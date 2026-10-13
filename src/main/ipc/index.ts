@@ -698,5 +698,11 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
     (_e: any, a: { index: number; channels: EpgChannelRef[] }) => host.loadLiveEpg(Number(a?.index) || 0, a?.channels || []),
     log,
   );
+  registerHandler(
+    IPC.EPG_PROGRAMS,
+    // ★ 不要 String() 转换 —— 渲染层可能传数组（多 key 依次尝试）
+    (_e: any, channelName: string | string[]) => host.getLiveEpgPrograms(channelName as string | string[]),
+    log,
+  );
   registerHandler('live:meta', () => host.lives, log);
 }

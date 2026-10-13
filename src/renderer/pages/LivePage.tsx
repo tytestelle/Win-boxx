@@ -623,21 +623,45 @@ export default function LivePage() {
           {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
         </select>
 
-        {/* ★ 新增：订阅源按钮 */}
+        {/* ★ 订阅源按钮：全部使用内联样式，不依赖 .btn 等外部 class，保证一定可见 */}
         <button
-          className="btn"
-          style={{ marginLeft: 8 }}
+          type="button"
           onClick={() => setSubPanelOpen(true)}
           title="管理网络直播订阅源（自定义名称 + 链接）"
+          style={{
+            marginLeft: 8,
+            padding: '4px 14px',
+            borderRadius: 6,
+            border: '1px solid #4ec9ff',
+            background: 'rgba(78,201,255,0.12)',
+            color: '#4ec9ff',
+            cursor: 'pointer',
+            fontSize: 13,
+            lineHeight: '20px',
+            whiteSpace: 'nowrap',
+            flex: '0 0 auto',
+          }}
         >
           订阅源{subs.length ? ` (${subs.length})` : ''}
         </button>
         <button
-          className="btn"
-          style={{ marginLeft: 6 }}
+          type="button"
           onClick={() => refreshSubs()}
           disabled={subLoading}
           title="立即联网刷新全部启用的订阅源"
+          style={{
+            marginLeft: 6,
+            padding: '4px 14px',
+            borderRadius: 6,
+            border: '1px solid #3a4150',
+            background: subLoading ? 'rgba(255,255,255,0.05)' : 'rgba(255,255,255,0.08)',
+            color: subLoading ? '#777' : '#e6e6e6',
+            cursor: subLoading ? 'not-allowed' : 'pointer',
+            fontSize: 13,
+            lineHeight: '20px',
+            whiteSpace: 'nowrap',
+            flex: '0 0 auto',
+          }}
         >
           {subLoading ? '刷新中…' : '刷新订阅'}
         </button>

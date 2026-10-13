@@ -25,7 +25,13 @@ import { LocalPkgStore } from './store/LocalPkgStore';
 import { LOCAL_PROXY_BASE } from '../shared/constants';
 import { localImportsDir, userDataDir } from './util/paths';
 import { safeStorageDriveCodec } from './util/driveCodec';
-import { registerLiveSubscriptionIpc } from './LiveSubscriptionManager';
+// ★ 2026-10-13：订阅源相关（IPC 注册 + 本地导入函数注入 + 启动自动检查更新）
+import {
+  registerLiveSubscriptionIpc,
+  bindLiveImporter,
+  checkAndUpdateSubscriptions,
+} from './LiveSubscriptionManager';
+import { importLiveFileFromPath } from './live/importLiveFile';
 // esbuild 打成 CJS：__dirname 由 Node 提供（= dist/）。资源在 dist/../../resources。
 declare const __dirname: string;
 
@@ -236,9 +242,26 @@ app.whenReady().then(async () => {
     fileLogger.w('播放诊断初始化失败：' + (e as Error).message);
   }
   registerIpc(host, dav, dlna, updater, localPkgs);
-  // ★ 新增：注册网络直播订阅源 IPC（必须在 app.whenReady() 之后调用——
-  //   LiveSubscriptionManager 会读 app.getPath('userData')；且需早于 createWindow 打开窗口）。
+
+  // ★ 2026-10-13：先接线「本地文件导入」函数，再注册订阅源 IPC。
+  //   网络订阅源下载后走 importLiveFileFromPath → 与「配置页 · 导入本地 TXT/M3U」完全同构，
+  //   注册进 lives 的 api 是 `http://127.0.0.1:9978/file/local-live/sub-<id>.<ext>`，
+  //   直播页加载器才认得（此前直拼 file:/// 时只有名字没有内容）。
+  bindLiveImporter((srcPath, opts) => importLiveFileFromPath(host, srcPath, opts));
   registerLiveSubscriptionIpc();
+
+  // ★ 2026-10-13：启动后延迟 10 秒自动检查订阅源更新（避开启动高峰）。
+  //   有变化 → 覆盖本地文件 + 走本地导入覆盖 lives；无变化 → 保留原样不重新导入。
+  setTimeout(() => {
+    void checkAndUpdateSubscriptions()
+      .then((r) => {
+        if (r.updated > 0 || r.failed > 0) {
+          fileLogger.i(`[LiveSub] 启动自动检查：更新 ${r.updated} · 跳过 ${r.skipped} · 失败 ${r.failed}`);
+        }
+      })
+      .catch((e) => fileLogger.w(`[LiveSub] 启动自动检查异常：${(e as Error).message}`));
+  }, 10_000);
+
   // 老板键：注入窗口提供者（主窗口 + 播放器窗口）并按上次设置注册全局快捷键
   bossKey.start(() => {
     const ws: BrowserWindow[] = [];

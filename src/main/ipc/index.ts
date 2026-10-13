@@ -440,13 +440,23 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
     try {
       const buf = readFileSync(srcPath);
       if (!buf.length) return { ok: false, error: '所选文件为空' };
-      // 编码：UTF-8 优先；出现替换字符（典型 GBK 直播源）时按 gb18030 再解一次做校验
+      // 编码检测：GBK 直播源被 UTF-8 解码后有两种表现——
+      //   (a) 出现替换字符 \uFFFD（非法 UTF-8 序列）
+      //   (b) 无替换字符，但解出的是拉丁扩展乱码（如「æµ‹è¯•」）
+      // 因此不能只看 \uFFFD；改为比较 UTF-8 与 GB18030 解码结果中的 CJK 字符数，取更优者。
       let text = buf.toString('utf-8');
-      if (text.includes('\uFFFD')) {
+      const utf8Cjk = (text.match(/[\u4E00-\u9FFF]/g) || []).length;
+      const utf8NonAscii = (text.match(/[^\x00-\x7F]/g) || []).length;
+      // 有非 ASCII 字符，但 CJK 占比低于一半 → 大概率不是中文 UTF-8，尝试 GB18030
+      if (utf8NonAscii > 0 && utf8Cjk / utf8NonAscii < 0.5) {
         try {
-          text = iconv.decode(buf, 'gb18030');
+          const gbkText = iconv.decode(buf, 'gb18030');
+          const gbkCjk = (gbkText.match(/[\u4E00-\u9FFF]/g) || []).length;
+          if (gbkCjk > utf8Cjk) {
+            text = gbkText;
+          }
         } catch {
-          /* 解码失败就用 utf-8 结果做校验 */
+          /* 解码失败则保留 UTF-8 结果 */
         }
       }
       if (!looksLikeLiveSourceText(text)) {

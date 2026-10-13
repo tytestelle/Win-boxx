@@ -136,6 +136,17 @@ export const IPC = {
   WIN_REPORT_ERROR: 'win:reportError',
   /** 主进程 → 渲染层：让已打开的详情窗口切换路由（`/detail/:key/:id?…&dw=1`） */
   WIN_NAVIGATE: 'win:navigate',
+  /**
+   * ★ 2026-10-14（用户要求）：导航点击 → 打开包含该路由的**独立窗口**（多开）。
+   *   主进程按路由去重：已开则聚焦；未开则新建（无边框、独立于主窗口、可自由拖动）。
+   *   白名单：`/`、`/home`、`/history`、`/live`、`/storage`、`/config`、`/about`。
+   */
+  OPEN_ROUTE_WINDOW: 'win:openRouteWindow',
+  /**
+   * ★ 2026-10-14：渲染层上报路由变化 → 主进程更新「路由 → 窗口」注册表
+   *   （用于 openRouteWindow 去重：同一路由的窗口只保留一个）。
+   */
+  NOTIFY_ROUTE_CHANGE: 'win:notifyRouteChange',
   /** ★ 2026-09-30（用户要求「软件关闭后，所有的墓碑机制都应该脱钩」）：主进程**本次启动**的唯一标识
    *  （每次启动重新生成）—— 渲染层据此判定「新一次启动」并丢掉页面状态类记忆（见 uiMemory）。 */
   SYSTEM_SESSION_ID: 'system:sessionId',

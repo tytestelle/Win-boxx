@@ -1,12 +1,14 @@
 // src/main/live/EpgManager.ts
 // XMLTV EPG 管理器 —— 移植自 TVBox EpgManager.java
 //
-// 匹配链路：
+// 匹配链路（与 TVBox 完全一致）：
 //   1) 频道名（trim）→ epg_data.json 的 name 变体精确查表 → epgid
 //   2) 查不到 → 直接用频道名当 epgid
 //   3) 用 epgid 去 XMLTV 匹配 <display-name>
 //   4) 同名 epgid 命中多个 XMLTV <channel> → programmes 全部合并
 //   5) loadedEpgIds 只记录成功命中的 epgid（未命中的下次继续尝试）
+//
+// 依赖：npm install sax @types/sax
 
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
@@ -21,16 +23,13 @@ const TAG = 'EpgManager';
 const EPG_DIR_NAME = 'epgche';
 const EPG_FILE_NAME = 'epg.xml';
 const HASH_FILE_NAME = 'epg.hash';
-const LOGO_DIR_NAME = 'logos';
-const EPG_DATA_FILE_NAME = 'epg_data.json';
+const EPG_DATA_FILE_NAME = 'epg_data_cache.json';
 const EPG_DATA_HASH_FILE = 'epg_data_cache.hash';
 
-// ★ 原始地址（国内可能访问慢）
+// ★ epg_data.json 原始地址（GitHub raw） + 加速前缀（国内可访问）
 const EPG_DATA_RAW_URL =
   'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json';
-
-// ★ 加速链接（国内可正常访问；如果失效可更换前缀）
-//   参考：https://gitproxy.click/ 或 https://githubproxy.cc/
+/** ★ 加速前缀：如需更换，直接改这一个常量即可（如 https://githubproxy.cc/ 或 https://ghfast.top/） */
 const GITHUB_PROXY = 'https://gitproxy.click/';
 const EPG_DATA_REMOTE_URL = GITHUB_PROXY + EPG_DATA_RAW_URL;
 
@@ -48,7 +47,6 @@ export interface EpgRefreshResult {
 
 export class EpgManager {
   private readonly nameToEpgId = new Map<string, string>();
-  private readonly dynamicEpgIds = new Map<string, string>();
   private readonly xmlChannelIdsByEpgId = new Map<string, string[]>();
   private readonly programsByChannelId = new Map<string, EpgProgram[]>();
   private readonly programsByEpgId = new Map<string, EpgProgram[]>();
@@ -63,7 +61,6 @@ export class EpgManager {
   private readonly epgDir: string;
   private readonly epgFile: string;
   private readonly hashFile: string;
-  private readonly logoDir: string;
   private readonly epgDataFile: string;
   private readonly epgDataHashFile: string;
 
@@ -71,29 +68,22 @@ export class EpgManager {
     this.epgDir = join(userDataDir, EPG_DIR_NAME);
     this.epgFile = join(this.epgDir, EPG_FILE_NAME);
     this.hashFile = join(this.epgDir, HASH_FILE_NAME);
-    this.logoDir = join(userDataDir, LOGO_DIR_NAME);
     this.epgDataFile = join(userDataDir, EPG_DATA_FILE_NAME);
     this.epgDataHashFile = join(userDataDir, EPG_DATA_HASH_FILE);
 
-    for (const d of [this.epgDir, this.logoDir]) {
-      if (!existsSync(d)) mkdirSync(d, { recursive: true });
-    }
+    if (!existsSync(this.epgDir)) mkdirSync(this.epgDir, { recursive: true });
 
     this.epgUrl = this.normalizeEpgUrl(epgUrl);
     this.loadEpgDataMap(false);
   }
 
-  // ==================================================================
-  // URL 管理
-  // ==================================================================
+  // ============================== URL ==============================
   setEpgUrl(url: string): void {
     this.epgUrl = this.normalizeEpgUrl(url);
   }
-
   getEpgUrl(): string {
     return this.epgUrl;
   }
-
   private normalizeEpgUrl(url: string): string {
     if (!url) return '';
     const v = url.trim();
@@ -101,9 +91,7 @@ export class EpgManager {
     return idx > 0 ? v.substring(0, idx).trim() : v;
   }
 
-  // ==================================================================
-  // epg_data.json 加载
-  // ==================================================================
+  // ====================== epg_data.json 加载 ======================
   loadEpgDataMap(resetXmlCache: boolean): void {
     this.nameToEpgId.clear();
     let source = '无';
@@ -128,7 +116,6 @@ export class EpgManager {
     } catch (e) {
       fileLogger.w(`${TAG} 加载 epg_data.json 失败[${source}]: ${String(e)}`);
     }
-
     if (resetXmlCache) this.resetXmlCache();
   }
 
@@ -141,9 +128,7 @@ export class EpgManager {
     this.parsed = false;
   }
 
-  // ==================================================================
-  // 远程同步 epg_data.json（走加速链接）
-  // ==================================================================
+  // ================= 远程同步 epg_data.json =================
   async refreshEpgDataFromRemote(): Promise<void> {
     if (this.epgDataRefreshRunning) return;
     this.epgDataRefreshRunning = true;
@@ -165,7 +150,7 @@ export class EpgManager {
       }
       writeFileSync(this.epgDataFile, buf);
       writeFileSync(this.epgDataHashFile, remoteHash, 'utf-8');
-      fileLogger.i(`${TAG} 远程 epg_data.json 已更新，将清 XML 缓存`);
+      fileLogger.i(`${TAG} 远程 epg_data.json 已更新（${buf.length}B），将清 XML 缓存`);
       this.loadEpgDataMap(true);
     } catch (e) {
       fileLogger.w(`${TAG} 刷新 epg_data.json 失败: ${String(e)}`);
@@ -174,13 +159,10 @@ export class EpgManager {
     }
   }
 
-  // ==================================================================
-  // 下载 / 刷新 XMLTV
-  // ==================================================================
+  // =================== 下载 / 刷新 XMLTV ===================
   async refreshEpg(): Promise<EpgRefreshResult> {
     if (!this.epgUrl) return { ok: false, error: 'EPG URL 未设置' };
     if (this.refreshRunning) return { ok: false, error: '正在刷新中' };
-
     this.refreshRunning = true;
     try {
       const remoteHash = await this.fetchText(this.epgUrl + '.hash', 10_000);
@@ -228,9 +210,7 @@ export class EpgManager {
     }
   }
 
-  // ==================================================================
-  // 分组按需加载
-  // ==================================================================
+  // ==================== 分组按需加载 ====================
   async loadChannelGroup(channelNames: string[]): Promise<void> {
     if (!channelNames || channelNames.length === 0) return;
     const requested = new Set<string>();
@@ -254,17 +234,14 @@ export class EpgManager {
 
   private lookupEpgId(channelName: string): string | null {
     if (!channelName) return null;
-    const key = channelName.trim();
-    return this.nameToEpgId.get(key) ?? this.dynamicEpgIds.get(key) ?? null;
+    return this.nameToEpgId.get(channelName.trim()) ?? null;
   }
 
   resolveEpgId(channelName: string): string | null {
     return this.lookupEpgId(channelName);
   }
 
-  // ==================================================================
-  // 流式解析 XMLTV（sax 单遍扫描）
-  // ==================================================================
+  // ================= 流式解析 XMLTV（sax） =================
   private parseXmlForEpgIds(file: string, requested: Set<string>): Promise<void> {
     return new Promise((resolve) => {
       const newPrograms = new Map<string, EpgProgram[]>();
@@ -285,7 +262,7 @@ export class EpgManager {
       let captureTag = '';
       let buf = '';
 
-      parser.on('opentag', (node: sax.Tag) => {
+      parser.on('opentag', (node: any) => {
         const name = node.name;
         if (name === 'channel') {
           curChannelId = String(node.attributes.id ?? '').trim() || null;
@@ -310,26 +287,19 @@ export class EpgManager {
           buf = '';
         }
       });
-
       parser.on('text', (t: string) => { if (captureTag) buf += t; });
       parser.on('cdata', (t: string) => { if (captureTag) buf += t; });
 
-      parser.on('closetag', (node: sax.Tag | string) => {
+      parser.on('closetag', (node: any) => {
         const name = typeof node === 'string' ? node : node.name;
-
         if (name === 'display-name' && captureTag === 'display-name') {
           const v = buf.trim();
           if (v) curDisplayNames.push(v);
-          captureTag = '';
-          buf = '';
+          captureTag = ''; buf = '';
         } else if (name === 'title' && captureTag === 'title') {
-          curTitle = buf.trim();
-          captureTag = '';
-          buf = '';
+          curTitle = buf.trim(); captureTag = ''; buf = '';
         } else if (name === 'desc' && captureTag === 'desc') {
-          curDesc = buf.trim();
-          captureTag = '';
-          buf = '';
+          curDesc = buf.trim(); captureTag = ''; buf = '';
         } else if (name === 'channel' && curChannelId) {
           const matched = this.matchChannelToEpgId(curDisplayNames, requested);
           if (matched) {
@@ -342,9 +312,7 @@ export class EpgManager {
               `${TAG} XMLTV 命中: epgid=[${matched}] displayName=${JSON.stringify(curDisplayNames)} channelId=[${curChannelId}]`,
             );
           }
-          curChannelId = null;
-          curDisplayNames = [];
-          curIcon = null;
+          curChannelId = null; curDisplayNames = []; curIcon = null;
         } else if (name === 'programme' && curProgChannel) {
           if (wantedChannelIds.has(curProgChannel) && curStart && curStop) {
             const s = this.parseXmltvTime(curStart);
@@ -355,23 +323,18 @@ export class EpgManager {
               newPrograms.set(curProgChannel, arr);
             }
           }
-          curProgChannel = null;
-          curStart = null;
-          curStop = null;
-          curTitle = '';
-          curDesc = '';
+          curProgChannel = null; curStart = null; curStop = null;
+          curTitle = ''; curDesc = '';
         }
       });
 
       parser.on('end', () => {
         for (const [chId, list] of newPrograms) this.programsByChannelId.set(chId, list);
-
         for (const [epgid, ids] of idsByEpgId) {
           const existing = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
           for (const id of ids) if (!existing.includes(id)) existing.push(id);
           this.xmlChannelIdsByEpgId.set(epgid, existing);
         }
-
         for (const [epgid] of idsByEpgId) {
           const allIds = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
           const merged: EpgProgram[] = [];
@@ -381,14 +344,22 @@ export class EpgManager {
           }
           merged.sort((a, b) => a.start.getTime() - b.start.getTime());
           this.programsByEpgId.set(epgid, merged);
+          fileLogger.i(`${TAG} EPG汇总: epgid=[${epgid}] channelIds=${JSON.stringify(allIds)} programmes=${merged.length}`);
         }
-
         for (const [epgid, url] of iconByEpgId) {
           if (!this.iconUrlByEpgId.has(epgid)) this.iconUrlByEpgId.set(epgid, url);
         }
-
         for (const epgid of idsByEpgId.keys()) this.loadedEpgIds.add(epgid);
         this.parsed = this.programsByEpgId.size > 0 || this.xmlChannelIdsByEpgId.size > 0;
+
+        const unmatched = new Set<string>();
+        for (const r of requested) if (!idsByEpgId.has(r)) unmatched.add(r);
+        if (unmatched.size > 0) {
+          fileLogger.i(`${TAG} 未匹配上的 epgid: ${JSON.stringify([...unmatched])}`);
+        }
+        fileLogger.i(
+          `${TAG} 按需解析完成: 请求=${requested.size} 本次命中=${idsByEpgId.size} 累计加载=${this.loadedEpgIds.size}`,
+        );
         resolve();
       });
 
@@ -412,17 +383,10 @@ export class EpgManager {
       const id = this.nameToEpgId.get(t);
       if (id && requested.has(id)) return id;
     }
-    for (const dn of displayNames) {
-      const t = dn.trim();
-      const id = this.dynamicEpgIds.get(t);
-      if (id && requested.has(id)) return id;
-    }
     return null;
   }
 
-  // ==================================================================
-  // 查询接口
-  // ==================================================================
+  // ==================== 查询接口 ====================
   getProgramsForChannel(channelName: string): EpgProgram[] {
     if (!channelName || !this.parsed) return [];
     const epgid = this.lookupEpgId(channelName) ?? channelName.trim();
@@ -451,17 +415,11 @@ export class EpgManager {
     return this.iconUrlByEpgId.get(epgid) ?? '';
   }
 
-  isEpgIdLoaded(epgid: string): boolean {
-    return this.loadedEpgIds.has(epgid);
-  }
-
   isParsed(): boolean {
     return this.parsed && this.programsByEpgId.size > 0;
   }
 
-  // ==================================================================
-  // 时间解析：XMLTV 形如 20240101120000 +0800
-  // ==================================================================
+  // ============ 时间解析：XMLTV 形如 20240101120000 +0800 ============
   private parseXmltvTime(v: string): Date | null {
     if (!v || v.length < 14) return null;
     const main = v.substring(0, 14);
@@ -475,9 +433,7 @@ export class EpgManager {
     return Number.isNaN(d.getTime()) ? null : d;
   }
 
-  // ==================================================================
-  // 网络工具
-  // ==================================================================
+  // ====================== 网络工具 ======================
   private async fetchText(url: string, timeoutMs: number): Promise<string> {
     try {
       const ctrl = new AbortController();
@@ -510,8 +466,7 @@ export class EpgManager {
     try {
       const res = await fetch(url, { signal: ctrl.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const buf = Buffer.from(await res.arrayBuffer());
-      writeFileSync(target, buf);
+      writeFileSync(target, Buffer.from(await res.arrayBuffer()));
     } finally {
       clearTimeout(t);
     }

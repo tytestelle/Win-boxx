@@ -2242,25 +2242,19 @@ export class SpiderHost {
   }
 
   /**
-   * ★ EPG 直查：支持三种入参 —— 单 key / 数组 / 逗号分隔字符串。
-   *   渲染层推荐传 `[tvg-id, tvg-name, name]` 依次尝试。
+   * ★ EPG 直查：接受单 key / 数组 / 逗号分隔字符串；走 EpgManager 的多 key 联合查询
    */
   getLiveEpgPrograms(channelNames: string | string[]) {
-    if (!this.epgMgr) return [];
+    if (!this.epgMgr) {
+      this.logger.w('[EPG] getLiveEpgPrograms: EpgManager 未初始化');
+      return [];
+    }
     let list: string[];
     if (Array.isArray(channelNames)) list = channelNames;
     else list = String(channelNames || '').split(',');
-    // eslint-disable-next-line no-console
-    fileLogger.i(`[EPG] epgPrograms 查询 keys=${JSON.stringify(list)}`);
-    for (const n of list) {
-      const trimmed = String(n || '').trim();
-      if (!trimmed) continue;
-      const got = this.epgMgr.getProgramsForChannel(trimmed);
-      // eslint-disable-next-line no-console
-      fileLogger.i(`[EPG]   key="${trimmed}" → ${got.length} 条`);
-      if (got.length) return got;
-    }
-    return [];
+    list = list.map((s) => String(s || '').trim()).filter((s) => !!s);
+    if (!list.length) return [];
+    return this.epgMgr.getProgramsForChannelMulti(list);
   }
   /** ★ EPG 直查：某频道当前节目 */
   getLiveEpgCurrent(channelName: string) {

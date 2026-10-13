@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { client } from '../api/client';
 import type { LiveGroup, LiveBean, LiveEpgEntry, EpgChannelRef } from '../../shared/types';
 import VideoPlayer from '../components/VideoPlayer';
@@ -40,16 +40,13 @@ function hhmm(d: Date): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-/**
- * ★ 判断 URL 是否形如"可能返回 HLS 内容的接口"（保留此函数，但**不主动调用**，
- *   只在播放失败（SRC_NOT_SUPPORTED）时作为归一化候选判断）。
- */
+/** 判断 URL 是否形如"可能返回 HLS 内容的接口" */
 function looksLikeStreamEndpoint(url: string): boolean {
   const u = (url || '').toLowerCase().trim();
   if (!u) return false;
   if (/\.(mp4|mkv|avi|webm|ts|m4v|mov|wmv|mp3|aac|flac|wav)(\?|#|$)/i.test(u)) return false;
-  if (u.includes('.m3u8')) return true;
-  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//.test(u)) return true;
+  if (u.includes('.m3u8')) return false; // 已经是 m3u8，不需要再处理
+  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//.test(u)) return false;
   if (/\.(php|asp|aspx|cgi|jsp)(\?|#|\/|$)/i.test(u)) return true;
   if (/\/(hls|live|stream|tv|iptv|play|channel)\b/i.test(u)) return true;
   if (/^https?:\/\/\d+\.\d+\.\d+\.\d+:\d+/.test(u)) return true;
@@ -57,12 +54,10 @@ function looksLikeStreamEndpoint(url: string): boolean {
   return false;
 }
 
-/** 归一化：仅作为 fallback 候选，返回 null 表示无需尝试 */
+/** 给 URL 追加 `_f=.m3u8`，让 HLS 判定命中 */
 function normalizeLiveUrl(url: string): string | null {
   const u = (url || '').trim();
   if (!u) return null;
-  if (u.includes('.m3u8')) return null;
-  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//i.test(u)) return null;
   if (!looksLikeStreamEndpoint(u)) return null;
   const hashIdx = u.indexOf('#');
   const base = hashIdx >= 0 ? u.slice(0, hashIdx) : u;
@@ -179,27 +174,36 @@ export default function LivePage() {
   const [programsDate, setProgramsDate] = useState('');
   const programsScrollRef = useRef<HTMLDivElement>(null);
 
-  // ★ 播放 URL 状态：默认用原始，失败时才切归一化
+  // ★ 播放 URL 状态
   const [playbackUrl, setPlaybackUrl] = useState('');
-  const triedNormalizedRef = useRef(false);
-  const normalizedCandidate = useMemo(() => normalizeLiveUrl(playUrl), [playUrl]);
+  const [reconnectKey, setReconnectKey] = useState(0);
+  const [reconnectMsg, setReconnectMsg] = useState('');
+  const reconnectCountRef = useRef(0);
+  const lastReconnectAtRef = useRef(0);
+  const triedRawRef = useRef(false); // 是否已回退到原始 URL
+  const MAX_RECONNECT = 30;
 
-  // 每次换频道重置
+  // ★ 换频道：默认用归一化 URL（针对 .php 等 HLS 代理接口），失败再切回原 URL
   useEffect(() => {
-    setPlaybackUrl(playUrl);
-    triedNormalizedRef.current = false;
+    if (!playUrl) { setPlaybackUrl(''); return; }
+    const candidate = normalizeLiveUrl(playUrl);
+    if (candidate) {
+      // eslint-disable-next-line no-console
+      console.info('[LIVE] 使用归一化 URL：', candidate);
+      setPlaybackUrl(candidate);
+      triedRawRef.current = false;
+    } else {
+      // eslint-disable-next-line no-console
+      console.info('[LIVE] 使用原始 URL：', playUrl);
+      setPlaybackUrl(playUrl);
+      triedRawRef.current = true;
+    }
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
     setReconnectMsg('');
   }, [playUrl]);
 
-  // 断线重连
-  const [reconnectKey, setReconnectKey] = useState(0);
-  const [reconnectMsg, setReconnectMsg] = useState('');
-  const reconnectCountRef = useRef(0);
-  const lastReconnectAtRef = useRef(0);
-  const MAX_RECONNECT = 30;
-
+  // 断线重连（配合 onEnded / 网络错误）
   const doReconnect = useCallback(() => {
     const now = Date.now();
     if (now - lastReconnectAtRef.current < 3000) return;
@@ -217,33 +221,38 @@ export default function LivePage() {
     }, 3000);
   }, []);
 
+  // 手动重连：双 rAF 强保证 video 元素卸载重建
   const manualReconnect = useCallback(() => {
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
-    triedNormalizedRef.current = false;
+    triedRawRef.current = false;
     setReconnectMsg('手动重连中…');
-    // ★ 强卸载：先把 URL 置空（video 组件卸载），下一 tick 再挂回原 URL，保证 video 元素重建
     setPlaybackUrl('');
-    window.setTimeout(() => {
-      setPlaybackUrl(playUrl);
-      setReconnectKey((k) => k + 1);
-      setReconnectMsg('');
-    }, 150);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const candidate = normalizeLiveUrl(playUrl);
+        setPlaybackUrl(candidate || playUrl);
+        setReconnectKey((k) => k + 1);
+        window.setTimeout(() => setReconnectMsg(''), 1000);
+      });
+    });
   }, [playUrl]);
 
+  // ★ 播放失败处理：如果当前是归一化 URL 且失败 → 回退到原始 URL
   const handleVideoError = useCallback((msg: string) => {
-    // ★ 首次 SRC_NOT_SUPPORTED 且存在归一化候选 → 切换 URL 重试（不当作"重连"）
-    if (msg.includes('SRC_NOT_SUPPORTED') && !triedNormalizedRef.current && normalizedCandidate && normalizedCandidate !== playUrl) {
+    if (!msg) return;
+    const candidate = normalizeLiveUrl(playUrl);
+    if (!triedRawRef.current && candidate && playbackUrl === candidate) {
       // eslint-disable-next-line no-console
-      console.warn('[LIVE] SRC_NOT_SUPPORTED，尝试归一化 URL：', normalizedCandidate);
-      triedNormalizedRef.current = true;
-      setPlaybackUrl(normalizedCandidate);
-      setReconnectMsg('尝试兼容模式…');
+      console.warn('[LIVE] 归一化 URL 失败，回退到原始 URL：', playUrl);
+      triedRawRef.current = true;
+      setPlaybackUrl(playUrl);
+      setReconnectMsg('尝试原始 URL…');
       window.setTimeout(() => setReconnectMsg(''), 2000);
       return;
     }
-    if (msg) setReconnectMsg(msg);
-  }, [playUrl, normalizedCandidate]);
+    setReconnectMsg(msg);
+  }, [playUrl, playbackUrl]);
 
   useEffect(() => {
     let cancelled = false;
@@ -359,7 +368,7 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
-  /** ★ 打开完整节目单：把 tvg-id / tvg-name / name 三个 key 都传给主进程，按顺序依次尝试 */
+  /** 打开完整节目单：多 key 依次尝试 */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const keys = [channel['tvg-id'], channel['tvg-name'], channel.name]
       .map((k) => (k || '').trim())
@@ -370,6 +379,8 @@ export default function LivePage() {
     setProgramsLoading(true);
     setProgramsList([]);
     try {
+      // eslint-disable-next-line no-console
+      console.info('[EPG] 弹窗查询 keys =', keys);
       const raw = await client.epgPrograms(keys);
       const list: EpgProgramItem[] = ((raw as any[]) || [])
         .map((p: any) => ({
@@ -379,13 +390,13 @@ export default function LivePage() {
           stop: toDate(p?.stop),
         }))
         .sort((a, b) => a.start.getTime() - b.start.getTime());
+      // eslint-disable-next-line no-console
+      console.info(`[EPG] 弹窗返回 ${list.length} 条`);
       setProgramsList(list);
       const today = dayKey(new Date());
       if (list.some((p) => dayKey(p.start) === today)) setProgramsDate(today);
       else if (list.length) setProgramsDate(dayKey(list[0].start));
       else setProgramsDate(today);
-      // eslint-disable-next-line no-console
-      console.info(`[EPG] 节目单 ${keys.join(' / ')} → ${list.length} 条`);
     } catch (e) {
       // eslint-disable-next-line no-console
       console.warn('[EPG] 拉取完整节目单失败', e);

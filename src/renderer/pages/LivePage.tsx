@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import Hls from 'hls.js';
 import { client } from '../api/client';
 import type { LiveGroup, LiveBean, LiveEpgEntry, EpgChannelRef } from '../../shared/types';
-import VideoPlayer from '../components/VideoPlayer';
 import { splitLine } from '../../engine/live/LiveUtils';
 
 // ---- 频道选择记忆 ----
@@ -40,34 +40,33 @@ function hhmm(d: Date): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-/** 判断 URL 是否形如"可能返回 HLS 内容的接口" */
-function looksLikeStreamEndpoint(url: string): boolean {
+// =========================================================================
+// ★ 直播流类型判断
+//   · .m3u8 / 无扩展名接口 → 'hls'（hls.js 自己会 fetch 内容判断）
+//   · .flv                → 'flv'（mpegts.js）
+//   · .ts                 → 'ts'（mpegts.js）
+//   · .mp4/.mkv/...       → 'native'（原生 <video>）
+//   · rtmp:// / rtsp://   → 'native'（浏览器播不了，交给重连提示）
+// =========================================================================
+type StreamKind = 'hls' | 'flv' | 'ts' | 'native';
+
+function detectStreamKind(url: string): StreamKind {
   const u = (url || '').toLowerCase().trim();
-  if (!u) return false;
-  if (/\.(mp4|mkv|avi|webm|ts|m4v|mov|wmv|mp3|aac|flac|wav)(\?|#|$)/i.test(u)) return false;
-  if (u.includes('.m3u8')) return false; // 已经是 m3u8，不需要再处理
-  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//.test(u)) return false;
-  if (/\.(php|asp|aspx|cgi|jsp)(\?|#|\/|$)/i.test(u)) return true;
-  if (/\/(hls|live|stream|tv|iptv|play|channel)\b/i.test(u)) return true;
-  if (/^https?:\/\/\d+\.\d+\.\d+\.\d+:\d+/.test(u)) return true;
-  if (/[?&](id|url|src|channel|ch|stream|play|t|type)=/i.test(u)) return true;
-  return false;
+  if (!u) return 'native';
+  if (u.includes('.m3u8')) return 'hls';
+  if (/\.ts(\?|#|$)/.test(u)) return 'ts';
+  if (u.includes('.flv')) return 'flv';
+  if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(u)) return 'native';
+  if (/^(rtmp|rtsp|rtp|mms):\/\//.test(u)) return 'native';
+  // ★ 关键：所有无后缀 / .php / .asp / .cgi / 参数接口 → 一律当 HLS 处理
+  //   hls.js 会 fetch 后自己判断内容是不是 #EXTM3U，是就播；不是就报错 → 触发重连
+  return 'hls';
 }
 
-/** 给 URL 追加 `_f=.m3u8`，让 HLS 判定命中 */
-function normalizeLiveUrl(url: string): string | null {
-  const u = (url || '').trim();
-  if (!u) return null;
-  if (!looksLikeStreamEndpoint(u)) return null;
-  const hashIdx = u.indexOf('#');
-  const base = hashIdx >= 0 ? u.slice(0, hashIdx) : u;
-  const frag = hashIdx >= 0 ? u.slice(hashIdx) : '';
-  const sep = base.includes('?') ? '&' : '?';
-  return `${base}${sep}_f=.m3u8${frag}`;
-}
-
-/** 直播 video 事件监听包装 */
-function LiveVideoWrapper({
+// =========================================================================
+// ★ 内联多协议直播播放器（hls.js / mpegts.js / 原生 <video>）
+// =========================================================================
+function LiveVideoPlayer({
   url,
   onReconnect,
   onVideoError,
@@ -76,82 +75,173 @@ function LiveVideoWrapper({
   onReconnect: () => void;
   onVideoError: (msg: string) => void;
 }) {
-  const holderRef = useRef<HTMLDivElement>(null);
-  const reconnectRef = useRef(onReconnect);
-  const errorRef = useRef(onVideoError);
-  reconnectRef.current = onReconnect;
-  errorRef.current = onVideoError;
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<any>(null);
+  const mpegtsRef = useRef<any>(null);
+  const cbRef = useRef({ onReconnect, onVideoError });
+  cbRef.current = { onReconnect, onVideoError };
 
   useEffect(() => {
-    const holder = holderRef.current;
-    if (!holder) return;
-    let cleanupFns: Array<() => void> = [];
-    let reconnectTimer: number | null = null;
-    let attachedVideo: HTMLVideoElement | null = null;
+    const v = videoRef.current;
+    if (!v || !url) return;
 
-    const scheduleReconnect = (delayMs: number) => {
-      if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = null;
-        reconnectRef.current();
-      }, delayMs);
+    const destroyHls = () => {
+      if (hlsRef.current) {
+        try { hlsRef.current.destroy(); } catch { /* ignore */ }
+        hlsRef.current = null;
+      }
+    };
+    const destroyMpegts = () => {
+      if (mpegtsRef.current) {
+        try { mpegtsRef.current.destroy(); } catch { /* ignore */ }
+        mpegtsRef.current = null;
+      }
     };
 
-    const attach = (): boolean => {
-      const v = holder.querySelector('video');
-      if (!v || v === attachedVideo) return v === attachedVideo;
-      attachedVideo = v;
+    const kind = detectStreamKind(url);
+    // eslint-disable-next-line no-console
+    console.info('[LIVE] 播放类型 =', kind, 'URL =', url);
 
-      const onEnded = () => scheduleReconnect(800);
-      const onError = () => {
-        const err = v.error;
-        const code = err?.code;
-        const msg =
-          code === 1 ? 'MEDIA_ERR_ABORTED（用户中止）'
-            : code === 2 ? 'MEDIA_ERR_NETWORK（网络错误）'
-              : code === 3 ? 'MEDIA_ERR_DECODE（解码错误）'
-                : code === 4 ? 'MEDIA_ERR_SRC_NOT_SUPPORTED（源不支持）'
-                  : `未知错误(${code ?? '?'})`;
-        errorRef.current(msg);
-        if (code === 2 || code === 4) scheduleReconnect(1500);
-      };
-      const onPlay = () => {
-        if (reconnectTimer != null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; }
-        errorRef.current('');
-      };
+    const safePlay = () => {
+      const p = v.play();
+      if (p && typeof p.catch === 'function') p.catch(() => undefined);
+    };
 
-      v.addEventListener('ended', onEnded);
-      v.addEventListener('error', onError);
-      v.addEventListener('play', onPlay);
-      v.addEventListener('playing', onPlay);
-      cleanupFns.push(() => {
-        v.removeEventListener('ended', onEnded);
-        v.removeEventListener('error', onError);
-        v.removeEventListener('play', onPlay);
-        v.removeEventListener('playing', onPlay);
+    const playNative = () => {
+      v.src = url;
+      v.load();
+      safePlay();
+    };
+
+    const playHls = () => {
+      if (!Hls.isSupported()) {
+        // eslint-disable-next-line no-console
+        console.warn('[LIVE] hls.js 不支持此环境，退回原生');
+        playNative();
+        return;
+      }
+      // ★ hls.js 会自己 fetch 这个 URL 并检测 m3u8 内容，不看后缀
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 30,
+        maxBufferLength: 20,
+        manifestLoadingTimeOut: 15000,
+        manifestLoadingMaxRetry: 6,
+        manifestLoadingRetryDelay: 500,
+        levelLoadingTimeOut: 15000,
+        fragLoadingTimeOut: 30000,
       });
-      return true;
+      hlsRef.current = hls;
+      hls.loadSource(url);
+      hls.attachMedia(v);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        // eslint-disable-next-line no-console
+        console.info('[LIVE] HLS manifest 解析成功');
+        safePlay();
+      });
+
+      hls.on(Hls.Events.ERROR, (_evt: unknown, data: any) => {
+        const fatal = data?.fatal;
+        // eslint-disable-next-line no-console
+        console.warn('[LIVE] HLS error：', data?.type, data?.details, 'fatal =', fatal);
+        if (!fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
+          try { hls.startLoad(); } catch { /* ignore */ }
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          cbRef.current.onVideoError('HLS 解码错误，尝试恢复…');
+          try { hls.recoverMediaError(); } catch { /* ignore */ }
+        } else {
+          cbRef.current.onVideoError(`HLS 失败：${data.details || data.type}`);
+          destroyHls();
+          cbRef.current.onReconnect();
+        }
+      });
     };
 
-    if (!attach()) {
-      const t = window.setInterval(() => { if (attach()) window.clearInterval(t); }, 300);
-      cleanupFns.push(() => window.clearInterval(t));
-    }
+    const playMpegts = async (type: 'flv' | 'mpegts') => {
+      try {
+        // @ts-ignore 动态加载可选依赖（没装就退回原生）
+        const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
+        const mpegts: any = (mod as any)?.default || (mod as any);
+        if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
+          // eslint-disable-next-line no-console
+          console.warn('[LIVE] mpegts.js 不可用，退回原生');
+          playNative();
+          return;
+        }
+        const player = mpegts.createPlayer(
+          { type, url, isLive: true },
+          { enableWorker: true, enableStashBuffer: false, stashInitialSize: 128, lazyLoad: false },
+        );
+        mpegtsRef.current = player;
+        player.attachMediaElement(v);
+        player.load();
+        try { player.play(); } catch { /* ignore */ }
+        player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
+          // eslint-disable-next-line no-console
+          console.warn('[LIVE] mpegts error：', errType, errDetail);
+          cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
+          cbRef.current.onReconnect();
+        });
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn('[LIVE] mpegts.js 加载失败', e);
+        playNative();
+      }
+    };
+
+    if (kind === 'hls') playHls();
+    else if (kind === 'flv') void playMpegts('flv');
+    else if (kind === 'ts') void playMpegts('mpegts');
+    else playNative();
+
+    const onEnded = () => cbRef.current.onReconnect();
+    const onErr = () => {
+      const err = v.error;
+      const code = err?.code;
+      const msg =
+        code === 1 ? 'MEDIA_ERR_ABORTED（用户中止）'
+          : code === 2 ? '网络错误'
+            : code === 3 ? '解码错误'
+              : code === 4 ? '源不支持'
+                : `错误(${code ?? '?'})`;
+      cbRef.current.onVideoError(msg);
+      if (code === 2 || code === 4) cbRef.current.onReconnect();
+    };
+    const onPlaying = () => cbRef.current.onVideoError('');
+    v.addEventListener('ended', onEnded);
+    v.addEventListener('error', onErr);
+    v.addEventListener('playing', onPlaying);
+    v.addEventListener('play', onPlaying);
+
     return () => {
-      if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
-      for (const fn of cleanupFns) fn();
-      cleanupFns = [];
-      attachedVideo = null;
+      v.removeEventListener('ended', onEnded);
+      v.removeEventListener('error', onErr);
+      v.removeEventListener('playing', onPlaying);
+      v.removeEventListener('play', onPlaying);
+      destroyHls();
+      destroyMpegts();
+      try { v.removeAttribute('src'); v.load(); } catch { /* ignore */ }
     };
   }, [url]);
 
   return (
-    <div ref={holderRef} style={{ width: '100%', height: '100%' }}>
-      <VideoPlayer url={url} />
-    </div>
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      controls={false}
+      style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
+    />
   );
 }
 
+// =========================================================================
+// 主组件
+// =========================================================================
 export default function LivePage() {
   const [lives, setLives] = useState<LiveBean[]>([]);
   const [liveIdx, setLiveIdx] = useState(0);
@@ -160,6 +250,7 @@ export default function LivePage() {
   const [channelName, setChannelName] = useState('');
   const [lineIdx, setLineIdx] = useState(0);
   const [playUrl, setPlayUrl] = useState('');
+  const [playbackUrl, setPlaybackUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
   const [epg, setEpg] = useState<Record<string, LiveEpgEntry>>({});
@@ -174,36 +265,22 @@ export default function LivePage() {
   const [programsDate, setProgramsDate] = useState('');
   const programsScrollRef = useRef<HTMLDivElement>(null);
 
-  // ★ 播放 URL 状态
-  const [playbackUrl, setPlaybackUrl] = useState('');
+  // 断线重连
   const [reconnectKey, setReconnectKey] = useState(0);
   const [reconnectMsg, setReconnectMsg] = useState('');
   const reconnectCountRef = useRef(0);
   const lastReconnectAtRef = useRef(0);
-  const triedRawRef = useRef(false); // 是否已回退到原始 URL
-  const MAX_RECONNECT = 30;
+  const MAX_RECONNECT = 50;
 
-  // ★ 换频道：默认用归一化 URL（针对 .php 等 HLS 代理接口），失败再切回原 URL
+  // ★ 换频道 → 直接把原始 URL 交给内联播放器（它自己识别类型）
   useEffect(() => {
     if (!playUrl) { setPlaybackUrl(''); return; }
-    const candidate = normalizeLiveUrl(playUrl);
-    if (candidate) {
-      // eslint-disable-next-line no-console
-      console.info('[LIVE] 使用归一化 URL：', candidate);
-      setPlaybackUrl(candidate);
-      triedRawRef.current = false;
-    } else {
-      // eslint-disable-next-line no-console
-      console.info('[LIVE] 使用原始 URL：', playUrl);
-      setPlaybackUrl(playUrl);
-      triedRawRef.current = true;
-    }
+    setPlaybackUrl(playUrl);
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
     setReconnectMsg('');
   }, [playUrl]);
 
-  // 断线重连（配合 onEnded / 网络错误）
   const doReconnect = useCallback(() => {
     const now = Date.now();
     if (now - lastReconnectAtRef.current < 3000) return;
@@ -221,38 +298,23 @@ export default function LivePage() {
     }, 3000);
   }, []);
 
-  // 手动重连：双 rAF 强保证 video 元素卸载重建
   const manualReconnect = useCallback(() => {
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
-    triedRawRef.current = false;
     setReconnectMsg('手动重连中…');
     setPlaybackUrl('');
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        const candidate = normalizeLiveUrl(playUrl);
-        setPlaybackUrl(candidate || playUrl);
+        setPlaybackUrl(playUrl);
         setReconnectKey((k) => k + 1);
         window.setTimeout(() => setReconnectMsg(''), 1000);
       });
     });
   }, [playUrl]);
 
-  // ★ 播放失败处理：如果当前是归一化 URL 且失败 → 回退到原始 URL
   const handleVideoError = useCallback((msg: string) => {
-    if (!msg) return;
-    const candidate = normalizeLiveUrl(playUrl);
-    if (!triedRawRef.current && candidate && playbackUrl === candidate) {
-      // eslint-disable-next-line no-console
-      console.warn('[LIVE] 归一化 URL 失败，回退到原始 URL：', playUrl);
-      triedRawRef.current = true;
-      setPlaybackUrl(playUrl);
-      setReconnectMsg('尝试原始 URL…');
-      window.setTimeout(() => setReconnectMsg(''), 2000);
-      return;
-    }
-    setReconnectMsg(msg);
-  }, [playUrl, playbackUrl]);
+    if (msg) setReconnectMsg(msg);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -368,7 +430,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
-  /** 打开完整节目单：多 key 依次尝试 */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const keys = [channel['tvg-id'], channel['tvg-name'], channel.name]
       .map((k) => (k || '').trim())
@@ -514,7 +575,7 @@ export default function LivePage() {
               {playUrl ? (
                 <div className="live-player" style={{ position: 'relative' }}>
                   {playbackUrl ? (
-                    <LiveVideoWrapper
+                    <LiveVideoPlayer
                       key={`${playbackUrl}__${reconnectKey}`}
                       url={playbackUrl}
                       onReconnect={doReconnect}

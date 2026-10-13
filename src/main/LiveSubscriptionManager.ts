@@ -24,7 +24,7 @@ import type {
   UserConfig,
 } from '../shared/types';
 import { LOCAL_PROXY_BASE } from '../shared/constants';
-import { localLiveUrl } from '../../engine/live/localLive';
+import { localLiveUrl } from '../engine/live/localLive';
 import { UserConfigManager } from './store/UserConfigManager';
 
 // =========================================================================

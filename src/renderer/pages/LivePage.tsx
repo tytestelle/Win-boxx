@@ -612,4 +612,359 @@ export default function LivePage() {
     if (date.getTime() === today.getTime()) return '今天';
     if (date.getTime() === tmr.getTime()) return '明天';
     if (date.getTime() === dat.getTime()) return '后天';
-    const wd = ['日', '一', '二', '三',
+    const wd = ['日', '一', '二', '三', '四', '五', '六'][date.getDay()];
+    return `${m}-${d} 周${wd}`;
+  }
+
+  return (
+    <>
+      <div className="topbar">
+        <select value={liveIdx} onChange={(e) => pickLive(Number(e.target.value))} disabled={loading}>
+          {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
+        </select>
+
+        {/* ★ 新增：订阅源按钮 */}
+        <button
+          className="btn"
+          style={{ marginLeft: 8 }}
+          onClick={() => setSubPanelOpen(true)}
+          title="管理网络直播订阅源（自定义名称 + 链接）"
+        >
+          订阅源{subs.length ? ` (${subs.length})` : ''}
+        </button>
+        <button
+          className="btn"
+          style={{ marginLeft: 6 }}
+          onClick={() => refreshSubs()}
+          disabled={subLoading}
+          title="立即联网刷新全部启用的订阅源"
+        >
+          {subLoading ? '刷新中…' : '刷新订阅'}
+        </button>
+
+        <span className="status" style={{ marginLeft: 'auto' }}>
+          {loading ? '加载中…' : `${allGroups.length} 组`}
+        </span>
+        {subMsg && (
+          <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.75 }}>
+            {subMsg}
+          </span>
+        )}
+        <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
+          EPG：{epgStatusText}
+        </span>
+      </div>
+
+      <div className="layout-2 content" style={{ padding: 12 }}>
+        <div className="left">
+          {allGroups.map((g) => (
+            <div
+              key={g.group}
+              className={`nav-item ${g.group === groupName ? 'active' : ''}`}
+              onClick={() => {
+                setGroupName(g.group);
+                if (g.channels.length) pickChannel(g, g.channels[0].name, 0, groups);
+              }}
+            >
+              {g.group} <span className="muted">({g.channels.length})</span>
+            </div>
+          ))}
+        </div>
+        <div className="right">
+          {err && <div className="err" style={{ marginBottom: 10 }}>{err}</div>}
+          {curGroup ? (
+            <>
+              <div className="row" style={{ marginBottom: 10, maxHeight: 180, overflow: 'auto' }}>
+                {curGroup.channels.map((c) => (
+                  <span
+                    key={c.name}
+                    className={`tag ${c.name === channelName ? 'active' : ''}`}
+                    onClick={() => pickChannel(curGroup, c.name, 0, groups)}
+                    onDoubleClick={() => openPrograms(c)}
+                    title="双击查看完整节目单"
+                  >
+                    {c.name}
+                  </span>
+                ))}
+              </div>
+              {lines.length > 1 && (
+                <div className="row" style={{ marginBottom: 8 }}>
+                  <span className="muted">线路：</span>
+                  {lines.map((l) => (
+                    <span
+                      key={l.index}
+                      className={`tag ${l.index - 1 === lineIdx ? 'active' : ''}`}
+                      onClick={() => {
+                        setLineIdx(l.index - 1);
+                        setPlayUrl(l.url);
+                        saveLiveMem({ liveIdx, groupName, channelName, lineIdx: l.index - 1 });
+                      }}
+                    >
+                      {l.name}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {curEpg && (curEpg.current || curEpg.next) && curChannel && (
+                <div
+                  className="live-epg"
+                  onClick={() => openPrograms(curChannel)}
+                  style={{ cursor: 'pointer' }}
+                  title="点击查看完整节目单"
+                >
+                  {curEpg.current && (
+                    <span className="live-epg-now">
+                      <b>正在播</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '（无标题）'}
+                    </span>
+                  )}
+                  {curEpg.next && (
+                    <span className="muted">
+                      <b>下一档</b> {curEpg.next.start} {curEpg.next.title || '（无标题）'}
+                    </span>
+                  )}
+                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>📺</span>
+                </div>
+              )}
+
+              {playUrl ? (
+                <div className="live-player" style={{ position: 'relative' }}>
+                  {playbackUrl ? (
+                    <LiveVideoPlayer
+                      key={`${playbackUrl}__${reconnectKey}`}
+                      url={playbackUrl}
+                      onReconnect={doReconnect}
+                      onVideoError={handleVideoError}
+                    />
+                  ) : (
+                    <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
+                  )}
+
+                  {/* 断线重连提示（左上角浮层，不可点击） */}
+                  {reconnectMsg && (
+                    <div
+                      style={{
+                        position: 'absolute', top: 12, left: 12,
+                        padding: '6px 12px', borderRadius: 6,
+                        background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13,
+                        pointerEvents: 'none', zIndex: 20,
+                      }}
+                    >
+                      {reconnectMsg}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="empty">无播放地址</div>
+              )}
+            </>
+          ) : (
+            <div className="empty">{allGroups.length ? '选择左侧分组' : '无直播（请先导入含 lives 的配置）'}</div>
+          )}
+        </div>
+      </div>
+
+      {/* ★ 新增：订阅源管理弹窗 */}
+      {subPanelOpen && (
+        <div
+          onClick={() => setSubPanelOpen(false)}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+            zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(760px, 92vw)', maxHeight: '80vh', display: 'flex', flexDirection: 'column',
+              background: '#1a1d24', color: '#e6e6e6', borderRadius: 12,
+              boxShadow: '0 8px 32px rgba(0,0,0,0.5)', overflow: 'hidden',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #2a2f3a' }}>
+              <div style={{ fontSize: 16, fontWeight: 600 }}>网络直播订阅源</div>
+              <button
+                onClick={() => setSubPanelOpen(false)}
+                style={{ background: 'transparent', border: 'none', color: '#aaa', fontSize: 20, cursor: 'pointer', padding: '0 4px' }}
+                title="关闭"
+              >×</button>
+            </div>
+
+            {/* 添加表单 */}
+            <div style={{ padding: '12px 16px', borderBottom: '1px solid #232833', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              <input
+                value={subFormName}
+                onChange={(e) => setSubFormName(e.target.value)}
+                placeholder="自定义名称（如：我的央视源）"
+                style={{ flex: '1 1 180px', minWidth: 140, padding: '6px 10px', borderRadius: 6, border: '1px solid #333944', background: '#0f1218', color: '#e6e6e6', fontSize: 13 }}
+              />
+              <input
+                value={subFormUrl}
+                onChange={(e) => setSubFormUrl(e.target.value)}
+                placeholder="订阅链接（支持 .m3u / .m3u8 / .txt / .json）"
+                style={{ flex: '2 1 320px', minWidth: 220, padding: '6px 10px', borderRadius: 6, border: '1px solid #333944', background: '#0f1218', color: '#e6e6e6', fontSize: 13 }}
+              />
+              <button
+                onClick={onAddSub}
+                style={{ padding: '6px 16px', borderRadius: 6, border: '1px solid #4ec9ff', background: 'rgba(78,201,255,0.12)', color: '#4ec9ff', cursor: 'pointer', fontSize: 13 }}
+              >添加</button>
+            </div>
+
+            {/* 列表 */}
+            <div style={{ overflowY: 'auto', padding: '8px 12px 14px' }}>
+              {subs.length === 0 ? (
+                <div style={{ padding: 32, textAlign: 'center', color: '#888' }}>
+                  暂无订阅源。填写上方「名称 + 链接」后点「添加」即可。
+                </div>
+              ) : (
+                subs.map((s) => (
+                  <div
+                    key={s.id}
+                    style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '10px 8px', borderBottom: '1px solid #232833' }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={s.enabled}
+                      onChange={(e) => onToggleSub(s.id, e.target.checked)}
+                      title={s.enabled ? '已启用，点击停用' : '已停用，点击启用'}
+                      style={{ flex: '0 0 auto' }}
+                    />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14 }}>
+                        {s.name}
+                        {!s.enabled && <span style={{ marginLeft: 8, fontSize: 11, color: '#888' }}>（已停用）</span>}
+                      </div>
+                      <div
+                        style={{
+                          fontSize: 12, color: '#8a9099',
+                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }}
+                        title={s.url}
+                      >
+                        {s.url}
+                      </div>
+                      <div style={{ fontSize: 11, color: '#666', marginTop: 2 }}>
+                        {s.lastUpdated
+                          ? `更新于 ${new Date(s.lastUpdated).toLocaleString()}`
+                          : '尚未更新'}
+                        {s.lastError ? ` · 错误：${s.lastError}` : ''}
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => onRemoveSub(s.id, s.name)}
+                      style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #5a2a2a', background: 'rgba(255,90,90,0.12)', color: '#ff7676', cursor: 'pointer', fontSize: 12 }}
+                    >删除</button>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* 底部操作 */}
+            <div style={{ padding: '10px 16px', borderTop: '1px solid #232833', display: 'flex', alignItems: 'center', gap: 10 }}>
+              <button
+                onClick={() => refreshSubs()}
+                disabled={subLoading}
+                style={{ padding: '6px 14px', borderRadius: 6, border: '1px solid #4ec9ff', background: 'rgba(78,201,255,0.12)', color: '#4ec9ff', cursor: 'pointer', fontSize: 13 }}
+              >
+                {subLoading ? '刷新中…' : '立即刷新全部'}
+              </button>
+              {subMsg && <span style={{ fontSize: 12, color: '#8a9099' }}>{subMsg}</span>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 完整节目单弹窗（保持原样） */}
+      {programsOpen && (
+        <div
+          onClick={closePrograms}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
+            zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(720px, 92vw)', maxHeight: '80vh', display: 'flex', flexDirection: 'column',
+              background: '#1a1d24', color: '#e6e6e6', borderRadius: 12,
+              boxShadow: '0 8px 32px rgba(0,0,0,0.5)', overflow: 'hidden',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #2a2f3a' }}>
+              <div style={{ fontSize: 16, fontWeight: 600 }}>
+                节目单 · <span style={{ color: '#4ec9ff' }}>{programsChannel || '-'}</span>
+              </div>
+              <button
+                onClick={closePrograms}
+                style={{ background: 'transparent', border: 'none', color: '#aaa', fontSize: 20, cursor: 'pointer', padding: '0 4px' }}
+                title="关闭 (Esc)"
+              >×</button>
+            </div>
+
+            {dateTabs.length > 0 && (
+              <div style={{ display: 'flex', gap: 6, padding: '10px 16px 0', flexWrap: 'wrap' }}>
+                {dateTabs.map((d) => (
+                  <button
+                    key={d}
+                    onClick={() => setProgramsDate(d)}
+                    style={{
+                      padding: '5px 12px', borderRadius: 16, fontSize: 13, cursor: 'pointer',
+                      border: '1px solid ' + (d === programsDate ? '#4ec9ff' : '#333944'),
+                      background: d === programsDate ? 'rgba(78,201,255,0.15)' : 'transparent',
+                      color: d === programsDate ? '#4ec9ff' : '#ccc',
+                    }}
+                  >{dateLabel(d)}</button>
+                ))}
+              </div>
+            )}
+
+            <div ref={programsScrollRef} style={{ overflowY: 'auto', padding: '10px 8px 14px' }}>
+              {programsLoading ? (
+                <div style={{ padding: 32, textAlign: 'center', color: '#888' }}>加载中…</div>
+              ) : dateList.length === 0 ? (
+                <div style={{ padding: 32, textAlign: 'center', color: '#888' }}>这一天暂无节目单</div>
+              ) : (
+                dateList.map((p, i) => {
+                  const isCurrent = nowMs >= p.start.getTime() && nowMs < p.stop.getTime();
+                  const isPast = nowMs >= p.stop.getTime();
+                  return (
+                    <div
+                      key={i}
+                      data-current={isCurrent ? '1' : '0'}
+                      style={{
+                        display: 'flex', gap: 12, padding: '10px 12px', borderRadius: 8,
+                        background: isCurrent ? 'rgba(78,201,255,0.12)' : 'transparent',
+                        borderLeft: isCurrent ? '3px solid #4ec9ff' : '3px solid transparent',
+                        opacity: isPast ? 0.5 : 1,
+                      }}
+                    >
+                      <div style={{ minWidth: 100, color: isCurrent ? '#4ec9ff' : '#9aa0a6', fontSize: 13, paddingTop: 2 }}>
+                        {hhmm(p.start)} - {hhmm(p.stop)}
+                      </div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 14, fontWeight: isCurrent ? 600 : 400 }}>
+                          {p.title || '（无标题）'}
+                          {isCurrent && (
+                            <span style={{
+                              marginLeft: 8, fontSize: 11, padding: '1px 6px',
+                              borderRadius: 4, background: '#4ec9ff', color: '#0b1016',
+                            }}>正在播</span>
+                          )}
+                        </div>
+                        {p.description && (
+                          <div style={{ fontSize: 12, color: '#8a9099', marginTop: 4, lineHeight: 1.5 }}>
+                            {p.description}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}

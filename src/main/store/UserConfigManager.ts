@@ -130,6 +130,16 @@ function clampIndex(i: number, len: number): number {
 export type ConfigChangeKind = 'content' | 'ui';
 
 export class UserConfigManager {
+  /**
+   * ★ 2026-10-13（用户报「网络直播订阅源显示已注册、实际直播页看不到」）：
+   *   本类是**内存快照**的唯一权威（磁盘 user-config.json 只在启动时读一次）。
+   *   LiveSubscriptionManager 之前直接读写磁盘文件，导致主进程内存快照不同步，
+   *   直播页 IPC 读到的还是旧的 lives 列表。这里保留一个当前实例的静态引用，
+   *   让 LiveSubscriptionManager 通过 `UserConfigManager.current` 读写内存。
+   */
+  private static _current: UserConfigManager | null = null;
+  static get current(): UserConfigManager | null { return UserConfigManager._current; }
+
   private snap: UserConfig = emptyUserConfig();
   private loaded = false;
   private onChange: ((snap: UserConfig, kind: ConfigChangeKind) => void) | null = null;
@@ -137,7 +147,9 @@ export class UserConfigManager {
   constructor(
     private store: JsonStore,
     private logger: Logger,
-  ) {}
+  ) {
+    UserConfigManager._current = this;
+  }
 
   /** 注册变更回调（SpiderHost 用它同步 sourceMap / 全局 jar / lives / active 键） */
   setOnChange(cb: (snap: UserConfig, kind: ConfigChangeKind) => void): void {

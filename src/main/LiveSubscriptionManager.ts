@@ -14,6 +14,13 @@
 //   importLiveFileFromPath（与「配置页 · 导入本地 TXT/M3U」同一条链路）——
 //   它负责：编码归一化 → 落 <userData>/local-live/sub-<id>.<ext> → parseLive → host.cfgAddLive。
 //   删除时按 api 精确移除；启动时自动检查更新（有变化才重新导入）。
+//
+// ★★ 2026-10-13 追加：本地源管理 ★★
+//   「配置页 · 导入直播源（本地文件）」写入的 lives 条目也走同一目录 `local-live/`，
+//   但**文件名不以 `sub-` 开头**（网络订阅源才以 `sub-` 开头）。
+//   本模块新增 listLocalLiveSources / removeLocalLiveSource：
+//     · list    —— 从 UserConfig.lives 里筛出「api 以 /file/local-live/ 开头 且 文件名非 sub-*」的条目
+//     · remove  —— 按 api 精确删除该线路 + 同时删除 <userData>/local-live/<文件名> 文件
 
 import { app, ipcMain, BrowserWindow } from 'electron';
 import * as fs from 'fs/promises';
@@ -40,6 +47,12 @@ export const LIVE_SUB_CHANNELS = {
   REFRESH_ALL: 'live:subscription:refreshAll',
 } as const;
 
+// ★ 2026-10-13：本地源管理（用户手动导入的本地 TXT/M3U；非网络订阅源）
+export const LIVE_LOCAL_CHANNELS = {
+  LIST: 'live:local:list',
+  REMOVE: 'live:local:remove',
+} as const;
+
 export const LIVE_SUB_CHANGED_CHANNEL = 'live:subscriptions-changed';
 
 export function notifyLiveSubscriptionsChanged(): void {
@@ -51,7 +64,7 @@ export function notifyLiveSubscriptionsChanged(): void {
 }
 
 // =========================================================================
-// ★ 2026-10-13：可注入的「本地文件导入」函数
+// ★ 可注入的「本地文件导入」函数
 //   主进程 index.ts 在 registerLiveSubscriptionIpc() 之前调用 bindLiveImporter(...) 接线。
 //   不注入 = 任何 CRUD 都会抛错（防「悄悄不注册」）。
 // =========================================================================
@@ -81,6 +94,7 @@ function rootDir(): string { return path.join(app.getPath('userData'), 'live-sub
 function indexFile(): string { return path.join(rootDir(), 'index.json'); }
 function filesDir(): string { return path.join(rootDir(), 'files'); }
 function userConfigPath(): string { return path.join(app.getPath('userData'), 'user-config.json'); }
+function localLiveDir(): string { return path.join(app.getPath('userData'), LOCAL_LIVE_SUBDIR); }
 
 async function ensureDirs(): Promise<void> {
   await fs.mkdir(rootDir(), { recursive: true });
@@ -160,6 +174,9 @@ async function writeUserConfig(cfg: UserConfig): Promise<void> {
 const SUB_BEAN_PREFIX = '【订阅】';
 const LOCAL_LIVE_SUBDIR = 'local-live';
 
+/** /file 路由前缀（本地直播源都走这条） */
+const LOCAL_LIVE_API_PREFIX = `${LOCAL_PROXY_BASE}/file/local-live/`;
+
 function extForUrl(url: string): string {
   const u = url.toLowerCase().split('?')[0].split('#')[0];
   if (u.endsWith('.txt')) return 'txt';
@@ -175,6 +192,16 @@ function stableFileNameOf(subId: string, url: string): string {
 /** 注册进 lives 的 api（= 直播页加载器唯一认得的形态） */
 function apiOf(subId: string, url: string): string {
   return localLiveUrl(LOCAL_PROXY_BASE, stableFileNameOf(subId, url));
+}
+
+/** 是否为「/file/local-live/」形态的本地源 api */
+function isLocalLiveApi(api: string): boolean {
+  return typeof api === 'string' && api.startsWith(LOCAL_LIVE_API_PREFIX);
+}
+
+/** 是否为「本模块（网络订阅源）管理」的本地文件名（`sub-*` 前缀） */
+function isSubscriptionLocalFileName(fileName: string): boolean {
+  return fileName.startsWith('sub-');
 }
 
 /** 从 lives 里移除本订阅源的线路（按 api 精确匹配，经 UserConfigManager 内存快照变更） */
@@ -338,6 +365,10 @@ export async function removeSubscription(id: string): Promise<void> {
 
   try { await removeSubFromLives(sub); } catch (e) { console.warn('[LiveSub] 移除 lives 失败：', e); }
   await deleteLocalFile(sub.localFile);
+  // 同时删除 <userData>/local-live/ 里的副本
+  try {
+    await fs.rm(path.join(localLiveDir(), stableFileNameOf(sub.id, sub.url)), { force: true });
+  } catch { /* ignore */ }
   subs.splice(idx, 1);
   await saveSubscriptions(subs);
 
@@ -377,8 +408,8 @@ export async function updateSubscription(
       try { await removeSubFromLives(old); } catch { /* ignore */ }
     }
     if (urlChanged) {
-      // URL 变了：旧缓存文件不再可用 → 清掉（下次启用会重新下载）
       await deleteLocalFile(old.localFile);
+      try { await fs.rm(path.join(localLiveDir(), stableFileNameOf(old.id, old.url)), { force: true }); } catch { /* ignore */ }
       next.localFile = undefined;
     }
     subs[idx] = next;
@@ -388,13 +419,9 @@ export async function updateSubscription(
   }
 
   // 启用（或保持启用）：
-  //   · url 变化 → 必须重下
-  //   · 无本地缓存 → 必须下
-  //   · 只是启停切换 / 只改 name → 无需重下，直接用已有缓存文件重导
   const needDownload = urlChanged || !old.localFile || !(await fileExists(old.localFile));
 
   if (needDownload) {
-    // URL 变了：老缓存文件不再需要
     if (urlChanged && old.localFile) {
       await deleteLocalFile(old.localFile);
       next.localFile = undefined;
@@ -408,7 +435,6 @@ export async function updateSubscription(
     }
   }
 
-  // 走本地导入链路（新增、启用、改名、URL 变化都落到这里；url 稳定 → replaced=true 覆盖同条目）
   if (next.localFile) {
     const r = liveImporter(next.localFile, {
       customName: `${SUB_BEAN_PREFIX}${next.name}`,
@@ -447,8 +473,6 @@ export async function moveSubscription(
   subs.splice(target, 0, item);
   await saveSubscriptions(subs);
 
-  // 注：lives 里的顺序不再由此处调整 —— 直播页下拉顺序以 lives 数组顺序为准，
-  // 本模块追加时都落在末尾；用户如果希望顺序对齐，可通过「删除 + 重加」调整。
   notifyLiveSubscriptionsChanged();
   return subs;
 }
@@ -563,6 +587,71 @@ export async function checkAndUpdateSubscriptions(): Promise<CheckUpdateSummary>
 }
 
 // =========================================================================
+// ★ 2026-10-13：本地源管理（用户手动导入的本地 TXT/M3U；非网络订阅源）
+//
+// 识别口径：
+//   · 属于本地源：`LiveBean.url` 以 `${LOCAL_PROXY_BASE}/file/local-live/` 开头
+//   · 排除：文件名以 `sub-` 开头（那是本模块的网络订阅源，交给「网络订阅源」列表管理）
+// =========================================================================
+export interface LocalLiveSource {
+  /** 线路显示名（= LiveBean.name） */
+  name: string;
+  /** 线路 api（= LiveBean.url；`http://127.0.0.1:9978/file/local-live/<文件名>`） */
+  api: string;
+  /** <userData>/local-live/ 下的文件名 */
+  fileName: string;
+  /** 该本地文件当前是否还存在（false = 已被手动删；线路会在下次清理时移除） */
+  fileExists: boolean;
+}
+
+/** 列出「配置页 · 导入本地 TXT/M3U」写入的 lives 条目（不含网络订阅源 `sub-*`） */
+export async function listLocalLiveSources(): Promise<LocalLiveSource[]> {
+  const uc = UserConfigManager.current;
+  if (!uc) return [];
+  const cfg = uc.snapshot();
+  const out: LocalLiveSource[] = [];
+  for (const l of cfg.lives || []) {
+    const api = String(l.url || '').trim();
+    if (!isLocalLiveApi(api)) continue;
+    const fileName = api.slice(LOCAL_LIVE_API_PREFIX.length);
+    if (!fileName) continue;
+    if (isSubscriptionLocalFileName(fileName)) continue; // 网络订阅源，交给订阅列表管
+    out.push({
+      name: String(l.name || '').trim() || fileName,
+      api,
+      fileName,
+      fileExists: await fileExists(path.join(localLiveDir(), fileName)),
+    });
+  }
+  return out;
+}
+
+/** 删除一条本地源：按 api 精确移除 lives 条目 + 删除 <userData>/local-live/<文件名> */
+export async function removeLocalLiveSource(api: string): Promise<boolean> {
+  const uc = UserConfigManager.current;
+  if (!uc) throw new Error('配置管理器未就绪');
+  const target = String(api || '').trim();
+  if (!isLocalLiveApi(target)) throw new Error('不是本地直播源');
+  const fileName = target.slice(LOCAL_LIVE_API_PREFIX.length);
+  if (!fileName) throw new Error('本地文件名解析失败');
+  if (isSubscriptionLocalFileName(fileName)) {
+    throw new Error('该源由网络订阅源管理，请在「网络订阅源」列表中删除');
+  }
+
+  const removed = uc.removeLiveByApi(target);
+  if (removed) {
+    try {
+      await fs.rm(path.join(localLiveDir(), fileName), { force: true });
+    } catch (e) {
+      console.warn('[LiveSub] 删除本地文件失败：', e);
+    }
+    notifyLiveSubscriptionsChanged();
+    console.info(`[LiveSub] 已删除本地源：${fileName}`);
+  }
+  return removed;
+}
+
+// =========================================================================
 // IPC 注册
 // =========================================================================
 export function registerLiveSubscriptionIpc(): void {
@@ -573,4 +662,8 @@ export function registerLiveSubscriptionIpc(): void {
   ipcMain.handle(LIVE_SUB_CHANNELS.TOGGLE, async (_e, id: string, enabled: boolean) => updateSubscription(id, { enabled: !!enabled }));
   ipcMain.handle(LIVE_SUB_CHANNELS.MOVE, async (_e, id: string, dir: 'up' | 'down' | 'top' | 'bottom') => moveSubscription(id, dir));
   ipcMain.handle(LIVE_SUB_CHANNELS.REFRESH_ALL, async () => refreshAllSubscriptions());
+
+  // ★ 2026-10-13：本地源管理
+  ipcMain.handle(LIVE_LOCAL_CHANNELS.LIST, async () => listLocalLiveSources());
+  ipcMain.handle(LIVE_LOCAL_CHANNELS.REMOVE, async (_e, api: string) => removeLocalLiveSource(String(api || '')));
 }

@@ -1832,3 +1832,45 @@ export default function ConfigPage() {
               {davServers.map((s) => (
                 <tr key={s.id}>
                   <td style={{ padding: '4px 6px' }}>{s.name}</td>
+                  <td style={{ padding: '4px 6px', fontFamily: 'monospace' }}>{s.url}</td>
+                  <td style={{ padding: '4px 6px' }}>{s.username || '—'}</td>
+                  <td style={{ padding: '4px 6px', textAlign: 'right' }}>
+                    <button onClick={() => { setDavDraft({ ...s }); setDavMsg(null); }}>编辑</button>{' '}
+                    <button onClick={() => void removeDav(s)}>删除</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <div className="empty">还没有添加存储</div>
+        )}
+      </div>
+      </>
+      )}
+
+      {tab === 'backup' && (
+      <>
+      
+      <div className="card" style={{ padding: 12, marginBottom: 16 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <span className="muted" style={{ fontSize: 12 }}>
+            备份内容：订阅源与档案 · 网盘 Cookie · 字幕 / TMDB 凭据 · 弹幕与播放偏好 · 代理 · 快捷键 · 外观 · 观看历史与收藏。
+          </span>
+          <span className="muted" style={{ fontSize: 12 }}>
+            ⚠ 凭据（网盘 Cookie / 接口密钥）在备份文件里是<b>明文</b>，便于换机或重装后还原 —— 请自行妥善保管，不要外传。
+          </span>
+          <div className="row" style={{ alignItems: 'center', gap: 10 }}>
+            <button className="primary" disabled={bkBusy} onClick={() => void doBackupExport()}>导出设置备份</button>
+            <button disabled={bkBusy} onClick={() => void doBackupImport()}>导入设置备份</button>
+            {bkMsg && (
+              <span className={bkMsg.kind === 'err' ? 'err' : 'status'} style={{ margin: 0 }}>{bkMsg.text}</span>
+            )}
+          </div>
+        </div>
+      </div>
+      </>
+      )}
+    </div>
+  );
+}

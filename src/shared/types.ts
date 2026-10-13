@@ -121,22 +121,33 @@ export interface LiveLine {
 // ---------- 网络直播订阅源（自定义名称 + 链接；支持 m3u / m3u8 / txt / json） ----------
 /**
  * ★ 用户新增需求：允许用户给 Win-box 添加**网络订阅源**（自定义名称 + 链接）。
- * 每次进入直播页时由主进程拉取并解析，结果与本地（导入）的 LiveGroup 合并展示。
- * 持久化文件：<userData>/live-subscriptions.json
+ *
+ * ★ 2026-10-13 方案升级：不再每次进直播页现拉现解析；改为**添加时立即下载到本地**，
+ *   落盘到 <userData>/live-subscriptions/files/<id>.<ext>，
+ *   并自动注册到 UserConfig.lives（等价于「导入本地直播源」）——
+ *   直播页顶部线路下拉会多出一条「【订阅】xxx」，与本地导入完全同构。
+ *
+ * 元数据持久化：<userData>/live-subscriptions/index.json
  */
 export interface LiveSubscription {
   /** 唯一 id（生成规则见 LiveSubscriptionManager.addSubscription） */
   id: string;
-  /** 用户自定义名称；解析不到 group-title / #genre# 时作为默认分组名 */
+  /** 用户自定义名称；注册到 lives 时前缀为「【订阅】」以便识别 */
   name: string;
-  /** 订阅链接（http/https；后缀 .m3u / .m3u8 / .txt / .json，无后缀默认按 m3u 解析） */
+  /** 订阅链接（http/https；后缀 .m3u / .m3u8 / .txt / .json，无后缀默认按 m3u 下载） */
   url: string;
-  /** 是否启用；停用后不参与刷新 */
+  /** 是否启用；停用后从 lives 移除（但保留本地文件） */
   enabled: boolean;
-  /** 最近一次成功更新时间（ISO 字符串） */
+  /** 最近一次成功下载/更新时间（ISO 字符串） */
   lastUpdated?: string;
-  /** 最近一次刷新失败原因（成功时清空） */
+  /** 最近一次下载/解析失败原因（成功时清空） */
   lastError?: string;
+  /**
+   * ★ 2026-10-13：下载到本地的文件**绝对路径**。
+   *   例：C:\Users\xxx\AppData\Roaming\Win-Box\live-subscriptions\files\abc123.m3u
+   *   下载成功时写入，删除订阅源时一并清理该文件。
+   */
+  localFile?: string;
 }
 
 /** 一次「刷新全部订阅源」的逐源结果（refreshAll IPC 的返回项） */
@@ -144,7 +155,10 @@ export interface LiveSubscriptionRefreshResult {
   id: string;
   name: string;
   ok: boolean;
-  /** ok=true 时的解析结果 */
+  /**
+   * 兼容字段：老版本会用它在渲染层合并展示；新版本走「注册到 lives」不再使用。
+   * 保留以避免 IPC 结构变动导致前端类型不匹配。
+   */
   groups?: LiveGroup[];
   /** ok=false 时的错误摘要（HTTP 状态 / 解析异常等） */
   error?: string;
@@ -606,6 +620,6 @@ export interface BossKeySettings {
 
 export interface Logger {
   i(t: string): void;
-  w(t: string): void;
+  w(t: string, err?: unknown): void;
   e(t: string, err?: unknown): void;
 }

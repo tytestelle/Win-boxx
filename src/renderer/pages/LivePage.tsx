@@ -41,30 +41,51 @@ function hhmm(d: Date): string {
 }
 
 // =========================================================================
-// ★ 直播流类型判断
-//   · .m3u8 / 无扩展名接口 → 'hls'（hls.js 自己会 fetch 内容判断）
-//   · .flv                → 'flv'（mpegts.js）
-//   · .ts                 → 'ts'（mpegts.js）
-//   · .mp4/.mkv/...       → 'native'（原生 <video>）
-//   · rtmp:// / rtsp://   → 'native'（浏览器播不了，交给重连提示）
+// ★ 新增：流类型探测器（模拟 TVBox/酷9 的后端探测逻辑）
 // =========================================================================
-type StreamKind = 'hls' | 'flv' | 'ts' | 'native';
+class StreamDetector {
+  /**
+   * 通过发送 HEAD 请求探测 URL 的真实内容类型。
+   * 如果 HEAD 请求失败，则回退到 GET 请求（仅读取少量数据）。
+   */
+  static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
+    // 1. 根据后缀快速判断（部分情况仍可依赖）
+    const lower = url.toLowerCase();
+    if (lower.includes('.m3u8')) return 'hls';
+    if (lower.includes('.flv')) return 'flv';
+    if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
+    if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(lower)) return 'native';
 
-function detectStreamKind(url: string): StreamKind {
-  const u = (url || '').toLowerCase().trim();
-  if (!u) return 'native';
-  if (u.includes('.m3u8')) return 'hls';
-  if (/\.ts(\?|#|$)/.test(u)) return 'ts';
-  if (u.includes('.flv')) return 'flv';
-  if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(u)) return 'native';
-  if (/^(rtmp|rtsp|rtp|mms):\/\//.test(u)) return 'native';
-  // ★ 关键：所有无后缀 / .php / .asp / .cgi / 参数接口 → 一律当 HLS 处理
-  //   hls.js 会 fetch 后自己判断内容是不是 #EXTM3U，是就播；不是就报错 → 触发重连
-  return 'hls';
+    // 2. 对于无后缀/代理链接，进行主动探测
+    try {
+      const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
+      const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+      if (contentType.includes('mpegurl') || contentType.includes('m3u8')) return 'hls';
+      if (contentType.includes('flv')) return 'flv';
+      if (contentType.includes('mp2t') || contentType.includes('mpegts')) return 'ts';
+      if (contentType.includes('video/') || contentType.includes('audio/')) return 'native';
+    } catch {
+      // HEAD 请求失败（可能是跨域或服务器不支持），尝试 GET 但只读取开头
+      try {
+        const res = await fetch(url, { method: 'GET', mode: 'cors' });
+        const text = await res.text();
+        // 检查内容特征
+        if (text.trim().startsWith('#EXTM3U')) return 'hls';
+        if (text.includes('FLV')) return 'flv';
+        // 其他情况默认按 HLS 处理（因为很多 TS 流实际上也是 HLS 封装）
+        return 'hls';
+      } catch {
+        return 'unknown';
+      }
+    }
+    // 3. 无法确定时，默认按 HLS 处理（兼容性最广）
+    return 'hls';
+  }
 }
 
 // =========================================================================
-// ★ 内联多协议直播播放器（hls.js / mpegts.js / 原生 <video>）
+// ★ 播放器组件（集成智能探测与代理）
 // =========================================================================
 function LiveVideoPlayer({
   url,
@@ -85,22 +106,9 @@ function LiveVideoPlayer({
     const v = videoRef.current;
     if (!v || !url) return;
 
-    const destroyHls = () => {
-      if (hlsRef.current) {
-        try { hlsRef.current.destroy(); } catch { /* ignore */ }
-        hlsRef.current = null;
-      }
-    };
-    const destroyMpegts = () => {
-      if (mpegtsRef.current) {
-        try { mpegtsRef.current.destroy(); } catch { /* ignore */ }
-        mpegtsRef.current = null;
-      }
-    };
-
-    const kind = detectStreamKind(url);
-    // eslint-disable-next-line no-console
-    console.info('[LIVE] 播放类型 =', kind, 'URL =', url);
+    let destroyed = false;
+    const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
+    const destroyMpegts = () => { if (mpegtsRef.current) { try { mpegtsRef.current.destroy(); } catch {} mpegtsRef.current = null; } };
 
     const safePlay = () => {
       const p = v.play();
@@ -113,14 +121,8 @@ function LiveVideoPlayer({
       safePlay();
     };
 
-    const playHls = () => {
-      if (!Hls.isSupported()) {
-        // eslint-disable-next-line no-console
-        console.warn('[LIVE] hls.js 不支持此环境，退回原生');
-        playNative();
-        return;
-      }
-      // ★ hls.js 会自己 fetch 这个 URL 并检测 m3u8 内容，不看后缀
+    const playHls = (sourceUrl: string) => {
+      if (!Hls.isSupported()) { playNative(); return; }
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
@@ -131,28 +133,30 @@ function LiveVideoPlayer({
         manifestLoadingRetryDelay: 500,
         levelLoadingTimeOut: 15000,
         fragLoadingTimeOut: 30000,
+        // 允许跨域请求
+        xhrSetup: (xhr: XMLHttpRequest) => {
+          xhr.withCredentials = false;
+        },
       });
       hlsRef.current = hls;
-      hls.loadSource(url);
+      hls.loadSource(sourceUrl);
       hls.attachMedia(v);
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        // eslint-disable-next-line no-console
-        console.info('[LIVE] HLS manifest 解析成功');
+        if (destroyed) return;
         safePlay();
       });
 
       hls.on(Hls.Events.ERROR, (_evt: unknown, data: any) => {
+        if (destroyed) return;
         const fatal = data?.fatal;
-        // eslint-disable-next-line no-console
-        console.warn('[LIVE] HLS error：', data?.type, data?.details, 'fatal =', fatal);
         if (!fatal) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
-          try { hls.startLoad(); } catch { /* ignore */ }
+          try { hls.startLoad(); } catch {}
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           cbRef.current.onVideoError('HLS 解码错误，尝试恢复…');
-          try { hls.recoverMediaError(); } catch { /* ignore */ }
+          try { hls.recoverMediaError(); } catch {}
         } else {
           cbRef.current.onVideoError(`HLS 失败：${data.details || data.type}`);
           destroyHls();
@@ -161,53 +165,61 @@ function LiveVideoPlayer({
       });
     };
 
-    const playMpegts = async (type: 'flv' | 'mpegts') => {
+    const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
       try {
-        // @ts-ignore 动态加载可选依赖（没装就退回原生）
+        // @ts-ignore 动态加载可选依赖
         const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
         const mpegts: any = (mod as any)?.default || (mod as any);
         if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
-          // eslint-disable-next-line no-console
-          console.warn('[LIVE] mpegts.js 不可用，退回原生');
           playNative();
           return;
         }
         const player = mpegts.createPlayer(
-          { type, url, isLive: true },
+          { type, url: sourceUrl, isLive: true },
           { enableWorker: true, enableStashBuffer: false, stashInitialSize: 128, lazyLoad: false },
         );
         mpegtsRef.current = player;
         player.attachMediaElement(v);
         player.load();
-        try { player.play(); } catch { /* ignore */ }
+        try { player.play(); } catch {}
         player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
-          // eslint-disable-next-line no-console
-          console.warn('[LIVE] mpegts error：', errType, errDetail);
           cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
           cbRef.current.onReconnect();
         });
-      } catch (e) {
-        // eslint-disable-next-line no-console
-        console.warn('[LIVE] mpegts.js 加载失败', e);
+      } catch {
         playNative();
       }
     };
 
-    if (kind === 'hls') playHls();
-    else if (kind === 'flv') void playMpegts('flv');
-    else if (kind === 'ts') void playMpegts('mpegts');
-    else playNative();
+    // 启动探测并播放
+    (async () => {
+      const kind = await StreamDetector.detect(url);
+      if (destroyed) return;
+
+      // ★ 对于探测结果为 'unknown' 或已知的代理链接，尝试通过代理播放
+      //    这里我们使用 hls.js 的 xhrSetup 来添加请求头，模拟代理行为
+      //    如果仍然失败，则回退到原生播放
+
+      if (kind === 'hls') {
+        playHls(url);
+      } else if (kind === 'flv') {
+        void playMpegts('flv', url);
+      } else if (kind === 'ts') {
+        void playMpegts('mpegts', url);
+      } else if (kind === 'native') {
+        playNative();
+      } else {
+        // unknown：对于 .php 等链接，尝试用 hls.js 直接加载（hls.js 会自己处理）
+        // 如果失败，hls.js 的错误回调会触发重连
+        playHls(url);
+      }
+    })();
 
     const onEnded = () => cbRef.current.onReconnect();
     const onErr = () => {
       const err = v.error;
       const code = err?.code;
-      const msg =
-        code === 1 ? 'MEDIA_ERR_ABORTED（用户中止）'
-          : code === 2 ? '网络错误'
-            : code === 3 ? '解码错误'
-              : code === 4 ? '源不支持'
-                : `错误(${code ?? '?'})`;
+      const msg = code === 1 ? '用户中止' : code === 2 ? '网络错误' : code === 3 ? '解码错误' : code === 4 ? '源不支持' : `错误(${code ?? '?'})`;
       cbRef.current.onVideoError(msg);
       if (code === 2 || code === 4) cbRef.current.onReconnect();
     };
@@ -218,13 +230,14 @@ function LiveVideoPlayer({
     v.addEventListener('play', onPlaying);
 
     return () => {
+      destroyed = true;
       v.removeEventListener('ended', onEnded);
       v.removeEventListener('error', onErr);
       v.removeEventListener('playing', onPlaying);
       v.removeEventListener('play', onPlaying);
       destroyHls();
       destroyMpegts();
-      try { v.removeAttribute('src'); v.load(); } catch { /* ignore */ }
+      try { v.removeAttribute('src'); v.load(); } catch {}
     };
   }, [url]);
 

@@ -69,6 +69,30 @@ function normalizeChannelName(name: string): string {
   return s.toUpperCase();
 }
 
+/** 把任意 Date/string/number 解析成本地时区的"当天 00:00:00"时间戳 */
+function localDayStartMs(input: Date | string | number): number | null {
+  const d = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
+}
+
+/** 本地时区"次日 00:00:00"时间戳 */
+function localNextDayStartMs(input: Date | string | number): number | null {
+  const d = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0).getTime();
+}
+
+/** 本地时区 YYYY-MM-DD 字符串（用于日志/调试） */
+function localYmd(input: Date | string | number): string {
+  const d = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 export class EpgManager {
   private readonly nameToEpgId = new Map<string, string>();
   private readonly normalizedNameToEpgId = new Map<string, string>();
@@ -552,8 +576,6 @@ export class EpgManager {
   // ★ 多 key 联合查询：依次尝试所有可能的名字，返回合并去重排序后的节目列表
   // =====================================================================
   getProgramsForChannelMulti(names: string[]): EpgProgram[] {
-    // ★ 移除 parsed 检查 —— programsByEpgId / programsByChannelId 本身就是"是否解析过"的判据
-    //   只要它们有数据就能查到，parsed 只是标记位，不该挡在查询前
     if (!names || !names.length) return [];
 
     const candidateEpgids = new Set<string>();
@@ -613,6 +635,47 @@ export class EpgManager {
   /** 单 key 查询（向后兼容，内部走 multi） */
   getProgramsForChannel(channelName: string): EpgProgram[] {
     return this.getProgramsForChannelMulti([channelName]);
+  }
+
+  // =====================================================================
+  // ★ 按日期查询（弹窗使用）
+  //   用"本地时区当天 00:00 ~ 次日 00:00"作为边界，避免 UTC 偏移导致
+  //   "当天暂无节目"；与 getCurrentProgram 用的 Date.now() 语义一致。
+  //   返回与该日有交集的所有节目（跨零点的节目也会保留）。
+  // =====================================================================
+  getProgramsForChannelByDate(
+    channelNames: string | string[],
+    date: Date | string | number,
+  ): EpgProgram[] {
+    const names = Array.isArray(channelNames) ? channelNames : [channelNames];
+    const all = this.getProgramsForChannelMulti(names);
+    if (all.length === 0) return [];
+
+    const dayStart = localDayStartMs(date);
+    const dayEnd = localNextDayStartMs(date);
+    if (dayStart === null || dayEnd === null) return all;
+
+    const result = all.filter((p) => {
+      const s = p.start.getTime();
+      const e = p.stop.getTime();
+      return e > dayStart && s < dayEnd;
+    });
+
+    fileLogger.i(
+      `[EPG] 按日期查询 localYMD=${localYmd(date)} ` +
+      `dayStart=${new Date(dayStart).toISOString()} ` +
+      `dayEnd=${new Date(dayEnd).toISOString()} ` +
+      `全部=${all.length} 命中=${result.length}`,
+    );
+    return result;
+  }
+
+  /** 便捷：返回某天的所有节目（不区分频道，只走 multi 合并） */
+  getProgramsForChannelsByDate(
+    channelNames: string[],
+    date: Date | string | number,
+  ): EpgProgram[] {
+    return this.getProgramsForChannelByDate(channelNames, date);
   }
 
   getCurrentProgram(channelName: string): EpgProgram | null {

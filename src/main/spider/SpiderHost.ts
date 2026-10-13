@@ -2241,14 +2241,23 @@ export class SpiderHost {
     return this.epgMgr;
   }
 
-  /** ★ EPG 直查：支持单 key 或多 key 数组（渲染层会把 tvg-id / tvg-name / name 全部传进来，依次尝试） */
+  /**
+   * ★ EPG 直查：支持三种入参 —— 单 key / 数组 / 逗号分隔字符串。
+   *   渲染层推荐传 `[tvg-id, tvg-name, name]` 依次尝试。
+   */
   getLiveEpgPrograms(channelNames: string | string[]) {
     if (!this.epgMgr) return [];
-    const list = Array.isArray(channelNames) ? channelNames : [channelNames];
+    let list: string[];
+    if (Array.isArray(channelNames)) list = channelNames;
+    else list = String(channelNames || '').split(',');
+    // eslint-disable-next-line no-console
+    fileLogger.i(`[EPG] epgPrograms 查询 keys=${JSON.stringify(list)}`);
     for (const n of list) {
       const trimmed = String(n || '').trim();
       if (!trimmed) continue;
       const got = this.epgMgr.getProgramsForChannel(trimmed);
+      // eslint-disable-next-line no-console
+      fileLogger.i(`[EPG]   key="${trimmed}" → ${got.length} 条`);
       if (got.length) return got;
     }
     return [];

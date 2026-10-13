@@ -1,5 +1,5 @@
 // src/main/LiveSubscriptionManager.ts
-// 网络直播订阅源：CRUD + 网络拉取 + m3u/txt/json 解析 + IPC 注册。
+// 网络直播订阅源：CRUD + 排序 + 网络拉取 + m3u/txt/json 解析 + IPC 注册。
 // 持久化到 <userData>/live-subscriptions.json。
 // 使用方式：主进程启动时调用一次 registerLiveSubscriptionIpc()。
 
@@ -20,6 +20,7 @@ export const LIVE_SUB_CHANNELS = {
   REMOVE: 'live:subscription:remove',
   UPDATE: 'live:subscription:update',
   TOGGLE: 'live:subscription:toggle',
+  MOVE: 'live:subscription:move',
   REFRESH_ALL: 'live:subscription:refreshAll',
 } as const;
 
@@ -60,7 +61,7 @@ async function saveSubscriptions(subs: LiveSubscription[]): Promise<void> {
 }
 
 // =========================================================================
-// CRUD
+// CRUD + 排序
 // =========================================================================
 
 export async function addSubscription(name: string, url: string): Promise<LiveSubscription> {
@@ -93,16 +94,54 @@ export async function updateSubscription(
   const subs = await listSubscriptions();
   const idx = subs.findIndex((s) => s.id === id);
   if (idx === -1) return null;
-  subs[idx] = { ...subs[idx], ...patch };
+
+  const next: LiveSubscription = { ...subs[idx] };
+  if (typeof patch.name === 'string') {
+    const n = patch.name.trim();
+    if (!n) throw new Error('名称不能为空');
+    next.name = n;
+  }
+  if (typeof patch.url === 'string') {
+    const u = patch.url.trim();
+    if (!/^https?:\/\//i.test(u)) throw new Error('订阅链接必须以 http:// 或 https:// 开头');
+    next.url = u;
+  }
+  if (typeof patch.enabled === 'boolean') {
+    next.enabled = patch.enabled;
+  }
+
+  subs[idx] = next;
   await saveSubscriptions(subs);
-  return subs[idx];
+  return next;
+}
+
+/** 上下移动 / 置顶 / 置底 */
+export async function moveSubscription(
+  id: string,
+  direction: 'up' | 'down' | 'top' | 'bottom',
+): Promise<LiveSubscription[]> {
+  const subs = await listSubscriptions();
+  const idx = subs.findIndex((s) => s.id === id);
+  if (idx === -1) return subs;
+
+  let target = idx;
+  if (direction === 'up') target = Math.max(0, idx - 1);
+  else if (direction === 'down') target = Math.min(subs.length - 1, idx + 1);
+  else if (direction === 'top') target = 0;
+  else if (direction === 'bottom') target = subs.length - 1;
+
+  if (target === idx) return subs;
+
+  const [item] = subs.splice(idx, 1);
+  subs.splice(target, 0, item);
+  await saveSubscriptions(subs);
+  return subs;
 }
 
 // =========================================================================
 // 网络拉取
 // =========================================================================
 
-/** 根据 URL 后缀判断解析格式；无后缀默认按 m3u 处理（兼容绝大多数 IPTV 源） */
 function detectFormat(url: string): 'm3u' | 'txt' | 'json' {
   const lower = url.toLowerCase().split('?')[0].split('#')[0];
   if (lower.endsWith('.m3u') || lower.endsWith('.m3u8')) return 'm3u';
@@ -113,8 +152,7 @@ function detectFormat(url: string): 'm3u' | 'txt' | 'json' {
 
 /**
  * GitHub 加速：当 URL 是 raw.githubusercontent.com / github.com/.../raw/ 时，
- * 依次尝试「直连 → ghproxy.net 镜像」。
- * 仅在直连失败时启用镜像，避免用户网络本身良好时反而绕路。
+ * 依次尝试「直连 → ghproxy.net 镜像 → gh-proxy.com 镜像」。
  */
 function buildFetchCandidates(url: string): string[] {
   const candidates: string[] = [url];
@@ -150,7 +188,6 @@ async function fetchTextOnce(url: string, timeoutMs = 20000): Promise<string> {
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ''}`.trim());
     const buf = await res.arrayBuffer();
 
-    // 编码处理：优先 Content-Type 里声明的 charset；缺省按 UTF-8，含 BOM 自动剥离
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     const m = ct.match(/charset=([\w-]+)/i);
     const charset = (m?.[1] || '').toLowerCase();
@@ -167,9 +204,7 @@ async function fetchTextOnce(url: string, timeoutMs = 20000): Promise<string> {
     if (charset && charset !== 'utf-8' && charset !== 'utf8') {
       return tryDecode(charset) ?? tryDecode('utf-8') ?? '';
     }
-    // 无声明 charset：先按 utf-8 解，若首字节是 EF BB BF 会被 TextDecoder 自动去除
     let text = new TextDecoder('utf-8').decode(buf);
-    // 简单启发：utf-8 解码后出现明显乱码（U+FFFD 比例过高）→ 尝试 gbk
     if (text.length > 0) {
       const bad = (text.match(/\uFFFD/g) || []).length;
       if (bad / text.length > 0.05) {
@@ -183,7 +218,6 @@ async function fetchTextOnce(url: string, timeoutMs = 20000): Promise<string> {
   }
 }
 
-/** 拉取订阅正文；GitHub 直连失败时自动尝试镜像 */
 async function fetchSubscriptionText(url: string): Promise<string> {
   const candidates = buildFetchCandidates(url);
   let lastErr: unknown = null;
@@ -192,7 +226,6 @@ async function fetchSubscriptionText(url: string): Promise<string> {
       return await fetchTextOnce(candidates[i]);
     } catch (e) {
       lastErr = e;
-      // 直连失败且还有镜像 → 继续；否则抛出
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -202,7 +235,6 @@ async function fetchSubscriptionText(url: string): Promise<string> {
 // 解析：m3u / txt / json
 // =========================================================================
 
-/** 构造 LiveChannel，保证所有必填字段都有默认值 */
 function makeChannel(
   name: string,
   url: string,
@@ -225,14 +257,12 @@ function makeChannel(
   };
 }
 
-/** 把 urls 数组去重 + 过滤非法 URL + 保留 $线路名 后缀 */
 function cleanUrls(raw: string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const r of raw) {
     const s = (r || '').trim();
     if (!s) continue;
-    // 允许 http(s):// 、rtmp(s):// 、rtsp:// 等；同时保留 URL$线路名
     const bare = s.split('$')[0];
     if (!/^(https?|rtmp|rtmps|rtsp|udp|rtp|mms):\/\//i.test(bare)) continue;
     if (seen.has(s)) continue;
@@ -252,13 +282,11 @@ function parseM3U(text: string, defaultGroup: string): LiveGroup[] {
     if (!line) continue;
 
     if (line.startsWith('#EXTINF:')) {
-      // 抽取所有 k="v" 属性
       const attrs: Record<string, string> = {};
       const attrRe = /([\w-]+)="([^"]*)"/g;
       let m: RegExpExecArray | null;
       while ((m = attrRe.exec(line))) attrs[m[1].toLowerCase()] = m[2];
 
-      // 逗号后的显示名（M3U 规范：最后一个逗号之后是标题）
       const commaIdx = line.lastIndexOf(',');
       const displayName = commaIdx >= 0 ? line.slice(commaIdx + 1).trim() : '';
 
@@ -274,15 +302,12 @@ function parseM3U(text: string, defaultGroup: string): LiveGroup[] {
         format: attrs['format'] || '',
       };
       pendingGroup = (attrs['group-title'] || '').trim() || defaultGroup;
-
-      // 名称最终在 URL 行组装；此处先把"显示名优先"暂存
       (pending as any).__displayName = attrs['tvg-name'] || displayName || 'Unnamed';
       continue;
     }
 
     if (line.startsWith('#')) continue;
 
-    // 非 # 开头 → 视为 URL 行
     if (!pending) continue;
     const chName = String((pending as any).__displayName || 'Unnamed');
     delete (pending as any).__displayName;
@@ -307,7 +332,6 @@ function parseTXT(text: string, defaultGroup: string): LiveGroup[] {
   let currentGroup = defaultGroup;
 
   for (const line of lines) {
-    // 支持三种 #genre# 形态：#genre# 央视 / 央视,#genre# / 央视 #genre#
     if (line.includes('#genre#')) {
       const g = line.replace(/#genre#/gi, '').replace(/^#\s*/, '').replace(/^,\s*/, '').replace(/,\s*$/, '').trim();
       currentGroup = g || defaultGroup;
@@ -319,7 +343,6 @@ function parseTXT(text: string, defaultGroup: string): LiveGroup[] {
     if (commaIdx === -1) continue;
     const name = line.slice(0, commaIdx).trim();
     const urlPart = line.slice(commaIdx + 1).trim();
-    // 一个条目可能携带多条线路：url1$线路1#url2$线路2
     const urls = cleanUrls(urlPart.split('#'));
     if (!urls.length) continue;
 
@@ -335,7 +358,6 @@ function parseTXT(text: string, defaultGroup: string): LiveGroup[] {
 function parseJSON(text: string, defaultGroup: string): LiveGroup[] {
   const data = JSON.parse(text);
 
-  // 形态 1：LiveGroup[] —— [{group, channels:[{name,urls,logo,...}]}, ...]
   if (Array.isArray(data) && data.length && data.every((x) => x && typeof x === 'object' && 'channels' in x)) {
     const out: LiveGroup[] = [];
     for (const g of data as any[]) {
@@ -363,7 +385,6 @@ function parseJSON(text: string, defaultGroup: string): LiveGroup[] {
     if (out.length) return out;
   }
 
-  // 形态 2：FongMi 风格 {lives:[{name, url/api, group?}, ...]}
   if (data && typeof data === 'object' && Array.isArray((data as any).lives)) {
     const groupMap = new Map<string, LiveChannel[]>();
     for (const l of (data as any).lives) {
@@ -377,7 +398,6 @@ function parseJSON(text: string, defaultGroup: string): LiveGroup[] {
     if (groupMap.size) return [...groupMap.entries()].map(([group, channels]) => ({ group, channels }));
   }
 
-  // 形态 3：{ "央视": [{name,url}, ...], "卫视": [...] }
   if (data && typeof data === 'object' && !Array.isArray(data)) {
     const out: LiveGroup[] = [];
     for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
@@ -411,7 +431,6 @@ function parseJSON(text: string, defaultGroup: string): LiveGroup[] {
 // 公开刷新 API
 // =========================================================================
 
-/** 拉取并解析单个订阅源 */
 export async function refreshSubscription(sub: LiveSubscription): Promise<LiveGroup[]> {
   const text = await fetchSubscriptionText(sub.url);
   if (!text || !text.trim()) throw new Error('订阅内容为空');
@@ -421,11 +440,6 @@ export async function refreshSubscription(sub: LiveSubscription): Promise<LiveGr
   return parseJSON(text, sub.name);
 }
 
-/**
- * 刷新全部**启用**的订阅源。
- * - 单个源失败不会阻塞其他源（逐项 try/catch）
- * - 同时回写 lastUpdated / lastError 到磁盘
- */
 export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefreshResult[]> {
   const subs = await listSubscriptions();
   const results: LiveSubscriptionRefreshResult[] = [];
@@ -440,13 +454,7 @@ export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefresh
       const groups = await refreshSubscription(sub);
       sub.lastUpdated = new Date().toISOString();
       sub.lastError = undefined;
-      results.push({
-        id: sub.id,
-        name: sub.name,
-        ok: true,
-        groups,
-        lastUpdated: sub.lastUpdated,
-      });
+      results.push({ id: sub.id, name: sub.name, ok: true, groups, lastUpdated: sub.lastUpdated });
       dirty = true;
     } catch (e) {
       const msg = (e as Error)?.message || String(e);
@@ -486,11 +494,11 @@ export function registerLiveSubscriptionIpc(): void {
     return await updateSubscription(id, { enabled: !!enabled });
   });
 
+  ipcMain.handle(LIVE_SUB_CHANNELS.MOVE, async (_e, id: string, direction: 'up' | 'down' | 'top' | 'bottom') => {
+    return await moveSubscription(id, direction);
+  });
+
   ipcMain.handle(LIVE_SUB_CHANNELS.REFRESH_ALL, async () => {
     return await refreshAllSubscriptions();
   });
 }
-
-// 供 main/index.ts 一行接入：
-//   import { registerLiveSubscriptionIpc } from './LiveSubscriptionManager';
-//   registerLiveSubscriptionIpc();

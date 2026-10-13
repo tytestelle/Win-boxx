@@ -145,7 +145,6 @@ const SEARCH_ALL_QUICK_MS = 3_000;
 const UNSUPPORTED_ERR = /UNSUPPORTED_|SCRIPT_ERROR|PY_UNSUPPORTED|桌面版无法|不支持|未实现/i;
 const SEARCH_ALL_PREPARE_MS = 12_000;
 
-/** ★ 2026-10-13 EPG：内置默认 XMLTV 地址（走加速前缀）—— 用户线路没配 EPG URL 时兜底 */
 const DEFAULT_EPG_URL =
   'https://gitproxy.click/https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_merged.xml';
 
@@ -2133,11 +2132,6 @@ export class SpiderHost {
     return this.config?.lives ?? [];
   }
 
-  /**
-   * ★ 2026-10-13 EPG：走 TVBox 风格 EpgManager（epg_data.json 变体名映射 → XMLTV display-name
-   * 精确匹配 → 多源合并），返回每个频道的「当前 / 下一档」。频道引用由渲染层传入。
-   * 线路级 `live.epg` / 频道级 `tvg-url` 都没有时，用内置默认 EPG（epg_merged.xml）。
-   */
   async loadLiveEpg(index: number, refs: EpgChannelRef[]): Promise<LiveEpgResult> {
     const lives = this.config?.lives ?? [];
     const live = lives[Math.min(Math.max(index, 0), Math.max(lives.length - 1, 0))];
@@ -2180,22 +2174,23 @@ export class SpiderHost {
 
     const byKey: Record<string, LiveEpgEntry> = {};
     const now = Date.now();
+    let hitCount = 0;
     for (const ref of list) {
       const name = (ref.name || ref.tvgName || ref.tvgId || '').trim();
       if (!name) continue;
       const entry = this.buildLiveEpgEntry(mgr, name, now);
       if (!entry.current && !entry.next) continue;
+      hitCount++;
       for (const k of [ref.tvgId, ref.tvgName, ref.name]) {
         if (k) byKey[k] = entry;
       }
     }
     this.logger.i(
-      `EPG：地址 ${urls[0]} / 命中 ${Object.keys(byKey).length} 键（线路「${live?.name || index}」，请求 ${channelNames.length} 个频道）`,
+      `EPG：地址 ${urls[0]} / 命中 ${hitCount} 个频道（byKey ${Object.keys(byKey).length} 键）（线路「${live?.name || index}」，请求 ${channelNames.length} 个）`,
     );
     return { byKey };
   }
 
-  /** ★ 从 EpgManager 拿当前/下一档 → 转成渲染层需要的 LiveEpgEntry（HH:mm 文本 + 毫秒时间戳） */
   private buildLiveEpgEntry(mgr: EpgManager, channelName: string, now: number): LiveEpgEntry {
     const fmt = (d: Date): string => {
       const hh = String(d.getHours()).padStart(2, '0');

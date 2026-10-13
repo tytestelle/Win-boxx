@@ -500,6 +500,26 @@ export class UserConfigManager {
     return { index: replaced ? idx : lives.length - 1, replaced };
   }
 
+  /**
+   * ★ 2026-10-13（用户要求）：按 api 精确移除一条 live 线路。
+   *
+   * 主要供「网络直播订阅源删除/停用」时同步清理 —— 这些线路的 api 是**稳定可计算**的
+   * （`http://127.0.0.1:9978/file/local-live/sub-<id>.<ext>`，见 LiveSubscriptionManager）。
+   * 若移除的是当前选中线路，activeLiveIndex 一并收敛到合法范围。
+   */
+  removeLiveByApi(api: string): boolean {
+    const target = String(api || '').trim();
+    if (!target) return false;
+    const lives = this.snap.lives;
+    const idx = lives.findIndex((l) => String(l.url || '').trim() === target);
+    if (idx < 0) return false;
+    const next = lives.filter((_, i) => i !== idx);
+    let activeLiveIndex = this.snap.ui.activeLiveIndex;
+    if (activeLiveIndex >= next.length) activeLiveIndex = Math.max(0, next.length - 1);
+    this.apply({ ...this.snap, lives: next, ui: { ...this.snap.ui, activeLiveIndex } });
+    return true;
+  }
+
   // ---------------------------------------------------------------
   private apply(next: UserConfig, kind: ConfigChangeKind = 'content'): void {
     // ★ 2026-09-30：内容型变更必须把「当前生效档案」的存档 json 一起对齐（见 withActiveProfileSynced）

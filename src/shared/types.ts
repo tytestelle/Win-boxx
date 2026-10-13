@@ -118,6 +118,40 @@ export interface LiveLine {
   url: string;
 }
 
+// ---------- 网络直播订阅源（自定义名称 + 链接；支持 m3u / m3u8 / txt / json） ----------
+/**
+ * ★ 用户新增需求：允许用户给 Win-box 添加**网络订阅源**（自定义名称 + 链接）。
+ * 每次进入直播页时由主进程拉取并解析，结果与本地（导入）的 LiveGroup 合并展示。
+ * 持久化文件：<userData>/live-subscriptions.json
+ */
+export interface LiveSubscription {
+  /** 唯一 id（生成规则见 LiveSubscriptionManager.addSubscription） */
+  id: string;
+  /** 用户自定义名称；解析不到 group-title / #genre# 时作为默认分组名 */
+  name: string;
+  /** 订阅链接（http/https；后缀 .m3u / .m3u8 / .txt / .json，无后缀默认按 m3u 解析） */
+  url: string;
+  /** 是否启用；停用后不参与刷新 */
+  enabled: boolean;
+  /** 最近一次成功更新时间（ISO 字符串） */
+  lastUpdated?: string;
+  /** 最近一次刷新失败原因（成功时清空） */
+  lastError?: string;
+}
+
+/** 一次「刷新全部订阅源」的逐源结果（refreshAll IPC 的返回项） */
+export interface LiveSubscriptionRefreshResult {
+  id: string;
+  name: string;
+  ok: boolean;
+  /** ok=true 时的解析结果 */
+  groups?: LiveGroup[];
+  /** ok=false 时的错误摘要（HTTP 状态 / 解析异常等） */
+  error?: string;
+  /** ok=true 时本次写回的 ISO 时间 */
+  lastUpdated?: string;
+}
+
 // ---------- 直播 EPG（节目单） ----------
 /** 单档节目（对齐 FongMi `EpgData`：标题 + HH:mm 起止 + epoch 起止） */
 export interface EpgProgram {

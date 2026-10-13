@@ -262,7 +262,17 @@ export type Api = typeof api;
 //   而网络直播订阅源用的是动态 channel（'live:subscription:xxx'），
 //   无法预先在 api 里列出，所以这里额外暴露一个通用 invoke 桥。
 //   渲染层 ipcInvoke() 会优先使用 window.winboxIpc.invoke。
+//
+// ★ 2026-10-13（修复"注册到直播页但实际看不到"）：
+//   主进程 LiveSubscriptionManager 会在订阅源 CRUD / 刷新后广播
+//   'live:subscriptions-changed'，直播页与弹窗据此即时刷新，无需重启。
+//   这里同时暴露 on/off 让渲染层能监听主进程事件。
 // =========================================================================
 contextBridge.exposeInMainWorld('winboxIpc', {
   invoke: (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args),
+  on: (channel: string, cb: (...args: unknown[]) => void): (() => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, ...args: unknown[]) => cb(...args);
+    ipcRenderer.on(channel, listener);
+    return () => { ipcRenderer.removeListener(channel, listener); };
+  },
 });

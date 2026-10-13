@@ -122,6 +122,16 @@ declare global {
         meta: () => Promise<IpcResult<LiveBean[]>>;
         /** ★ 2026-09-29 EPG：传入该线路的频道引用，返回各键（tvg-id/tvg-name/频道名）的「当前 / 下一档」 */
         epg: (index: number, channels: EpgChannelRef[]) => Promise<IpcResult<LiveEpgResult>>;
+        /** ★ EPG 直查：某频道完整节目单（返回 EpgProgram[]，Date 序列化后为 ISO 字符串） */
+        epgPrograms: (channelName: string) => Promise<IpcResult<unknown[]>>;
+        /** ★ EPG 直查：某频道当前节目 */
+        epgCurrent: (channelName: string) => Promise<IpcResult<unknown>>;
+        /** ★ EPG 直查：某频道下一档 */
+        epgNext: (channelName: string) => Promise<IpcResult<unknown>>;
+        /** ★ EPG 直查：某频道台标 URL */
+        epgIcon: (channelName: string) => Promise<IpcResult<string>>;
+        /** ★ EPG 手动刷新 */
+        epgRefresh: () => Promise<IpcResult<void>>;
       };
       /** ★ 2026-09-29 设置备份（含渲染层 localStorage） */
       backup: {
@@ -376,6 +386,16 @@ export const client = {
   loadLive: (index: number) => unwrap(window.api.live.load(index)),
   liveMeta: () => unwrap(window.api.live.meta()),
   liveEpg: (index: number, channels: EpgChannelRef[]) => unwrap(window.api.live.epg(index, channels)),
+  /** ★ EPG 直查：某频道完整节目单（返回 EpgProgram[]，Date 序列化后为 ISO 字符串） */
+  epgPrograms: (channelName: string) => unwrap(window.api.live.epgPrograms(channelName)),
+  /** ★ EPG 直查：某频道当前节目 */
+  epgCurrent: (channelName: string) => unwrap(window.api.live.epgCurrent(channelName)),
+  /** ★ EPG 直查：某频道下一档 */
+  epgNext: (channelName: string) => unwrap(window.api.live.epgNext(channelName)),
+  /** ★ EPG 直查：某频道台标 URL */
+  epgIcon: (channelName: string) => unwrap(window.api.live.epgIcon(channelName)),
+  /** ★ EPG 手动刷新 */
+  epgRefresh: () => unwrap(window.api.live.epgRefresh()),
   /** ★ 2026-09-29 设置备份 */
   backupExport: (renderer: Record<string, string>) => unwrap(window.api.backup.export(renderer)),
   backupImport: () => unwrap(window.api.backup.import()),

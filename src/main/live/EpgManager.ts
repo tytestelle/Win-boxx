@@ -10,10 +10,9 @@
 
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
-  statSync, unlinkSync, renameSync,
+  statSync, unlinkSync, renameSync, createReadStream,
 } from 'node:fs';
 import { join } from 'node:path';
-import { createReadStream } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import * as sax from 'sax';
 import { fileLogger } from '../util/logger';
@@ -26,8 +25,14 @@ const LOGO_DIR_NAME = 'logos';
 const EPG_DATA_FILE_NAME = 'epg_data.json';
 const EPG_DATA_HASH_FILE = 'epg_data_cache.hash';
 
-const EPG_DATA_REMOTE_URL =
+// ★ 原始地址（国内可能访问慢）
+const EPG_DATA_RAW_URL =
   'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json';
+
+// ★ 加速链接（国内可正常访问；如果失效可更换前缀）
+//   参考：https://gitproxy.click/ 或 https://githubproxy.cc/
+const GITHUB_PROXY = 'https://gitproxy.click/';
+const EPG_DATA_REMOTE_URL = GITHUB_PROXY + EPG_DATA_RAW_URL;
 
 export interface EpgProgram {
   title: string;
@@ -42,13 +47,8 @@ export interface EpgRefreshResult {
 }
 
 export class EpgManager {
-  // ===== 映射表 =====
-  /** 变体名（trim 后）→ epgid */
   private readonly nameToEpgId = new Map<string, string>();
-  /** 动态回填：频道名 → epgid */
   private readonly dynamicEpgIds = new Map<string, string>();
-
-  // ===== XMLTV 解析索引 =====
   private readonly xmlChannelIdsByEpgId = new Map<string, string[]>();
   private readonly programsByChannelId = new Map<string, EpgProgram[]>();
   private readonly programsByEpgId = new Map<string, EpgProgram[]>();
@@ -103,7 +103,6 @@ export class EpgManager {
 
   // ==================================================================
   // epg_data.json 加载
-  //   resetXmlCache = true → 同时清空 XMLTV 解析缓存
   // ==================================================================
   loadEpgDataMap(resetXmlCache: boolean): void {
     this.nameToEpgId.clear();
@@ -143,7 +142,7 @@ export class EpgManager {
   }
 
   // ==================================================================
-  // 远程同步 epg_data.json
+  // 远程同步 epg_data.json（走加速链接）
   // ==================================================================
   async refreshEpgDataFromRemote(): Promise<void> {
     if (this.epgDataRefreshRunning) return;
@@ -204,7 +203,6 @@ export class EpgManager {
         return { ok: false, error: 'EPG 文件下载为空' };
       }
 
-      // gzip 解压
       const head = readFileSync(tmp).subarray(0, 2);
       if (head.length === 2 && head[0] === 0x1f && head[1] === 0x8b) {
         writeFileSync(tmp, gunzipSync(readFileSync(tmp)));
@@ -383,7 +381,6 @@ export class EpgManager {
           }
           merged.sort((a, b) => a.start.getTime() - b.start.getTime());
           this.programsByEpgId.set(epgid, merged);
-          fileLogger.i(`${TAG} EPG汇总: epgid=[${epgid}] channelIds=${JSON.stringify(allIds)} programmes=${merged.length}`);
         }
 
         for (const [epgid, url] of iconByEpgId) {
@@ -392,14 +389,6 @@ export class EpgManager {
 
         for (const epgid of idsByEpgId.keys()) this.loadedEpgIds.add(epgid);
         this.parsed = this.programsByEpgId.size > 0 || this.xmlChannelIdsByEpgId.size > 0;
-
-        const unmatched = new Set<string>();
-        for (const r of requested) if (!idsByEpgId.has(r)) unmatched.add(r);
-        if (unmatched.size > 0) {
-          fileLogger.i(`${TAG} 未匹配上的 epgid: ${JSON.stringify([...unmatched])}`);
-        }
-
-        fileLogger.i(`${TAG} 按需解析完成: 请求=${requested.size} 本次命中=${idsByEpgId.size} 累计加载=${this.loadedEpgIds.size}`);
         resolve();
       });
 

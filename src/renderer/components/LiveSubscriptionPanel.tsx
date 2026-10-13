@@ -1,4 +1,6 @@
 // src/renderer/components/LiveSubscriptionPanel.tsx
+// 网络直播订阅源管理面板（挂在「配置页 → 直播订阅源」标签）。
+// 支持：添加 / 编辑 / 删除 / 上移 / 下移 / 置顶 / 置底 / 启停 / 立即刷新。
 import { useCallback, useEffect, useState } from 'react';
 import type { LiveSubscription, LiveSubscriptionRefreshResult } from '../../shared/types';
 import { ipcInvoke } from '../api/ipc';
@@ -101,10 +103,7 @@ export default function LiveSubscriptionPanel() {
   function startEdit(s: LiveSubscription) {
     setEditing({ id: s.id, name: s.name, url: s.url });
   }
-
-  function cancelEdit() {
-    setEditing(null);
-  }
+  function cancelEdit() { setEditing(null); }
 
   async function saveEdit() {
     if (!editing) return;
@@ -144,7 +143,7 @@ export default function LiveSubscriptionPanel() {
       <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 12 }}>网络直播订阅源</div>
       <div style={{ fontSize: 12, color: '#8a9099', marginBottom: 14, lineHeight: 1.6 }}>
         自定义名称 + 订阅链接，支持 <code>.m3u / .m3u8 / .txt / .json</code>（无后缀默认按 m3u 解析）。
-        每次进入「直播」页会自动联网刷新全部启用的订阅源。
+        每次进入「直播」页会自动联网刷新全部启用的订阅源；列表顺序即频道展示顺序。
       </div>
 
       {err && (

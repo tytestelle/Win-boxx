@@ -24,30 +24,6 @@ function saveLiveMem(m: LiveMem): void {
 
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 
-interface EpgProgramItem {
-  title: string;
-  description: string;
-  start: Date;
-  stop: Date;
-}
-
-function dayKey(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-function toDate(v: unknown): Date {
-  if (v instanceof Date) return v;
-  if (typeof v === 'string' || typeof v === 'number') return new Date(v);
-  return new Date();
-}
-
-function hhmm(d: Date): string {
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
-
 class StreamDetector {
   static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
     const lower = url.toLowerCase();
@@ -243,13 +219,6 @@ export default function LivePage() {
   const [subCount, setSubCount] = useState(0);
   const [subEnabled, setSubEnabled] = useState(0);
 
-  const [programsOpen, setProgramsOpen] = useState(false);
-  const [programsLoading, setProgramsLoading] = useState(false);
-  const [programsList, setProgramsList] = useState<EpgProgramItem[]>([]);
-  const [programsChannel, setProgramsChannel] = useState('');
-  const [programsDate, setProgramsDate] = useState('');
-  const programsScrollRef = useRef<HTMLDivElement>(null);
-
   const [reconnectKey, setReconnectKey] = useState(0);
   const [reconnectMsg, setReconnectMsg] = useState('');
   const reconnectCountRef = useRef(0);
@@ -291,7 +260,6 @@ export default function LivePage() {
       const cfg = await client.cfgGet();
       const m = await client.liveMeta();
       setLives(m);
-      // 保持当前选中索引（若超界则归零）
       const idx = liveIdx < m.length ? liveIdx : 0;
       setLiveIdx(idx);
       if (m.length && idx !== liveIdx) {
@@ -392,7 +360,7 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ★ 2026-10-13：监听主进程广播（订阅源 CRUD / 刷新后），实时重新拉 lives + 订阅状态
+  // 监听主进程广播（订阅源 CRUD / 刷新后），实时重新拉 lives + 订阅状态
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:subscriptions-changed', () => {
@@ -402,7 +370,7 @@ export default function LivePage() {
     return () => { if (typeof off === 'function') off(); };
   }, [loadSubStatus, reloadLives]);
 
-  // ====== EPG / 节目单（与原版一致） ======
+  // ====== EPG（当前/下一档，仅在直播页内显示摘要） ======
   const curGroup = groups.find((g) => g.group === groupName);
   const curChannel = curGroup?.channels.find((c) => c.name === channelName);
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
@@ -446,55 +414,25 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
+  /**
+   * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
+   *   - 不再在直播页内开浮窗（会遮视频、拖不出去）
+   *   - 主进程创建/复用一个无边框独立窗口，**默认置顶**，可拖动到屏幕任意位置
+   *   - 单例：切换频道时通知已开窗口换参数（不重载、不丢位置）
+   */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
-    const keys = [channel['tvg-id'], channel['tvg-name'], channel.name]
-      .map((k) => (k || '').trim())
-      .filter((k) => !!k);
-    if (!keys.length) return;
-    setProgramsChannel(channel.name);
-    setProgramsOpen(true);
-    setProgramsLoading(true);
-    setProgramsList([]);
+    const name = (channel.name || '').trim();
+    if (!name) return;
     try {
-      const raw = await client.epgPrograms(keys);
-      const list: EpgProgramItem[] = ((raw as any[]) || [])
-        .map((p: any) => ({
-          title: String(p?.title || ''),
-          description: String(p?.description || ''),
-          start: toDate(p?.start),
-          stop: toDate(p?.stop),
-        }))
-        .sort((a, b) => a.start.getTime() - b.start.getTime());
-      setProgramsList(list);
-      const today = dayKey(new Date());
-      if (list.some((p) => dayKey(p.start) === today)) setProgramsDate(today);
-      else if (list.length) setProgramsDate(dayKey(list[0].start));
-      else setProgramsDate(today);
+      await ipcInvoke('epg:openWindow', {
+        channelName: name,
+        tvgId: (channel['tvg-id'] || '').trim(),
+        tvgName: (channel['tvg-name'] || '').trim(),
+      });
     } catch (e) {
-      console.warn('[EPG] 拉取完整节目单失败', e);
-    } finally {
-      setProgramsLoading(false);
+      console.warn('[EPG] 打开节目单窗口失败', e);
     }
   }
-
-  function closePrograms() { setProgramsOpen(false); }
-
-  useEffect(() => {
-    if (!programsOpen || programsLoading) return;
-    const el = programsScrollRef.current?.querySelector('[data-current="1"]') as HTMLElement | null;
-    if (el) el.scrollIntoView({ block: 'center', behavior: 'auto' });
-  }, [programsOpen, programsLoading, programsList, programsDate]);
-
-  useEffect(() => {
-    if (!programsOpen) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closePrograms(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [programsOpen]);
-
-  const dateTabs = Array.from(new Set(programsList.map((p) => dayKey(p.start)))).sort();
-  const dateList = programsDate ? programsList.filter((p) => dayKey(p.start) === programsDate) : programsList;
-  const nowMs = Date.now();
 
   const epgStatusText =
     epgStatus === 'loading' ? '加载中…'
@@ -502,19 +440,6 @@ export default function LivePage() {
         : epgStatus === 'empty' ? '无节目单'
           : epgStatus === 'error' ? '失败（看日志）'
             : '未触发';
-
-  function dateLabel(key: string): string {
-    const [y, m, d] = key.split('-').map((s) => parseInt(s, 10));
-    const date = new Date(y, m - 1, d);
-    const today = new Date(); today.setHours(0, 0, 0, 0);
-    const tmr = new Date(today); tmr.setDate(tmr.getDate() + 1);
-    const dat = new Date(today); dat.setDate(dat.getDate() + 2);
-    if (date.getTime() === today.getTime()) return '今天';
-    if (date.getTime() === tmr.getTime()) return '明天';
-    if (date.getTime() === dat.getTime()) return '后天';
-    const wd = ['日', '一', '二', '三', '四', '五', '六'][date.getDay()];
-    return `${m}-${d} 周${wd}`;
-  }
 
   return (
     <>
@@ -560,7 +485,7 @@ export default function LivePage() {
                     className={`tag ${c.name === channelName ? 'active' : ''}`}
                     onClick={() => pickChannel(curGroup, c.name, 0, groups)}
                     onDoubleClick={() => openPrograms(c)}
-                    title="双击查看完整节目单"
+                    title="双击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
                   >
                     {c.name}
                   </span>
@@ -585,7 +510,12 @@ export default function LivePage() {
                 </div>
               )}
               {curEpg && (curEpg.current || curEpg.next) && curChannel && (
-                <div className="live-epg" onClick={() => openPrograms(curChannel)} style={{ cursor: 'pointer' }} title="点击查看完整节目单">
+                <div
+                  className="live-epg"
+                  onClick={() => openPrograms(curChannel)}
+                  style={{ cursor: 'pointer' }}
+                  title="点击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
+                >
                   {curEpg.current && (
                     <span className="live-epg-now">
                       <b>正在播</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '（无标题）'}
@@ -632,98 +562,7 @@ export default function LivePage() {
           )}
         </div>
       </div>
-
-      {programsOpen && (
-        <div
-          onClick={closePrograms}
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)',
-            zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}
-        >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            style={{
-              width: 'min(720px, 92vw)', maxHeight: '80vh', display: 'flex', flexDirection: 'column',
-              background: '#1a1d24', color: '#e6e6e6', borderRadius: 12,
-              boxShadow: '0 8px 32px rgba(0,0,0,0.5)', overflow: 'hidden',
-            }}
-          >
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid #2a2f3a' }}>
-              <div style={{ fontSize: 16, fontWeight: 600 }}>
-                节目单 · <span style={{ color: '#4ec9ff' }}>{programsChannel || '-'}</span>
-              </div>
-              <button
-                onClick={closePrograms}
-                style={{ background: 'transparent', border: 'none', color: '#aaa', fontSize: 20, cursor: 'pointer', padding: '0 4px' }}
-                title="关闭 (Esc)"
-              >×</button>
-            </div>
-
-            {dateTabs.length > 0 && (
-              <div style={{ display: 'flex', gap: 6, padding: '10px 16px 0', flexWrap: 'wrap' }}>
-                {dateTabs.map((d) => (
-                  <button
-                    key={d}
-                    onClick={() => setProgramsDate(d)}
-                    style={{
-                      padding: '5px 12px', borderRadius: 16, fontSize: 13, cursor: 'pointer',
-                      border: '1px solid ' + (d === programsDate ? '#4ec9ff' : '#333944'),
-                      background: d === programsDate ? 'rgba(78,201,255,0.15)' : 'transparent',
-                      color: d === programsDate ? '#4ec9ff' : '#ccc',
-                    }}
-                  >{dateLabel(d)}</button>
-                ))}
-              </div>
-            )}
-
-            <div ref={programsScrollRef} style={{ overflowY: 'auto', padding: '10px 8px 14px' }}>
-              {programsLoading ? (
-                <div style={{ padding: 32, textAlign: 'center', color: '#888' }}>加载中…</div>
-              ) : dateList.length === 0 ? (
-                <div style={{ padding: 32, textAlign: 'center', color: '#888' }}>这一天暂无节目单</div>
-              ) : (
-                dateList.map((p, i) => {
-                  const isCurrent = nowMs >= p.start.getTime() && nowMs < p.stop.getTime();
-                  const isPast = nowMs >= p.stop.getTime();
-                  return (
-                    <div
-                      key={i}
-                      data-current={isCurrent ? '1' : '0'}
-                      style={{
-                        display: 'flex', gap: 12, padding: '10px 12px', borderRadius: 8,
-                        background: isCurrent ? 'rgba(78,201,255,0.12)' : 'transparent',
-                        borderLeft: isCurrent ? '3px solid #4ec9ff' : '3px solid transparent',
-                        opacity: isPast ? 0.5 : 1,
-                      }}
-                    >
-                      <div style={{ minWidth: 100, color: isCurrent ? '#4ec9ff' : '#9aa0a6', fontSize: 13, paddingTop: 2 }}>
-                        {hhmm(p.start)} - {hhmm(p.stop)}
-                      </div>
-                      <div style={{ flex: 1 }}>
-                        <div style={{ fontSize: 14, fontWeight: isCurrent ? 600 : 400 }}>
-                          {p.title || '（无标题）'}
-                          {isCurrent && (
-                            <span style={{
-                              marginLeft: 8, fontSize: 11, padding: '1px 6px',
-                              borderRadius: 4, background: '#4ec9ff', color: '#0b1016',
-                            }}>正在播</span>
-                          )}
-                        </div>
-                        {p.description && (
-                          <div style={{ fontSize: 12, color: '#8a9099', marginTop: 4, lineHeight: 1.5 }}>
-                            {p.description}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      {/* ★ 2026-10-14：节目单弹窗已改为独立窗口（见 main/player/EpgWindow.ts + pages/EpgWinPage.tsx）*/}
     </>
   );
 }

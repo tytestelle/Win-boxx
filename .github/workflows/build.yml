@@ -32,14 +32,14 @@ jobs:
       - name: Build application
         run: npm run build
 
-      - name: Package release (electron-builder)
-        run: npm run dist
-        env:
-          # 从 GitHub Secrets 中读取 WINBOX_SUPPORT_IMAGE
-          WINBOX_SUPPORT_IMAGE: ${{ secrets.WINBOX_SUPPORT_IMAGE }}
+      - name: Package with electron-builder
+        run: npx electron-builder --win --publish never
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: win-box-installer
-          path: release1.21.01/*.exe
+          path: |
+            release1.21.01/*.exe
+            release1.21.01/*.blockmap
+            release1.21.01/latest.yml

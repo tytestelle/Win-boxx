@@ -19,11 +19,7 @@ import { clearAppCache } from '../util/cacheClean';
 import { nameFromLocalFile } from '../util/importNaming';
 import { join, basename } from 'node:path';
 import { IPC } from '../../shared/ipc-channels';
-import { LOCAL_PROXY_BASE } from '../../shared/constants';
-import { parseLive } from '../../engine/config/LiveConfigParser';
-import { localLiveUrl, looksLikeLiveSourceText, sanitizeLiveFileName } from '../../engine/live/localLive';
 import { dataDirReport } from '../util/dataDirBootstrap';
-import * as iconv from 'iconv-lite';
 import { proxySettingsView, setProxySettings, getProxySettings, type ProxySettings } from '../net/proxy';
 import { buildBackupFile, parseBackupFile } from '../settings/backup';
 import type { BackupExportResult, BackupImportResult, BackupSettingsState } from '../../shared/backup';
@@ -47,9 +43,11 @@ import { playerSettings } from '../player/playerSettings';
 import { detectPlayers, launchPlayer, seekArgs } from '../torrent/externalPlayer';
 import { ok } from '../../shared/ipc-result';
 import type { IpcMainInvokeEvent } from 'electron';
-import type { BossKeySettings, EpgChannelRef, ImportReport, LiveBean, MultiConfigEntry, SiteConfig, SourceBean, SourceMoveDirection, SourceUpdatePatch } from '../../shared/types';
+import type { BossKeySettings, EpgChannelRef, ImportReport, MultiConfigEntry, SiteConfig, SourceBean, SourceMoveDirection, SourceUpdatePatch } from '../../shared/types';
 import type { MetaSettings } from '../../shared/meta';
 import type { PlayerSettings } from '../../shared/player';
+// ★ 2026-10-13：本地文件导入直播源（抽出的公共函数；网络订阅源下载完成后走同一条链路）
+import { importLiveFileFromPath } from '../live/importLiveFile';
 
 function winOf(e: IpcMainInvokeEvent): BrowserWindow | null {
   return BrowserWindow.fromWebContents(e.sender);
@@ -422,10 +420,9 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
 
   /**
    * ★ 2026-09-30（用户要求）：导入**本地 TXT / M3U 直播源**（配置页按钮）。
-   *
-   * 链路：选文件 → 形态校验（#EXTM3U / #genre# / 「频道,http…」至少其一）→ 原始字节落
-   *   `<userData>/local-live/<文件名>`（就地更新，同名覆盖）→ 追加/更新一条 lives 线路
-   *   （url = `http://127.0.0.1:9978/file/local-live/<文件名>`，走既有的 /file 路由 + 直播页加载链）。
+   * ★ 2026-10-13：核心逻辑抽到 `importLiveFileFromPath`（见 src/main/live/importLiveFile.ts），
+   *   这里只负责弹文件选择框 —— 网络订阅源下载完成后走的是**同一个函数**，
+   *   保证两者注册进 lives 的 api 完全一致（`/file/local-live/<文件名>`，直播页唯一认得的形态）。
    */
   registerHandler(IPC.CFG_IMPORT_LIVE_LOCAL, async (e: any): Promise<{
     ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string;
@@ -436,45 +433,7 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
       filters: [{ name: '直播源（TXT / M3U）', extensions: ['txt', 'm3u', 'm3u8'] }],
     });
     if (picked.canceled || !picked.filePaths?.[0]) return { ok: false }; // 用户取消，不视为错误
-    const srcPath = picked.filePaths[0];
-    try {
-      const buf = readFileSync(srcPath);
-      if (!buf.length) return { ok: false, error: '所选文件为空' };
-      // 编码检测：GBK 直播源被 UTF-8 解码后有两种表现——
-      //   (a) 出现替换字符 \uFFFD（非法 UTF-8 序列）
-      //   (b) 无替换字符，但解出的是拉丁扩展乱码（如「æµ‹è¯•」）
-      // 因此不能只看 \uFFFD；改为比较 UTF-8 与 GB18030 解码结果中的 CJK 字符数，取更优者。
-      let text = buf.toString('utf-8');
-      const utf8Cjk = (text.match(/[\u4E00-\u9FFF]/g) || []).length;
-      const utf8NonAscii = (text.match(/[^\x00-\x7F]/g) || []).length;
-      // 有非 ASCII 字符，但 CJK 占比低于一半 → 大概率不是中文 UTF-8，尝试 GB18030
-      if (utf8NonAscii > 0 && utf8Cjk / utf8NonAscii < 0.5) {
-        try {
-          const gbkText = iconv.decode(buf, 'gb18030');
-          const gbkCjk = (gbkText.match(/[\u4E00-\u9FFF]/g) || []).length;
-          if (gbkCjk > utf8Cjk) {
-            text = gbkText;
-          }
-        } catch {
-          /* 解码失败则保留 UTF-8 结果 */
-        }
-      }
-      if (!looksLikeLiveSourceText(text)) {
-        return { ok: false, error: '文件内容不像 TXT / M3U 直播源（需要 #EXTM3U 头、#genre# 分组行，或「频道名,http…」频道行）' };
-      }
-      const dir = join(userDataDir(), 'local-live');
-      mkdirSync(dir, { recursive: true });
-      const fileName = sanitizeLiveFileName(basename(srcPath));
-      // 归一化为 UTF-8 落盘（/file 路由固定按 text/plain; charset=utf-8 输出，
-      // 若存原始 GBK 字节会在直播页解码成乱码；文本在上一段已统一解码）
-      writeFileSync(join(dir, fileName), Buffer.from(text, 'utf-8'));
-      const name = nameFromLocalFile(srcPath); // 线路名 = 原始文件名（去扩展名）
-      const bean: LiveBean = parseLive({ name, api: '', type: '0', url: localLiveUrl(LOCAL_PROXY_BASE, fileName) }, 0);
-      const r = host.cfgAddLive(bean);
-      return { ok: true, name, index: r.index, replaced: r.replaced, total: host.lives.length };
-    } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
-    }
+    return importLiveFileFromPath(host, picked.filePaths[0]);
   }, log);
 
   // ★ 2026-09-29（用户要求）本地包「网页源」：点播页「网页」入口 → 独立窗口打开 homePage（preload 注入 window.fm）

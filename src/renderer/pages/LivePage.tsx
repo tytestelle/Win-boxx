@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { client } from '../api/client';
 import type { LiveGroup, LiveBean, LiveEpgEntry, EpgChannelRef } from '../../shared/types';
 import VideoPlayer from '../components/VideoPlayer';
@@ -44,22 +44,61 @@ function hhmm(d: Date): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-/** ★ 2026-10-13 判断是否是直播 URL（RTMP/RTSP/FLV/WS 协议 或 m3u8 直播流） */
-function isLiveUrl(url: string): boolean {
+// =========================================================================
+// ★ 2026-10-13 直播 URL 识别 & 归一化
+// =========================================================================
+
+/** 判断 URL 是否形如"可能返回 HLS 内容的接口"（覆盖 IPTV PHP 代理、无扩展名接口、IP+端口等） */
+function looksLikeStreamEndpoint(url: string): boolean {
   const u = (url || '').toLowerCase().trim();
   if (!u) return false;
-  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//.test(u)) return true;
+  // 排除明确的点播文件后缀
+  if (/\.(mp4|mkv|avi|webm|ts|m4v|mov|wmv|mp3|aac|flac|wav)(\?|#|$)/i.test(u)) return false;
+  // 已知 HLS
   if (u.includes('.m3u8')) return true;
-  if (u.includes('/live/') || u.includes('live.')) return true;
+  // 已知流协议
+  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//.test(u)) return true;
+  // IPTV 代理脚本（.php/.asp/.aspx/.cgi/.jsp）
+  if (/\.(php|asp|aspx|cgi|jsp)(\?|#|\/|$)/i.test(u)) return true;
+  // 常见直播路径片段
+  if (/\/(hls|live|stream|tv|iptv|play|channel)\b/i.test(u)) return true;
+  // IP + 端口（国内 IPTV 常见）
+  if (/^https?:\/\/\d+\.\d+\.\d+\.\d+:\d+/.test(u)) return true;
+  // 带流参数（?id= / ?url= / ?channel= 等）
+  if (/[?&](id|url|src|channel|ch|stream|play|t|type)=/i.test(u)) return true;
+  // 无扩展名的短路径（如 /xxx）
+  if (/^https?:\/\/[^?#]+\/[^.#?\/]+$/.test(u)) return true;
   return false;
 }
 
 /**
+ * ★ 直播 URL 归一化：
+ *   - 让 `VideoPlayer` 内部的 `.m3u8` 判断命中，从而走 HLS 分支；
+ *   - 通过追加**无害 query 参数 `_f=.m3u8`**（服务器普遍忽略未知参数）实现；
+ *   - 若 URL 已有 fragment（`#`），必须在 fragment **之前**插入参数，否则参数变成 fragment 的一部分不发给服务器；
+ *   - 已是 `.m3u8` / 已知流协议 / 明确点播文件 → 原样返回。
+ */
+function normalizeLiveUrl(url: string): string {
+  const u = (url || '').trim();
+  if (!u) return u;
+  if (u.includes('.m3u8')) return u;
+  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//i.test(u)) return u;
+  if (!looksLikeStreamEndpoint(u)) return u;
+
+  const hashIdx = u.indexOf('#');
+  const base = hashIdx >= 0 ? u.slice(0, hashIdx) : u;
+  const frag = hashIdx >= 0 ? u.slice(hashIdx) : '';
+  const sep = base.includes('?') ? '&' : '?';
+  return `${base}${sep}_f=.m3u8${frag}`;
+}
+
+// =========================================================================
+
+/**
  * ★ 2026-10-13 直播播放器包装：
  *   - 监听内部 <video> 的 `ended` 事件 —— 直播流播到缓冲区末尾必然触发，
- *     播放器会显示「已播完全部剧集」，这就是用户看到的现象。这里捕获后延迟重连。
- *   - 监听 `error`（网络/源不支持）→ 同样重连。
- *   - 靠父组件用 `key` 强制重新挂载来重连（比调 video.load() 更稳）。
+ *     播放器会显示「已播完全部剧集」。这里捕获后延迟重连。
+ *   - 监听 `error`（网络 / 源不支持）→ 同样重连。
  */
 function LiveVideoWrapper({
   url,
@@ -116,16 +155,13 @@ function LiveVideoWrapper({
         // eslint-disable-next-line no-console
         console.warn('[LIVE] video error：', msg, err?.message || '');
         errorRef.current(msg);
-        // 网络错误 / 源不支持 → 延迟重连
         if (code === 2 || code === 4) scheduleReconnect(1500);
       };
       const onStalled = () => {
         // eslint-disable-next-line no-console
         console.warn('[LIVE] stalled 事件（网络卡顿）');
       };
-      const onWaiting = () => { /* 正常缓冲，不重连 */ };
       const onPlay = () => {
-        // 播放正常 → 取消挂起的重连
         if (reconnectTimer != null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; }
         errorRef.current('');
       };
@@ -133,7 +169,6 @@ function LiveVideoWrapper({
       v.addEventListener('ended', onEnded);
       v.addEventListener('error', onError);
       v.addEventListener('stalled', onStalled);
-      v.addEventListener('waiting', onWaiting);
       v.addEventListener('play', onPlay);
       v.addEventListener('playing', onPlay);
 
@@ -141,7 +176,6 @@ function LiveVideoWrapper({
         v.removeEventListener('ended', onEnded);
         v.removeEventListener('error', onError);
         v.removeEventListener('stalled', onStalled);
-        v.removeEventListener('waiting', onWaiting);
         v.removeEventListener('play', onPlay);
         v.removeEventListener('playing', onPlay);
       });
@@ -190,16 +224,11 @@ export default function LivePage() {
   const [programsDate, setProgramsDate] = useState('');
   const programsScrollRef = useRef<HTMLDivElement>(null);
 
-  // ---- ★ 2026-10-13 断线重连状态 ----
-  /** 每次重连自增，用于给播放器换 key 强制重新挂载 */
+  // ---- ★ 断线重连状态 ----
   const [reconnectKey, setReconnectKey] = useState(0);
-  /** 界面上的重连提示（空 = 不显示） */
   const [reconnectMsg, setReconnectMsg] = useState('');
-  /** 本次会话重连次数（换 URL 时清零） */
   const reconnectCountRef = useRef(0);
-  /** 上次重连时间戳（防抖） */
   const lastReconnectAtRef = useRef(0);
-  /** 最大连续重连次数，超过就提示用户 */
   const MAX_RECONNECT = 30;
 
   useEffect(() => {
@@ -281,10 +310,9 @@ export default function LivePage() {
     setReconnectMsg('');
   }, [playUrl]);
 
-  // ★ 断线重连核心逻辑（供 LiveVideoWrapper 调用）
+  // ★ 断线重连核心逻辑
   const doReconnect = useCallback(() => {
     const now = Date.now();
-    // 3 秒内的重复触发只算一次（ended + error 可能同时来）
     if (now - lastReconnectAtRef.current < 3000) return;
     lastReconnectAtRef.current = now;
     reconnectCountRef.current += 1;
@@ -297,13 +325,11 @@ export default function LivePage() {
     console.info(`[LIVE] 第 ${n} 次重连：${playUrl}`);
     setReconnectMsg(`断线重连中…（第 ${n} 次）`);
     setReconnectKey((k) => k + 1);
-    // 3 秒后自动隐藏提示（若播放恢复，wrapper 的 onPlay 也会清空）
     window.setTimeout(() => {
       setReconnectMsg((cur) => (cur.startsWith('断线重连中') ? '' : cur));
     }, 3000);
   }, [playUrl]);
 
-  // ★ 手动重连按钮
   const manualReconnect = useCallback(() => {
     reconnectCountRef.current = 0;
     lastReconnectAtRef.current = 0;
@@ -316,6 +342,9 @@ export default function LivePage() {
   const curChannel = curGroup?.channels.find((c) => c.name === channelName);
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
   const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
+
+  // ★ 播放 URL 归一化（让 .php / .asp / 无扩展名接口 也被识别为 HLS）
+  const playbackUrl = useMemo(() => normalizeLiveUrl(playUrl), [playUrl]);
 
   // ---- EPG ----
   async function refreshEpg(index: number, gs: LiveGroup[]) {
@@ -496,18 +525,16 @@ export default function LivePage() {
                 </div>
               )}
 
-              {/* ============ ★ 播放器 + 断线重连 ============ */}
-              {playUrl ? (
+              {/* ============ ★ 播放器 + 断线重连（用归一化后的 URL） ============ */}
+              {playbackUrl ? (
                 <div className="live-player" style={{ position: 'relative' }}>
-                  {/* 播放器：靠 key 变更加载新实例，key 含 reconnectKey 触发重连 */}
                   <LiveVideoWrapper
-                    key={`${playUrl}__${reconnectKey}`}
-                    url={playUrl}
+                    key={`${playbackUrl}__${reconnectKey}`}
+                    url={playbackUrl}
                     onReconnect={doReconnect}
                     onVideoError={(msg) => { if (msg) setReconnectMsg(msg); }}
                   />
 
-                  {/* 重连状态提示 */}
                   {reconnectMsg && (
                     <div
                       style={{
@@ -521,7 +548,6 @@ export default function LivePage() {
                     </div>
                   )}
 
-                  {/* 手动重连按钮（右下角） */}
                   <button
                     onClick={manualReconnect}
                     title="手动重新加载该直播流"

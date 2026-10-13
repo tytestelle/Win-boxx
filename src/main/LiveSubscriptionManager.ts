@@ -8,7 +8,7 @@
 // 每次添加/启用/刷新订阅源，会把下载的文件注册到 UserConfig.lives（一条 LiveBean），
 // 直播页顶部线路下拉即可看到「【订阅】xxx」。
 
-import { app, ipcMain } from 'electron';
+import { app, ipcMain, BrowserWindow } from 'electron';   // ★ 增加 BrowserWindow
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type {
@@ -17,6 +17,8 @@ import type {
   LiveSubscriptionRefreshResult,
   UserConfig,
 } from '../shared/types';
+// ★ 2026-10-13：直接读 UserConfigManager 的内存快照，避免"磁盘改了内存没改"
+import { UserConfigManager } from './store/UserConfigManager';
 
 // =========================================================================
 // 通道名
@@ -30,6 +32,19 @@ export const LIVE_SUB_CHANNELS = {
   MOVE: 'live:subscription:move',
   REFRESH_ALL: 'live:subscription:refreshAll',
 } as const;
+
+// =========================================================================
+// ★ 2026-10-13：订阅变化广播 —— 让直播页无需重启即可看到新注册线路
+// =========================================================================
+export const LIVE_SUB_CHANGED_CHANNEL = 'live:subscriptions-changed';
+
+export function notifyLiveSubscriptionsChanged(): void {
+  for (const w of BrowserWindow.getAllWindows()) {
+    try {
+      if (!w.isDestroyed()) w.webContents.send(LIVE_SUB_CHANGED_CHANNEL);
+    } catch { /* ignore */ }
+  }
+}
 
 // =========================================================================
 // 路径
@@ -86,10 +101,17 @@ async function saveSubscriptions(subs: LiveSubscription[]): Promise<void> {
 // =========================================================================
 // UserConfig 读写
 //
-// ⚠ 如果你的项目 user-config.json 不在 <userData>/user-config.json，
-//    请修改 userConfigPath() 指向实际路径。
+// ★ 2026-10-13 核心修复：
+//   优先通过 UserConfigManager.current 读/写**内存快照**，
+//   主进程内部的所有改动（restore 会触发 onChange → 宿主重放配置）即刻生效。
+//   仅在 UserConfigManager 尚未实例化时回退到直接读写磁盘（正常不会走到）。
 // =========================================================================
 async function readUserConfig(): Promise<UserConfig | null> {
+  const uc = UserConfigManager.current;
+  if (uc) {
+    try { return uc.snapshot(); }
+    catch (e) { console.warn('[LiveSub] 读取内存配置失败，回退磁盘：', e); }
+  }
   try {
     const raw = await fs.readFile(userConfigPath(), 'utf-8');
     return JSON.parse(raw) as UserConfig;
@@ -99,6 +121,15 @@ async function readUserConfig(): Promise<UserConfig | null> {
 }
 
 async function writeUserConfig(cfg: UserConfig): Promise<void> {
+  const uc = UserConfigManager.current;
+  if (uc) {
+    try {
+      uc.restore(cfg);   // 内存 + 落盘 + onChange 一步到位
+      return;
+    } catch (e) {
+      console.warn('[LiveSub] 写入内存配置失败，回退磁盘：', e);
+    }
+  }
   await atomicWrite(userConfigPath(), JSON.stringify(cfg, null, 2));
 }
 
@@ -152,7 +183,7 @@ function findSubBeanIndex(lives: LiveBean[], sub: LiveSubscription): number {
 async function upsertSubToLives(sub: LiveSubscription, localFile: string): Promise<void> {
   const cfg = await readUserConfig();
   if (!cfg) {
-    console.warn('[LiveSub] 未找到 user-config.json，跳过注册到 lives');
+    console.warn('[LiveSub] 未找到 user-config，跳过注册到 lives');
     return;
   }
   if (!Array.isArray(cfg.lives)) cfg.lives = [];
@@ -165,6 +196,9 @@ async function upsertSubToLives(sub: LiveSubscription, localFile: string): Promi
     cfg.lives.push(bean);
   }
   if (!cfg.ui) cfg.ui = { activeSourceKey: '', activeLiveIndex: 0 };
+  if (typeof cfg.ui.activeLiveIndex === 'number' && cfg.ui.activeLiveIndex >= cfg.lives.length) {
+    cfg.ui.activeLiveIndex = Math.max(0, cfg.lives.length - 1);
+  }
   await writeUserConfig(cfg);
   console.info(`[LiveSub] 已注册到 lives：${bean.name}`);
 }
@@ -183,7 +217,7 @@ async function removeSubFromLives(sub: LiveSubscription): Promise<void> {
 }
 
 // =========================================================================
-// 网络下载（★ 超时 120 秒，之前 20 秒就是报 aborted 的原因）
+// 网络下载（★ 超时 120 秒）
 // =========================================================================
 const FETCH_TIMEOUT_MS = 120_000;
 
@@ -219,7 +253,6 @@ async function fetchOnce(url: string): Promise<string> {
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText || ''}`.trim());
     const buf = await res.arrayBuffer();
 
-    // 编码处理
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     const m = ct.match(/charset=([\w-]+)/i);
     const cs = (m?.[1] || '').toLowerCase();
@@ -264,7 +297,7 @@ function extForUrl(url: string): string {
   const u = url.toLowerCase().split('?')[0].split('#')[0];
   if (u.endsWith('.txt')) return 'txt';
   if (u.endsWith('.json')) return 'json';
-  return 'm3u'; // .m3u / .m3u8 / 无后缀 → m3u
+  return 'm3u';
 }
 
 /** 下载到 <userData>/live-subscriptions/files/<id>.<ext> */
@@ -284,7 +317,7 @@ async function deleteLocalFile(localFile?: string): Promise<void> {
 }
 
 // =========================================================================
-// CRUD
+// CRUD（★ 每个操作末尾广播订阅变化）
 // =========================================================================
 export async function addSubscription(name: string, url: string): Promise<LiveSubscription> {
   const n = (name || '').trim();
@@ -299,27 +332,24 @@ export async function addSubscription(name: string, url: string): Promise<LiveSu
     enabled: true,
   };
 
-  // 1) 立即下载到本地
   try {
     sub.localFile = await downloadToLocal(sub);
     sub.lastUpdated = new Date().toISOString();
     sub.lastError = undefined;
   } catch (e) {
     sub.lastError = (e as Error)?.message || String(e);
-    // 下载失败也落库（用户可以重试）；不注册到 lives
   }
 
-  // 2) 保存元数据
   const subs = await listSubscriptions();
   subs.push(sub);
   await saveSubscriptions(subs);
 
-  // 3) 下载成功 → 注册到 UserConfig.lives
   if (sub.localFile) {
     try { await upsertSubToLives(sub, sub.localFile); }
     catch (e) { console.warn('[LiveSub] 注册失败：', e); }
   }
 
+  notifyLiveSubscriptionsChanged();   // ★
   return sub;
 }
 
@@ -329,15 +359,12 @@ export async function removeSubscription(id: string): Promise<void> {
   if (idx < 0) return;
   const sub = subs[idx];
 
-  // 1) 从 lives 移除
   try { await removeSubFromLives(sub); } catch (e) { console.warn('[LiveSub] 移除 lives 失败：', e); }
-
-  // 2) 删除本地文件
   await deleteLocalFile(sub.localFile);
-
-  // 3) 删记录
   subs.splice(idx, 1);
   await saveSubscriptions(subs);
+
+  notifyLiveSubscriptionsChanged();   // ★
 }
 
 export async function updateSubscription(
@@ -368,20 +395,17 @@ export async function updateSubscription(
   const isEnabled = next.enabled;
 
   if (nameChanged) {
-    // 名字变了，先移除旧注册
     try { await removeSubFromLives(old); } catch { /* ignore */ }
   }
 
   if (!isEnabled) {
-    // 停用 → 从 lives 移除（保留本地文件，方便快速重启用）
     try { await removeSubFromLives(next); } catch { /* ignore */ }
   } else {
-    // 启用（或保持启用）
     const needDownload =
-      !old.enabled ||                            // 从停用变启用
-      old.url !== next.url ||                    // URL 变了
-      !old.localFile ||                          // 没有本地文件
-      !(await fileExists(old.localFile));        // 本地文件丢了
+      !old.enabled ||
+      old.url !== next.url ||
+      !old.localFile ||
+      !(await fileExists(old.localFile));
 
     if (needDownload) {
       try {
@@ -401,6 +425,8 @@ export async function updateSubscription(
 
   subs[idx] = next;
   await saveSubscriptions(subs);
+
+  notifyLiveSubscriptionsChanged();   // ★
   return next;
 }
 
@@ -429,7 +455,6 @@ export async function moveSubscription(
   subs.splice(target, 0, item);
   await saveSubscriptions(subs);
 
-  // 同步 lives 顺序：把订阅源的 LiveBean 按当前 subs 顺序重排（放在其它 LiveBean 之后）
   try {
     const cfg = await readUserConfig();
     if (cfg && Array.isArray(cfg.lives)) {
@@ -449,6 +474,7 @@ export async function moveSubscription(
     }
   } catch (e) { console.warn('[LiveSub] 同步 lives 顺序失败：', e); }
 
+  notifyLiveSubscriptionsChanged();   // ★
   return subs;
 }
 
@@ -483,6 +509,8 @@ export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefresh
   if (dirty) {
     try { await saveSubscriptions(subs); } catch { /* ignore */ }
   }
+
+  notifyLiveSubscriptionsChanged();   // ★
   return results;
 }
 

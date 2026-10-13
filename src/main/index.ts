@@ -25,7 +25,7 @@ import { LocalPkgStore } from './store/LocalPkgStore';
 import { LOCAL_PROXY_BASE } from '../shared/constants';
 import { localImportsDir, userDataDir } from './util/paths';
 import { safeStorageDriveCodec } from './util/driveCodec';
-
+import { registerLiveSubscriptionIpc } from './LiveSubscriptionManager';
 // esbuild 打成 CJS：__dirname 由 Node 提供（= dist/）。资源在 dist/../../resources。
 declare const __dirname: string;
 

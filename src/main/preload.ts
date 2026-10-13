@@ -111,6 +111,17 @@ const api = {
     meta: () => invoke('live:meta'),
     /** ★ 2026-09-29 EPG：传入该线路的频道引用（tvg-id/tvg-name/频道名/频道级 epg），返回各键的当前/下一档 */
     epg: (index: number, channels: unknown) => invoke(IPC.LIVE_EPG, { index, channels }),
+    // ★ 2026-10-13 EPG 直查通道（EpgManager 直查；epg 仍负责「触发加载」）
+    /** 某频道完整节目单（渲染层做「节目单详情」弹窗用） */
+    epgPrograms: (channelName: string) => invoke(IPC.EPG_PROGRAMS, channelName),
+    /** 某频道当前节目 */
+    epgCurrent: (channelName: string) => invoke(IPC.EPG_CURRENT, channelName),
+    /** 某频道下一档节目 */
+    epgNext: (channelName: string) => invoke(IPC.EPG_NEXT, channelName),
+    /** 某频道台标 URL（取自 XMLTV <icon src>） */
+    epgIcon: (channelName: string) => invoke(IPC.EPG_ICON, channelName),
+    /** EPG 手动刷新（重拉 XMLTV / epg_data.json） */
+    epgRefresh: () => invoke(IPC.EPG_REFRESH),
   },
   /** ★ 2026-09-29 设置备份：导出（含渲染层 localStorage）/ 导入（返回需写回的 localStorage） */
   backup: {

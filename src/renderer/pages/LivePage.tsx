@@ -9,7 +9,6 @@ import type {
   LiveEpgEntry,
   EpgChannelRef,
   LiveSubscription,
-  LiveSubscriptionRefreshResult,
 } from '../../shared/types';
 import { splitLine } from '../../engine/live/LiveUtils';
 
@@ -240,11 +239,9 @@ export default function LivePage() {
   const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
   const epgTimer = useRef<number | null>(null);
 
-  // 订阅源状态（仅用于顶栏展示与"刷新订阅"按钮）
+  // 订阅源状态（仅用于顶栏展示）
   const [subCount, setSubCount] = useState(0);
   const [subEnabled, setSubEnabled] = useState(0);
-  const [subRefreshing, setSubRefreshing] = useState(false);
-  const [subMsg, setSubMsg] = useState('');
 
   const [programsOpen, setProgramsOpen] = useState(false);
   const [programsLoading, setProgramsLoading] = useState(false);
@@ -372,27 +369,6 @@ export default function LivePage() {
     } catch { /* ignore */ }
   }, []);
 
-  const refreshSubs = useCallback(async () => {
-    setSubRefreshing(true);
-    setSubMsg('正在重新下载订阅源…');
-    try {
-      const results = await ipcInvoke<LiveSubscriptionRefreshResult[]>('live:subscription:refreshAll');
-      let ok = 0, fail = 0;
-      for (const r of results || []) {
-        if (r.ok) ok++;
-        else if (r.error !== '已停用') fail++;
-      }
-      setSubMsg(`订阅刷新：成功 ${ok} / 失败 ${fail}`);
-      await loadSubStatus();
-      await reloadLives();
-    } catch (e) {
-      setSubMsg(`刷新失败：${(e as Error).message}`);
-    } finally {
-      setSubRefreshing(false);
-      window.setTimeout(() => setSubMsg(''), 5000);
-    }
-  }, [loadSubStatus, reloadLives]);
-
   // ====== 初始化 ======
   useEffect(() => {
     let cancelled = false;
@@ -416,14 +392,14 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 监听配置页广播 → 重新拉 lives
+  // ★ 2026-10-13：监听主进程广播（订阅源 CRUD / 刷新后），实时重新拉 lives + 订阅状态
   useEffect(() => {
-    const handler = () => {
+    const w = window as any;
+    const off = w?.winboxIpc?.on?.('live:subscriptions-changed', () => {
       void loadSubStatus();
       void reloadLives();
-    };
-    window.addEventListener('winbox:live-subscriptions-changed', handler);
-    return () => window.removeEventListener('winbox:live-subscriptions-changed', handler);
+    });
+    return () => { if (typeof off === 'function') off(); };
   }, [loadSubStatus, reloadLives]);
 
   // ====== EPG / 节目单（与原版一致） ======
@@ -546,32 +522,6 @@ export default function LivePage() {
         <select value={liveIdx} onChange={(e) => pickLive(Number(e.target.value))} disabled={loading}>
           {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
         </select>
-
-        <button
-          type="button"
-          onClick={() => void refreshSubs()}
-          disabled={subRefreshing}
-          title="重新下载全部启用的订阅源到本地并更新直播线路"
-          style={{
-            marginLeft: 8,
-            padding: '4px 12px',
-            borderRadius: 6,
-            border: '1px solid #4ec9ff',
-            background: 'rgba(78,201,255,0.12)',
-            color: '#4ec9ff',
-            cursor: subRefreshing ? 'not-allowed' : 'pointer',
-            fontSize: 12,
-            lineHeight: '20px',
-            whiteSpace: 'nowrap',
-            opacity: subRefreshing ? 0.6 : 1,
-          }}
-        >
-          {subRefreshing ? '刷新订阅中…' : '刷新订阅'}
-        </button>
-
-        {subMsg && (
-          <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.75 }}>{subMsg}</span>
-        )}
 
         <span className="status" style={{ marginLeft: 'auto' }}>
           {loading ? '加载中…' : `${groups.length} 组`}

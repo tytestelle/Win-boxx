@@ -1,14 +1,13 @@
 // src/main/live/EpgManager.ts
 // XMLTV EPG 管理器 —— 移植自 TVBox EpgManager.java
-// 依赖：npm install sax @types/sax
+// 无外部依赖（自研正则扫描器，兼容 XMLTV 常规格式）
 
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
-  statSync, unlinkSync, renameSync, createReadStream,
+  statSync, unlinkSync, renameSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
-import * as sax from 'sax';
 import { fileLogger } from '../util/logger';
 
 const TAG = 'EpgManager';
@@ -34,6 +33,29 @@ export interface EpgProgram {
 export interface EpgRefreshResult {
   ok: boolean;
   error?: string;
+}
+
+// ===================== XML 工具（无依赖） =====================
+/** 从属性串里取值（支持单/双引号） */
+function attrValue(attrs: string, name: string): string {
+  const re = new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"|\\b${name}\\s*=\\s*'([^']*)'`);
+  const m = re.exec(attrs);
+  if (!m) return '';
+  return (m[1] ?? m[2] ?? '').trim();
+}
+
+/** 去掉 XML 文本节点里的 CDATA 包裹、实体引用和首尾空白 */
+function stripXmlText(s: string): string {
+  let t = s.trim();
+  const cdataMatch = /^<!\[CDATA\[([\s\S]*?)\]\]>$/.exec(t);
+  if (cdataMatch) t = cdataMatch[1];
+  t = t
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+  return t.trim();
 }
 
 export class EpgManager {
@@ -218,92 +240,75 @@ export class EpgManager {
     return this.lookupEpgId(channelName);
   }
 
+  // ============== 纯正则扫描 XMLTV（无外部依赖） ==============
   private parseXmlForEpgIds(file: string, requested: Set<string>): Promise<void> {
     return new Promise((resolve) => {
-      const newPrograms = new Map<string, EpgProgram[]>();
-      const idsByEpgId = new Map<string, string[]>();
-      const iconByEpgId = new Map<string, string>();
-      const wantedChannelIds = new Set<string>();
-      const parser = sax.createStream(true, { trim: false, normalize: false });
+      try {
+        const xml = readFileSync(file, 'utf-8');
+        const newPrograms = new Map<string, EpgProgram[]>();
+        const idsByEpgId = new Map<string, string[]>();
+        const iconByEpgId = new Map<string, string>();
+        const wantedChannelIds = new Set<string>();
 
-      let curChannelId: string | null = null;
-      let curDisplayNames: string[] = [];
-      let curIcon: string | null = null;
-      let curProgChannel: string | null = null;
-      let curStart: string | null = null;
-      let curStop: string | null = null;
-      let curTitle = '';
-      let curDesc = '';
-      let captureTag = '';
-      let buf = '';
+        // ---- 第一遍：扫 <channel> 块，匹配 display-name ----
+        const channelRe = /<channel\b([^>]*)>([\s\S]*?)<\/channel>/g;
+        let m: RegExpExecArray | null;
+        while ((m = channelRe.exec(xml)) !== null) {
+          const attrs = m[1];
+          const body = m[2];
+          const channelId = attrValue(attrs, 'id');
+          if (!channelId) continue;
 
-      parser.on('opentag', (node: any) => {
-        const name = node.name;
-        if (name === 'channel') {
-          curChannelId = String(node.attributes.id ?? '').trim() || null;
-          curDisplayNames = [];
-          curIcon = null;
-        } else if (name === 'display-name' && curChannelId) {
-          captureTag = 'display-name';
-          buf = '';
-        } else if (name === 'icon' && curChannelId && !curIcon) {
-          curIcon = String(node.attributes.src ?? '').trim() || null;
-        } else if (name === 'programme') {
-          curProgChannel = String(node.attributes.channel ?? '').trim() || null;
-          curStart = String(node.attributes.start ?? '').trim() || null;
-          curStop = String(node.attributes.stop ?? '').trim() || null;
-          curTitle = '';
-          curDesc = '';
-        } else if (name === 'title' && curProgChannel) {
-          captureTag = 'title';
-          buf = '';
-        } else if (name === 'desc' && curProgChannel) {
-          captureTag = 'desc';
-          buf = '';
-        }
-      });
-      parser.on('text', (t: string) => { if (captureTag) buf += t; });
-      parser.on('cdata', (t: string) => { if (captureTag) buf += t; });
+          const displayNames: string[] = [];
+          const dnRe = /<display-name\b[^>]*>([\s\S]*?)<\/display-name>/g;
+          let dn: RegExpExecArray | null;
+          while ((dn = dnRe.exec(body)) !== null) {
+            const v = stripXmlText(dn[1]);
+            if (v) displayNames.push(v);
+          }
 
-      parser.on('closetag', (node: any) => {
-        const name = typeof node === 'string' ? node : node.name;
-        if (name === 'display-name' && captureTag === 'display-name') {
-          const v = buf.trim();
-          if (v) curDisplayNames.push(v);
-          captureTag = ''; buf = '';
-        } else if (name === 'title' && captureTag === 'title') {
-          curTitle = buf.trim(); captureTag = ''; buf = '';
-        } else if (name === 'desc' && captureTag === 'desc') {
-          curDesc = buf.trim(); captureTag = ''; buf = '';
-        } else if (name === 'channel' && curChannelId) {
-          const matched = this.matchChannelToEpgId(curDisplayNames, requested);
+          const iconMatch = /<icon\b[^>]*?\bsrc\s*=\s*"([^"]*)"/.exec(body)
+            || /<icon\b[^>]*?\bsrc\s*=\s*'([^']*)'/.exec(body);
+          const icon = iconMatch ? (iconMatch[1] || '').trim() : '';
+
+          const matched = this.matchChannelToEpgId(displayNames, requested);
           if (matched) {
             const arr = idsByEpgId.get(matched) ?? [];
-            if (!arr.includes(curChannelId)) arr.push(curChannelId);
+            if (!arr.includes(channelId)) arr.push(channelId);
             idsByEpgId.set(matched, arr);
-            wantedChannelIds.add(curChannelId);
-            if (curIcon && !iconByEpgId.has(matched)) iconByEpgId.set(matched, curIcon);
+            wantedChannelIds.add(channelId);
+            if (icon && !iconByEpgId.has(matched)) iconByEpgId.set(matched, icon);
             fileLogger.i(
-              `${TAG} XMLTV 命中: epgid=[${matched}] displayName=${JSON.stringify(curDisplayNames)} channelId=[${curChannelId}]`,
+              `${TAG} XMLTV 命中: epgid=[${matched}] displayName=${JSON.stringify(displayNames)} channelId=[${channelId}]`,
             );
           }
-          curChannelId = null; curDisplayNames = []; curIcon = null;
-        } else if (name === 'programme' && curProgChannel) {
-          if (wantedChannelIds.has(curProgChannel) && curStart && curStop) {
-            const s = this.parseXmltvTime(curStart);
-            const e = this.parseXmltvTime(curStop);
-            if (s && e && e.getTime() > s.getTime()) {
-              const arr = newPrograms.get(curProgChannel) ?? [];
-              arr.push({ title: curTitle, description: curDesc, start: s, stop: e });
-              newPrograms.set(curProgChannel, arr);
-            }
-          }
-          curProgChannel = null; curStart = null; curStop = null;
-          curTitle = ''; curDesc = '';
         }
-      });
 
-      parser.on('end', () => {
+        // ---- 第二遍：扫 <programme> 块（只收 wantedChannelIds 里的） ----
+        const progRe = /<programme\b([^>]*)>([\s\S]*?)<\/programme>/g;
+        while ((m = progRe.exec(xml)) !== null) {
+          const attrs = m[1];
+          const body = m[2];
+          const channel = attrValue(attrs, 'channel');
+          if (!channel || !wantedChannelIds.has(channel)) continue;
+          const start = attrValue(attrs, 'start');
+          const stop = attrValue(attrs, 'stop');
+          if (!start || !stop) continue;
+          const s = this.parseXmltvTime(start);
+          const e = this.parseXmltvTime(stop);
+          if (!s || !e || e.getTime() <= s.getTime()) continue;
+
+          const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/.exec(body);
+          const descMatch = /<desc\b[^>]*>([\s\S]*?)<\/desc>/.exec(body);
+          const title = titleMatch ? stripXmlText(titleMatch[1]) : '';
+          const desc = descMatch ? stripXmlText(descMatch[1]) : '';
+
+          const arr = newPrograms.get(channel) ?? [];
+          arr.push({ title, description: desc, start: s, stop: e });
+          newPrograms.set(channel, arr);
+        }
+
+        // ---- 合并 ----
         for (const [chId, list] of newPrograms) this.programsByChannelId.set(chId, list);
         for (const [epgid, ids] of idsByEpgId) {
           const existing = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
@@ -319,13 +324,16 @@ export class EpgManager {
           }
           merged.sort((a, b) => a.start.getTime() - b.start.getTime());
           this.programsByEpgId.set(epgid, merged);
-          fileLogger.i(`${TAG} EPG汇总: epgid=[${epgid}] channelIds=${JSON.stringify(allIds)} programmes=${merged.length}`);
+          fileLogger.i(
+            `${TAG} EPG汇总: epgid=[${epgid}] channelIds=${JSON.stringify(allIds)} programmes=${merged.length}`,
+          );
         }
         for (const [epgid, url] of iconByEpgId) {
           if (!this.iconUrlByEpgId.has(epgid)) this.iconUrlByEpgId.set(epgid, url);
         }
         for (const epgid of idsByEpgId.keys()) this.loadedEpgIds.add(epgid);
         this.parsed = this.programsByEpgId.size > 0 || this.xmlChannelIdsByEpgId.size > 0;
+
         const unmatched = new Set<string>();
         for (const r of requested) if (!idsByEpgId.has(r)) unmatched.add(r);
         if (unmatched.size > 0) {
@@ -335,14 +343,10 @@ export class EpgManager {
           `${TAG} 按需解析完成: 请求=${requested.size} 本次命中=${idsByEpgId.size} 累计加载=${this.loadedEpgIds.size}`,
         );
         resolve();
-      });
-
-      parser.on('error', (e: Error) => {
-        fileLogger.w(`${TAG} XML 解析错误: ${String(e)}`);
+      } catch (e) {
+        fileLogger.w(`${TAG} XML 解析失败: ${String(e)}`);
         resolve();
-      });
-
-      createReadStream(file).pipe(parser);
+      }
     });
   }
 

@@ -321,8 +321,13 @@ export class EpgManager {
     const requested = new Set<string>();
     for (const name of channelNames) {
       if (!name) continue;
-      const epgid = this.lookupEpgId(name) || name.trim();
-      requested.add(epgid);
+      const trimmed = String(name).trim();
+      if (!trimmed) continue;
+      // ★ 保留原始名字（"CCTV1"）—— 这样 noteAlias 能记录它
+      requested.add(trimmed);
+      // ★ 也加上查表后的 epgid（"CCTV-1 高清"）
+      const epgid = this.lookupEpgId(trimmed);
+      if (epgid) requested.add(epgid);
     }
     if (requested.size === 0) return;
     if (!this.parsed || !this.isSubset(requested, this.loadedEpgIds)) {
@@ -547,10 +552,8 @@ export class EpgManager {
   // ★ 多 key 联合查询：依次尝试所有可能的名字，返回合并去重排序后的节目列表
   // =====================================================================
   getProgramsForChannelMulti(names: string[]): EpgProgram[] {
-    if (!this.parsed) {
-      fileLogger.w(`${TAG} getProgramsForChannelMulti: parsed=false，尚未解析`);
-      return [];
-    }
+    // ★ 移除 parsed 检查 —— programsByEpgId / programsByChannelId 本身就是"是否解析过"的判据
+    //   只要它们有数据就能查到，parsed 只是标记位，不该挡在查询前
     if (!names || !names.length) return [];
 
     const candidateEpgids = new Set<string>();
@@ -578,14 +581,13 @@ export class EpgManager {
       if (nk) {
         const aliased2 = this.aliasToChannelIds.get(nk);
         if (aliased2) for (const cid of aliased2) candidateChannelIds.add(cid);
-        // 5) normalizedToXmlChannelId
         const cid = this.normalizedToXmlChannelId.get(nk);
         if (cid) candidateChannelIds.add(cid);
       }
     }
 
     fileLogger.i(
-      `[EPG] multi 查询 keys=${JSON.stringify(names)} → epgids=${JSON.stringify([...candidateEpgids])} channelIds=${JSON.stringify([...candidateChannelIds])}`,
+      `[EPG] multi 查询 keys=${JSON.stringify(names)} → epgids=${JSON.stringify([...candidateEpgids])} channelIds=${JSON.stringify([...candidateChannelIds])} 已解析=${this.programsByEpgId.size}/${this.programsByChannelId.size}`,
     );
 
     const merged: EpgProgram[] = [];
@@ -600,7 +602,6 @@ export class EpgManager {
       }
     };
 
-    // 优先从 channelId 拿（最精确），再从 epgid 拿（合并结果）
     for (const cid of candidateChannelIds) pushAll(this.programsByChannelId.get(cid));
     for (const eid of candidateEpgids) pushAll(this.programsByEpgId.get(eid));
 

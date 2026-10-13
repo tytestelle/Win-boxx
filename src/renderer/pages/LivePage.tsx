@@ -18,6 +18,8 @@ function saveLiveMem(m: LiveMem): void {
   try { localStorage.setItem(LIVE_MEM_KEY, JSON.stringify(m)); } catch { /* ignore */ }
 }
 
+type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
+
 export default function LivePage() {
   const [lives, setLives] = useState<LiveBean[]>([]);
   const [liveIdx, setLiveIdx] = useState(0);
@@ -30,6 +32,8 @@ export default function LivePage() {
   const [err, setErr] = useState('');
   /** ★ 2026-09-29 EPG：键（tvg-id / tvg-name / 频道名）→ 当前 / 下一档 */
   const [epg, setEpg] = useState<Record<string, LiveEpgEntry>>({});
+  /** ★ 2026-10-13 EPG 状态提示（让用户知道有没有下载/命中） */
+  const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
   const epgTimer = useRef<number | null>(null);
 
   useEffect(() => {
@@ -112,18 +116,26 @@ export default function LivePage() {
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
   const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
 
-  // ★ 2026-09-29 EPG：换线路 / 分组变化后拉一次节目单（主进程负责 XMLTV 拉取、缓存与频道匹配）
+  // ★ 2026-10-13 EPG：换线路 / 分组变化后拉一次节目单（主进程负责 XMLTV 拉取、缓存与频道匹配）
   async function refreshEpg(index: number, gs: LiveGroup[]) {
     const refs: EpgChannelRef[] = gs
       .flatMap((g) => g.channels)
       .map((c) => ({ tvgId: c['tvg-id'], tvgName: c['tvg-name'], name: c.name, epg: c.epg }))
       .filter((r) => !!(r.tvgId || r.tvgName || r.name));
-    if (!refs.length) { setEpg({}); return; }
+    if (!refs.length) { setEpg({}); setEpgStatus('empty'); return; }
+    setEpgStatus('loading');
     try {
       const r = await client.liveEpg(index, refs);
       setEpg(r.byKey);
-    } catch {
-      setEpg({}); // EPG 是增强项：失败只当作没有节目单，不影响直播播放
+      const n = Object.keys(r.byKey).length;
+      setEpgStatus(n ? 'ok' : 'empty');
+      // eslint-disable-next-line no-console
+      console.info(`[EPG] 命中 ${n} 个键`);
+    } catch (e) {
+      setEpg({});
+      setEpgStatus('error');
+      // eslint-disable-next-line no-console
+      console.warn('[EPG] 加载失败：', e);
     }
   }
 
@@ -151,6 +163,13 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
+  const epgStatusText =
+    epgStatus === 'loading' ? '加载中…'
+      : epgStatus === 'ok' ? `命中 ${Object.keys(epg).length} 键`
+        : epgStatus === 'empty' ? '无节目单'
+          : epgStatus === 'error' ? '失败（看日志）'
+            : '未触发';
+
   return (
     <>
       <div className="topbar">
@@ -158,6 +177,9 @@ export default function LivePage() {
           {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
         </select>
         <span className="status" style={{ marginLeft: 'auto' }}>{loading ? '加载中…' : `${groups.length} 组`}</span>
+        <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
+          EPG：{epgStatusText}
+        </span>
       </div>
       <div className="layout-2 content" style={{ padding: 12 }}>
         <div className="left">

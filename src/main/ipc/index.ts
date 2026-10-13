@@ -700,8 +700,8 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
   );
   registerHandler(
     IPC.EPG_PROGRAMS,
-    // ★ 不要 String() 转换 —— 渲染层可能传数组（多 key 依次尝试）
-    (_e: any, channelName: string | string[]) => host.getLiveEpgPrograms(channelName as string | string[]),
+    // ★ 不要 String() —— 渲染层传的是数组（多 key 依次尝试），String() 会拼成 "a,b,c" 变成单 key
+    (_e: any, channelNames: string | string[]) => host.getLiveEpgPrograms(channelNames),
     log,
   );
   registerHandler('live:meta', () => host.lives, log);

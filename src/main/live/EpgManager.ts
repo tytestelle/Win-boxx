@@ -1,13 +1,5 @@
 // src/main/live/EpgManager.ts
 // XMLTV EPG 管理器 —— 移植自 TVBox EpgManager.java
-//
-// 匹配链路（与 TVBox 完全一致）：
-//   1) 频道名（trim）→ epg_data.json 的 name 变体精确查表 → epgid
-//   2) 查不到 → 直接用频道名当 epgid
-//   3) 用 epgid 去 XMLTV 匹配 <display-name>
-//   4) 同名 epgid 命中多个 XMLTV <channel> → programmes 全部合并
-//   5) loadedEpgIds 只记录成功命中的 epgid（未命中的下次继续尝试）
-//
 // 依赖：npm install sax @types/sax
 
 import {
@@ -26,10 +18,9 @@ const HASH_FILE_NAME = 'epg.hash';
 const EPG_DATA_FILE_NAME = 'epg_data_cache.json';
 const EPG_DATA_HASH_FILE = 'epg_data_cache.hash';
 
-// ★ epg_data.json 原始地址（GitHub raw） + 加速前缀（国内可访问）
 const EPG_DATA_RAW_URL =
   'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json';
-/** ★ 加速前缀：如需更换，直接改这一个常量即可（如 https://githubproxy.cc/ 或 https://ghfast.top/） */
+// ★ 加速前缀：如需更换只改这一行（如 https://githubproxy.cc/ 或 https://ghfast.top/）
 const GITHUB_PROXY = 'https://gitproxy.click/';
 const EPG_DATA_REMOTE_URL = GITHUB_PROXY + EPG_DATA_RAW_URL;
 
@@ -70,14 +61,11 @@ export class EpgManager {
     this.hashFile = join(this.epgDir, HASH_FILE_NAME);
     this.epgDataFile = join(userDataDir, EPG_DATA_FILE_NAME);
     this.epgDataHashFile = join(userDataDir, EPG_DATA_HASH_FILE);
-
     if (!existsSync(this.epgDir)) mkdirSync(this.epgDir, { recursive: true });
-
     this.epgUrl = this.normalizeEpgUrl(epgUrl);
     this.loadEpgDataMap(false);
   }
 
-  // ============================== URL ==============================
   setEpgUrl(url: string): void {
     this.epgUrl = this.normalizeEpgUrl(url);
   }
@@ -91,7 +79,6 @@ export class EpgManager {
     return idx > 0 ? v.substring(0, idx).trim() : v;
   }
 
-  // ====================== epg_data.json 加载 ======================
   loadEpgDataMap(resetXmlCache: boolean): void {
     this.nameToEpgId.clear();
     let source = '无';
@@ -128,7 +115,6 @@ export class EpgManager {
     this.parsed = false;
   }
 
-  // ================= 远程同步 epg_data.json =================
   async refreshEpgDataFromRemote(): Promise<void> {
     if (this.epgDataRefreshRunning) return;
     this.epgDataRefreshRunning = true;
@@ -139,7 +125,6 @@ export class EpgManager {
         ? readFileSync(this.epgDataHashFile, 'utf-8').trim()
         : '';
       if (remoteHash === localHash && existsSync(this.epgDataFile)) return;
-
       const buf = await this.fetchBuffer(EPG_DATA_REMOTE_URL, 60_000);
       if (!buf || buf.length === 0) return;
       try {
@@ -159,7 +144,6 @@ export class EpgManager {
     }
   }
 
-  // =================== 下载 / 刷新 XMLTV ===================
   async refreshEpg(): Promise<EpgRefreshResult> {
     if (!this.epgUrl) return { ok: false, error: 'EPG URL 未设置' };
     if (this.refreshRunning) return { ok: false, error: '正在刷新中' };
@@ -169,7 +153,6 @@ export class EpgManager {
       const localHash = existsSync(this.hashFile)
         ? readFileSync(this.hashFile, 'utf-8').trim()
         : '';
-
       if (remoteHash && remoteHash === localHash && existsSync(this.epgFile)) {
         this.resetXmlCache();
         return { ok: true };
@@ -178,18 +161,15 @@ export class EpgManager {
         this.resetXmlCache();
         return { ok: true };
       }
-
       const tmp = this.epgFile + '.tmp';
       await this.downloadToFile(this.epgUrl, tmp);
       if (!existsSync(tmp) || statSync(tmp).size === 0) {
         return { ok: false, error: 'EPG 文件下载为空' };
       }
-
       const head = readFileSync(tmp).subarray(0, 2);
       if (head.length === 2 && head[0] === 0x1f && head[1] === 0x8b) {
         writeFileSync(tmp, gunzipSync(readFileSync(tmp)));
       }
-
       if (existsSync(this.epgFile)) unlinkSync(this.epgFile);
       try {
         renameSync(tmp, this.epgFile);
@@ -197,7 +177,6 @@ export class EpgManager {
         writeFileSync(this.epgFile, readFileSync(tmp));
         unlinkSync(tmp);
       }
-
       if (remoteHash) writeFileSync(this.hashFile, remoteHash, 'utf-8');
       this.resetXmlCache();
       fileLogger.i(`${TAG} EPG 下载成功 size=${statSync(this.epgFile).size}`);
@@ -210,7 +189,6 @@ export class EpgManager {
     }
   }
 
-  // ==================== 分组按需加载 ====================
   async loadChannelGroup(channelNames: string[]): Promise<void> {
     if (!channelNames || channelNames.length === 0) return;
     const requested = new Set<string>();
@@ -221,7 +199,6 @@ export class EpgManager {
     }
     if (requested.size === 0) return;
     if (!existsSync(this.epgFile) || statSync(this.epgFile).size === 0) return;
-
     if (!this.parsed || !this.isSubset(requested, this.loadedEpgIds)) {
       await this.parseXmlForEpgIds(this.epgFile, requested);
     }
@@ -241,14 +218,12 @@ export class EpgManager {
     return this.lookupEpgId(channelName);
   }
 
-  // ================= 流式解析 XMLTV（sax） =================
   private parseXmlForEpgIds(file: string, requested: Set<string>): Promise<void> {
     return new Promise((resolve) => {
       const newPrograms = new Map<string, EpgProgram[]>();
       const idsByEpgId = new Map<string, string[]>();
       const iconByEpgId = new Map<string, string>();
       const wantedChannelIds = new Set<string>();
-
       const parser = sax.createStream(true, { trim: false, normalize: false });
 
       let curChannelId: string | null = null;
@@ -351,7 +326,6 @@ export class EpgManager {
         }
         for (const epgid of idsByEpgId.keys()) this.loadedEpgIds.add(epgid);
         this.parsed = this.programsByEpgId.size > 0 || this.xmlChannelIdsByEpgId.size > 0;
-
         const unmatched = new Set<string>();
         for (const r of requested) if (!idsByEpgId.has(r)) unmatched.add(r);
         if (unmatched.size > 0) {
@@ -386,7 +360,6 @@ export class EpgManager {
     return null;
   }
 
-  // ==================== 查询接口 ====================
   getProgramsForChannel(channelName: string): EpgProgram[] {
     if (!channelName || !this.parsed) return [];
     const epgid = this.lookupEpgId(channelName) ?? channelName.trim();
@@ -419,7 +392,6 @@ export class EpgManager {
     return this.parsed && this.programsByEpgId.size > 0;
   }
 
-  // ============ 时间解析：XMLTV 形如 20240101120000 +0800 ============
   private parseXmltvTime(v: string): Date | null {
     if (!v || v.length < 14) return null;
     const main = v.substring(0, 14);
@@ -433,7 +405,6 @@ export class EpgManager {
     return Number.isNaN(d.getTime()) ? null : d;
   }
 
-  // ====================== 网络工具 ======================
   private async fetchText(url: string, timeoutMs: number): Promise<string> {
     try {
       const ctrl = new AbortController();

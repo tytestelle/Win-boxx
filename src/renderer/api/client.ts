@@ -386,8 +386,10 @@ export const client = {
   loadLive: (index: number) => unwrap(window.api.live.load(index)),
   liveMeta: () => unwrap(window.api.live.meta()),
   liveEpg: (index: number, channels: EpgChannelRef[]) => unwrap(window.api.live.epg(index, channels)),
-  /** ★ EPG 直查：某频道完整节目单（返回 EpgProgram[]，Date 序列化后为 ISO 字符串） */
-  epgPrograms: (channelName: string) => unwrap(window.api.live.epgPrograms(channelName)),
+  /** ★ EPG 直查：支持单 key 或多 key 数组（推荐传 `[tvg-id, tvg-name, name]` 依次尝试） */
+  epgPrograms(channelNames: string | string[]) {
+    return invoke(IPC.EPG_PROGRAMS, channelNames);
+  },
   /** ★ EPG 直查：某频道当前节目 */
   epgCurrent: (channelName: string) => unwrap(window.api.live.epgCurrent(channelName)),
   /** ★ EPG 直查：某频道下一档 */

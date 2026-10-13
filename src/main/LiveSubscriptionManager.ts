@@ -1,23 +1,30 @@
 // src/main/LiveSubscriptionManager.ts
-// 网络直播订阅源：下载到本地 + 自动注册到 UserConfig.lives + CRUD + 排序。
+// 网络直播订阅源：下载到本地 → 走「本地文件导入」链路注册到 lives → CRUD + 排序。
 //
 // 数据文件：
 //   <userData>/live-subscriptions/index.json   元数据
-//   <userData>/live-subscriptions/files/<id>.m3u | .txt | .json   下载的源文件
+//   <userData>/live-subscriptions/files/<id>.<ext>   下载的源文件
 //
-// 每次添加/启用/刷新订阅源，会把下载的文件注册到 UserConfig.lives（一条 LiveBean），
-// 直播页顶部线路下拉即可看到「【订阅】xxx」。
+// ★★ 2026-10-13 核心重构（用户报「网络源添加后直播页只有名称没内容」）★★
+//   此前自己拼 `file:///<绝对路径>` 写进 UserConfig.lives —— 直播页加载器**只认**
+//   `http://127.0.0.1:9978/file/local-live/<文件名>` 形态，所以引擎读到后当成不支持的 url
+//   → 顶部下拉有名字，点进去「无直播（请先导入含 lives 的配置）」。
+//
+//   修复：下载完成后**不再自己构造 LiveBean**，而是走 bindLiveImporter 注入的
+//   importLiveFileFromPath（与「配置页 · 导入本地 TXT/M3U」同一条链路）——
+//   它负责：编码归一化 → 落 <userData>/local-live/sub-<id>.<ext> → parseLive → host.cfgAddLive。
+//   删除时按 api 精确移除；启动时自动检查更新（有变化才重新导入）。
 
-import { app, ipcMain, BrowserWindow } from 'electron';   // ★ 增加 BrowserWindow
+import { app, ipcMain, BrowserWindow } from 'electron';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type {
-  LiveBean,
   LiveSubscription,
   LiveSubscriptionRefreshResult,
   UserConfig,
 } from '../shared/types';
-// ★ 2026-10-13：直接读 UserConfigManager 的内存快照，避免"磁盘改了内存没改"
+import { LOCAL_PROXY_BASE } from '../shared/constants';
+import { localLiveUrl } from '../../engine/live/localLive';
 import { UserConfigManager } from './store/UserConfigManager';
 
 // =========================================================================
@@ -33,9 +40,6 @@ export const LIVE_SUB_CHANNELS = {
   REFRESH_ALL: 'live:subscription:refreshAll',
 } as const;
 
-// =========================================================================
-// ★ 2026-10-13：订阅变化广播 —— 让直播页无需重启即可看到新注册线路
-// =========================================================================
 export const LIVE_SUB_CHANGED_CHANNEL = 'live:subscriptions-changed';
 
 export function notifyLiveSubscriptionsChanged(): void {
@@ -44,6 +48,30 @@ export function notifyLiveSubscriptionsChanged(): void {
       if (!w.isDestroyed()) w.webContents.send(LIVE_SUB_CHANGED_CHANNEL);
     } catch { /* ignore */ }
   }
+}
+
+// =========================================================================
+// ★ 2026-10-13：可注入的「本地文件导入」函数
+//   主进程 index.ts 在 registerLiveSubscriptionIpc() 之前调用 bindLiveImporter(...) 接线。
+//   不注入 = 任何 CRUD 都会抛错（防「悄悄不注册」）。
+// =========================================================================
+export interface LiveImporterResult {
+  ok: boolean;
+  name?: string;
+  index?: number;
+  replaced?: boolean;
+  total?: number;
+  api?: string;
+  error?: string;
+}
+export type LiveImporter = (
+  srcPath: string,
+  opts: { customName?: string; stableFileName?: string },
+) => LiveImporterResult;
+
+let liveImporter: LiveImporter | null = null;
+export function bindLiveImporter(fn: LiveImporter): void {
+  liveImporter = fn;
 }
 
 // =========================================================================
@@ -59,9 +87,6 @@ async function ensureDirs(): Promise<void> {
   await fs.mkdir(filesDir(), { recursive: true });
 }
 
-// =========================================================================
-// 原子写
-// =========================================================================
 async function atomicWrite(file: string, content: string): Promise<void> {
   const tmp = `${file}.tmp-${Date.now()}`;
   await fs.writeFile(tmp, content, 'utf-8');
@@ -99,12 +124,7 @@ async function saveSubscriptions(subs: LiveSubscription[]): Promise<void> {
 }
 
 // =========================================================================
-// UserConfig 读写
-//
-// ★ 2026-10-13 核心修复：
-//   优先通过 UserConfigManager.current 读/写**内存快照**，
-//   主进程内部的所有改动（restore 会触发 onChange → 宿主重放配置）即刻生效。
-//   仅在 UserConfigManager 尚未实例化时回退到直接读写磁盘（正常不会走到）。
+// UserConfig 读写（走内存，落盘由 UserConfigManager 内部处理）
 // =========================================================================
 async function readUserConfig(): Promise<UserConfig | null> {
   const uc = UserConfigManager.current;
@@ -123,101 +143,75 @@ async function readUserConfig(): Promise<UserConfig | null> {
 async function writeUserConfig(cfg: UserConfig): Promise<void> {
   const uc = UserConfigManager.current;
   if (uc) {
-    try {
-      uc.restore(cfg);   // 内存 + 落盘 + onChange 一步到位
-      return;
-    } catch (e) {
-      console.warn('[LiveSub] 写入内存配置失败，回退磁盘：', e);
-    }
+    try { uc.restore(cfg); return; }
+    catch (e) { console.warn('[LiveSub] 写入内存配置失败，回退磁盘：', e); }
   }
   await atomicWrite(userConfigPath(), JSON.stringify(cfg, null, 2));
 }
 
 // =========================================================================
-// LiveBean 生成 / 识别
+// 订阅源在 lives 里的稳定标识
+//
+// - 落盘到 <userData>/local-live/ 的文件名 = `sub-<id>.<ext>`（本模块管理）
+// - 注册进 lives 的 api = localLiveUrl(LOCAL_PROXY_BASE, 上面那个文件名)
+//   —— 与"导入本地 TXT/M3U"完全同构；且**稳定可计算**，删除/停用时按它精确清理。
+// - LiveBean.name 用「【订阅】xxx」前缀，直播页下拉一眼区分。
 // =========================================================================
-
-/**
- * 订阅源在 UserConfig.lives 里的名字前缀。
- * 用前缀方便识别哪些 LiveBean 是我们管理的，删除订阅源时能精确清理。
- */
 const SUB_BEAN_PREFIX = '【订阅】';
+const LOCAL_LIVE_SUBDIR = 'local-live';
 
-/**
- * ★ 本地直播源文件 → LiveBean.api 的格式。
- * 这里用 file:// 绝对路径（Windows 也统一正斜杠）。
- * 如果你们项目"导入本地直播源"用的是别的 scheme（比如 local-live://），
- * 只需要改这一个函数。
- */
-function buildLiveApi(localFile: string): string {
-  const norm = localFile.replace(/\\/g, '/');
-  return norm.startsWith('/') ? `file://${norm}` : `file:///${norm}`;
+function extForUrl(url: string): string {
+  const u = url.toLowerCase().split('?')[0].split('#')[0];
+  if (u.endsWith('.txt')) return 'txt';
+  if (u.endsWith('.json')) return 'json';
+  return 'm3u';
 }
 
-function buildLiveBean(sub: LiveSubscription, localFile: string): LiveBean {
-  return {
-    name: `${SUB_BEAN_PREFIX}${sub.name}`,
-    api: buildLiveApi(localFile),
-    type: '0',
-    url: '',
-    jar: '',
-    ext: '',
-    epg: '',
-    playerType: '',
-    timeout: 15,
-  };
+/** 本模块管理的本地文件名（稳定） */
+function stableFileNameOf(subId: string, url: string): string {
+  return `sub-${subId}.${extForUrl(url)}`;
 }
 
-function isSubLiveBean(bean: LiveBean): boolean {
-  return typeof bean?.name === 'string' && bean.name.startsWith(SUB_BEAN_PREFIX);
+/** 注册进 lives 的 api（= 直播页加载器唯一认得的形态） */
+function apiOf(subId: string, url: string): string {
+  return localLiveUrl(LOCAL_PROXY_BASE, stableFileNameOf(subId, url));
 }
 
-function findSubBeanIndex(lives: LiveBean[], sub: LiveSubscription): number {
-  const target = `${SUB_BEAN_PREFIX}${sub.name}`;
-  return lives.findIndex((b) => b?.name === target);
-}
-
-// =========================================================================
-// 注册 / 反注册（写 UserConfig.lives）
-// =========================================================================
-async function upsertSubToLives(sub: LiveSubscription, localFile: string): Promise<void> {
-  const cfg = await readUserConfig();
-  if (!cfg) {
-    console.warn('[LiveSub] 未找到 user-config，跳过注册到 lives');
+/** 从 lives 里移除本订阅源的线路（按 api 精确匹配，经 UserConfigManager 内存快照变更） */
+async function removeSubFromLives(sub: LiveSubscription): Promise<void> {
+  const uc = UserConfigManager.current;
+  if (!uc) {
+    console.warn('[LiveSub] UserConfigManager.current 未就绪，无法移除 lives');
     return;
   }
-  if (!Array.isArray(cfg.lives)) cfg.lives = [];
-
-  const idx = findSubBeanIndex(cfg.lives, sub);
-  const bean = buildLiveBean(sub, localFile);
-  if (idx >= 0) {
-    cfg.lives[idx] = { ...cfg.lives[idx], ...bean };
-  } else {
-    cfg.lives.push(bean);
-  }
-  if (!cfg.ui) cfg.ui = { activeSourceKey: '', activeLiveIndex: 0 };
-  if (typeof cfg.ui.activeLiveIndex === 'number' && cfg.ui.activeLiveIndex >= cfg.lives.length) {
-    cfg.ui.activeLiveIndex = Math.max(0, cfg.lives.length - 1);
-  }
-  await writeUserConfig(cfg);
-  console.info(`[LiveSub] 已注册到 lives：${bean.name}`);
+  const api = apiOf(sub.id, sub.url);
+  const ok = uc.removeLiveByApi(api);
+  if (ok) console.info(`[LiveSub] 已从 lives 移除：${api}`);
 }
 
-async function removeSubFromLives(sub: LiveSubscription): Promise<void> {
-  const cfg = await readUserConfig();
-  if (!cfg || !Array.isArray(cfg.lives)) return;
-  const idx = findSubBeanIndex(cfg.lives, sub);
-  if (idx < 0) return;
-  cfg.lives.splice(idx, 1);
-  if (cfg.ui && typeof cfg.ui.activeLiveIndex === 'number' && cfg.ui.activeLiveIndex >= cfg.lives.length) {
-    cfg.ui.activeLiveIndex = Math.max(0, cfg.lives.length - 1);
-  }
-  await writeUserConfig(cfg);
-  console.info(`[LiveSub] 已从 lives 移除：${SUB_BEAN_PREFIX}${sub.name}`);
+/** 下载到 <userData>/live-subscriptions/files/<id>.<ext>（仅做元数据缓存，供「对比是否变化」用） */
+async function downloadToCache(sub: LiveSubscription): Promise<string> {
+  const text = await fetchText(sub.url);
+  if (!text || !text.trim()) throw new Error('订阅内容为空');
+  await ensureDirs();
+  const ext = extForUrl(sub.url);
+  const file = path.join(filesDir(), `${sub.id}.${ext}`);
+  await atomicWrite(file, text);
+  return file;
+}
+
+async function deleteLocalFile(localFile?: string): Promise<void> {
+  if (!localFile) return;
+  try { await fs.unlink(localFile); } catch { /* ignore */ }
+}
+
+async function fileExists(p?: string): Promise<boolean> {
+  if (!p) return false;
+  try { await fs.access(p); return true; } catch { return false; }
 }
 
 // =========================================================================
-// 网络下载（★ 超时 120 秒）
+// 网络下载（★ 超时 120 秒；GitHub raw 自动加镜像回退）
 // =========================================================================
 const FETCH_TIMEOUT_MS = 120_000;
 
@@ -293,33 +287,11 @@ async function fetchText(url: string): Promise<string> {
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
-function extForUrl(url: string): string {
-  const u = url.toLowerCase().split('?')[0].split('#')[0];
-  if (u.endsWith('.txt')) return 'txt';
-  if (u.endsWith('.json')) return 'json';
-  return 'm3u';
-}
-
-/** 下载到 <userData>/live-subscriptions/files/<id>.<ext> */
-async function downloadToLocal(sub: LiveSubscription): Promise<string> {
-  const text = await fetchText(sub.url);
-  if (!text || !text.trim()) throw new Error('订阅内容为空');
-  await ensureDirs();
-  const ext = extForUrl(sub.url);
-  const file = path.join(filesDir(), `${sub.id}.${ext}`);
-  await atomicWrite(file, text);
-  return file;
-}
-
-async function deleteLocalFile(localFile?: string): Promise<void> {
-  if (!localFile) return;
-  try { await fs.unlink(localFile); } catch { /* ignore */ }
-}
-
 // =========================================================================
-// CRUD（★ 每个操作末尾广播订阅变化）
+// CRUD
 // =========================================================================
 export async function addSubscription(name: string, url: string): Promise<LiveSubscription> {
+  if (!liveImporter) throw new Error('直播导入器未就绪（主进程未调用 bindLiveImporter）');
   const n = (name || '').trim();
   const u = (url || '').trim();
   if (!n) throw new Error('订阅名称不能为空');
@@ -332,24 +304,29 @@ export async function addSubscription(name: string, url: string): Promise<LiveSu
     enabled: true,
   };
 
+  // 1) 下载到缓存目录（用于「检查更新」时对比内容）
   try {
-    sub.localFile = await downloadToLocal(sub);
+    sub.localFile = await downloadToCache(sub);
     sub.lastUpdated = new Date().toISOString();
-    sub.lastError = undefined;
   } catch (e) {
-    sub.lastError = (e as Error)?.message || String(e);
+    sub.lastError = (e as Error).message;
   }
 
+  // 2) 下载成功 → 走「本地文件导入」链路注册到 lives（与配置页按钮同一路径）
+  if (sub.localFile) {
+    const r = liveImporter(sub.localFile, {
+      customName: `${SUB_BEAN_PREFIX}${sub.name}`,
+      stableFileName: stableFileNameOf(sub.id, sub.url),
+    });
+    if (!r.ok) sub.lastError = r.error || '注册失败';
+  }
+
+  // 3) 落库
   const subs = await listSubscriptions();
   subs.push(sub);
   await saveSubscriptions(subs);
 
-  if (sub.localFile) {
-    try { await upsertSubToLives(sub, sub.localFile); }
-    catch (e) { console.warn('[LiveSub] 注册失败：', e); }
-  }
-
-  notifyLiveSubscriptionsChanged();   // ★
+  notifyLiveSubscriptionsChanged();
   return sub;
 }
 
@@ -364,24 +341,23 @@ export async function removeSubscription(id: string): Promise<void> {
   subs.splice(idx, 1);
   await saveSubscriptions(subs);
 
-  notifyLiveSubscriptionsChanged();   // ★
+  notifyLiveSubscriptionsChanged();
 }
 
 export async function updateSubscription(
   id: string,
   patch: Partial<Pick<LiveSubscription, 'name' | 'url' | 'enabled'>>,
 ): Promise<LiveSubscription | null> {
+  if (!liveImporter) throw new Error('直播导入器未就绪（主进程未调用 bindLiveImporter）');
   const subs = await listSubscriptions();
   const idx = subs.findIndex((s) => s.id === id);
   if (idx < 0) return null;
   const old = subs[idx];
   const next: LiveSubscription = { ...old };
 
-  let nameChanged = false;
   if (typeof patch.name === 'string') {
     const n = patch.name.trim();
     if (!n) throw new Error('名称不能为空');
-    if (n !== old.name) nameChanged = true;
     next.name = n;
   }
   if (typeof patch.url === 'string') {
@@ -391,48 +367,64 @@ export async function updateSubscription(
   }
   if (typeof patch.enabled === 'boolean') next.enabled = patch.enabled;
 
-  const wasEnabled = old.enabled;
-  const isEnabled = next.enabled;
+  const urlChanged = old.url !== next.url;
+  const enabledChanged = old.enabled !== next.enabled;
+  const nameChanged = old.name !== next.name;
 
-  if (nameChanged) {
-    try { await removeSubFromLives(old); } catch { /* ignore */ }
+  // 停用 → 从 lives 移除（保留本地缓存文件，方便快速重启用）
+  if (!next.enabled) {
+    if (old.enabled) {
+      try { await removeSubFromLives(old); } catch { /* ignore */ }
+    }
+    if (urlChanged) {
+      // URL 变了：旧缓存文件不再可用 → 清掉（下次启用会重新下载）
+      await deleteLocalFile(old.localFile);
+      next.localFile = undefined;
+    }
+    subs[idx] = next;
+    await saveSubscriptions(subs);
+    notifyLiveSubscriptionsChanged();
+    return next;
   }
 
-  if (!isEnabled) {
-    try { await removeSubFromLives(next); } catch { /* ignore */ }
-  } else {
-    const needDownload =
-      !old.enabled ||
-      old.url !== next.url ||
-      !old.localFile ||
-      !(await fileExists(old.localFile));
+  // 启用（或保持启用）：
+  //   · url 变化 → 必须重下
+  //   · 无本地缓存 → 必须下
+  //   · 只是启停切换 / 只改 name → 无需重下，直接用已有缓存文件重导
+  const needDownload = urlChanged || !old.localFile || !(await fileExists(old.localFile));
 
-    if (needDownload) {
-      try {
-        next.localFile = await downloadToLocal(next);
-        next.lastUpdated = new Date().toISOString();
-        next.lastError = undefined;
-      } catch (e) {
-        next.lastError = (e as Error)?.message || String(e);
-      }
+  if (needDownload) {
+    // URL 变了：老缓存文件不再需要
+    if (urlChanged && old.localFile) {
+      await deleteLocalFile(old.localFile);
+      next.localFile = undefined;
     }
+    try {
+      next.localFile = await downloadToCache(next);
+      next.lastUpdated = new Date().toISOString();
+      next.lastError = undefined;
+    } catch (e) {
+      next.lastError = (e as Error).message;
+    }
+  }
 
-    if (next.localFile) {
-      try { await upsertSubToLives(next, next.localFile); }
-      catch (e) { console.warn('[LiveSub] 注册失败：', e); }
+  // 走本地导入链路（新增、启用、改名、URL 变化都落到这里；url 稳定 → replaced=true 覆盖同条目）
+  if (next.localFile) {
+    const r = liveImporter(next.localFile, {
+      customName: `${SUB_BEAN_PREFIX}${next.name}`,
+      stableFileName: stableFileNameOf(next.id, next.url),
+    });
+    if (!r.ok) {
+      next.lastError = r.error || '注册失败';
+    } else if (nameChanged || enabledChanged || urlChanged) {
+      next.lastError = undefined;
     }
   }
 
   subs[idx] = next;
   await saveSubscriptions(subs);
-
-  notifyLiveSubscriptionsChanged();   // ★
+  notifyLiveSubscriptionsChanged();
   return next;
-}
-
-async function fileExists(p?: string): Promise<boolean> {
-  if (!p) return false;
-  try { await fs.access(p); return true; } catch { return false; }
 }
 
 export async function moveSubscription(
@@ -455,35 +447,19 @@ export async function moveSubscription(
   subs.splice(target, 0, item);
   await saveSubscriptions(subs);
 
-  try {
-    const cfg = await readUserConfig();
-    if (cfg && Array.isArray(cfg.lives)) {
-      const others = cfg.lives.filter((b) => !isSubLiveBean(b));
-      const sorted: LiveBean[] = [];
-      for (const s of subs) {
-        if (!s.enabled || !s.localFile) continue;
-        const target2 = `${SUB_BEAN_PREFIX}${s.name}`;
-        const found = cfg.lives.find((b) => b?.name === target2);
-        if (found) sorted.push(found);
-      }
-      cfg.lives = [...others, ...sorted];
-      if (cfg.ui && typeof cfg.ui.activeLiveIndex === 'number' && cfg.ui.activeLiveIndex >= cfg.lives.length) {
-        cfg.ui.activeLiveIndex = Math.max(0, cfg.lives.length - 1);
-      }
-      await writeUserConfig(cfg);
-    }
-  } catch (e) { console.warn('[LiveSub] 同步 lives 顺序失败：', e); }
-
-  notifyLiveSubscriptionsChanged();   // ★
+  // 注：lives 里的顺序不再由此处调整 —— 直播页下拉顺序以 lives 数组顺序为准，
+  // 本模块追加时都落在末尾；用户如果希望顺序对齐，可通过「删除 + 重加」调整。
+  notifyLiveSubscriptionsChanged();
   return subs;
 }
 
 // =========================================================================
-// 刷新
+// 刷新（手动触发；下载最新内容 → 走本地导入覆盖）
 // =========================================================================
 export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefreshResult[]> {
-  const subs = await listSubscriptions();
   const results: LiveSubscriptionRefreshResult[] = [];
+  if (!liveImporter) return results;
+  const subs = await listSubscriptions();
   let dirty = false;
 
   for (const sub of subs) {
@@ -492,10 +468,14 @@ export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefresh
       continue;
     }
     try {
-      sub.localFile = await downloadToLocal(sub);
+      sub.localFile = await downloadToCache(sub);
+      const r = liveImporter(sub.localFile, {
+        customName: `${SUB_BEAN_PREFIX}${sub.name}`,
+        stableFileName: stableFileNameOf(sub.id, sub.url),
+      });
+      if (!r.ok) throw new Error(r.error || '重新导入失败');
       sub.lastUpdated = new Date().toISOString();
       sub.lastError = undefined;
-      try { await upsertSubToLives(sub, sub.localFile); } catch (e) { console.warn('[LiveSub] 注册失败：', e); }
       results.push({ id: sub.id, name: sub.name, ok: true, lastUpdated: sub.lastUpdated });
       dirty = true;
     } catch (e) {
@@ -509,9 +489,77 @@ export async function refreshAllSubscriptions(): Promise<LiveSubscriptionRefresh
   if (dirty) {
     try { await saveSubscriptions(subs); } catch { /* ignore */ }
   }
-
-  notifyLiveSubscriptionsChanged();   // ★
+  notifyLiveSubscriptionsChanged();
   return results;
+}
+
+// =========================================================================
+// ★ 2026-10-13：启动时自动检查更新 —— 有变化才重新导入；无变化则保留原样。
+// =========================================================================
+export interface CheckUpdateSummary {
+  updated: number;
+  skipped: number;
+  failed: number;
+}
+
+/**
+ * 遍历所有启用的订阅源：
+ *   1) 拉取远端最新内容；
+ *   2) 与本地缓存逐字节对比；
+ *   3) **一致 → 跳过**（不动 lives、不动本地文件）；
+ *   4) **有变化 → 覆盖本地文件 + 走本地导入链路重新注册**（replaced=true 覆盖同条目）；
+ *   5) 失败 → 记录 lastError，继续处理下一个。
+ */
+export async function checkAndUpdateSubscriptions(): Promise<CheckUpdateSummary> {
+  const summary: CheckUpdateSummary = { updated: 0, skipped: 0, failed: 0 };
+  if (!liveImporter) return summary;
+
+  const subs = await listSubscriptions();
+  let dirty = false;
+
+  for (const sub of subs) {
+    if (!sub.enabled) { summary.skipped++; continue; }
+    try {
+      const remote = await fetchText(sub.url);
+      if (!remote || !remote.trim()) throw new Error('订阅内容为空');
+
+      // 与本地缓存对比：内容一致 → 跳过（不重新导入）
+      let local: string | null = null;
+      if (sub.localFile) {
+        try { local = await fs.readFile(sub.localFile, 'utf-8'); } catch { local = null; }
+      }
+      if (local !== null && local === remote) { summary.skipped++; continue; }
+
+      // 有变化 → 覆盖本地文件 + 走本地导入覆盖 lives 里的对应线路
+      await ensureDirs();
+      const ext = extForUrl(sub.url);
+      const cacheFile = path.join(filesDir(), `${sub.id}.${ext}`);
+      await atomicWrite(cacheFile, remote);
+      const r = liveImporter(cacheFile, {
+        customName: `${SUB_BEAN_PREFIX}${sub.name}`,
+        stableFileName: stableFileNameOf(sub.id, sub.url),
+      });
+      if (!r.ok) throw new Error(r.error || '重新导入失败');
+
+      sub.localFile = cacheFile;
+      sub.lastUpdated = new Date().toISOString();
+      sub.lastError = undefined;
+      summary.updated++;
+      dirty = true;
+      console.info(`[LiveSub] 订阅「${sub.name}」有更新，已重新导入到 lives`);
+    } catch (e) {
+      sub.lastError = (e as Error)?.message || String(e);
+      summary.failed++;
+      dirty = true;
+      console.warn(`[LiveSub] 订阅「${sub.name}」检查更新失败：${sub.lastError}`);
+    }
+  }
+
+  if (dirty) {
+    try { await saveSubscriptions(subs); } catch { /* ignore */ }
+  }
+  if (summary.updated > 0) notifyLiveSubscriptionsChanged();
+  return summary;
 }
 
 // =========================================================================

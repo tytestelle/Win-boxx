@@ -4,6 +4,10 @@
 //   · 按路由去重：同一路由最多一个窗口（已开 → 聚焦；未开 → 新建）
 //   · 白名单：/、/home、/history、/live、/storage、/config、/about
 //   · 渲染层每次路由变化时通过 NOTIFY_ROUTE_CHANGE 上报 → 主进程维护「路由 → 窗口」注册表
+//
+// ★★ 2026-10-14 追加：hash 里带 `?rw=1` 标记 —— 渲染层据此判定「我是子窗口」，
+//   子窗口点击导航时**只切换自己的路由**（不新开窗口）；主窗口点击导航才新开窗口。
+//   （无标记的 = 主窗口。）
 import { app, BrowserWindow, nativeTheme, shell } from 'electron';
 import { join } from 'node:path';
 import { applyWindowCorner } from '../util/windowCorner';
@@ -112,10 +116,12 @@ export function openRouteWindow(route: string): { ok: boolean; reused: boolean }
     winRoutes.delete(win);
   });
 
+  // ★ hash 里带 `?rw=1`（route window）—— 渲染层据此判定「我是子窗口」
+  const hashWithFlag = `${normalized}?rw=1`;
   if (isDev()) {
-    void win.loadURL(`http://localhost:5173/#${normalized}`);
+    void win.loadURL(`http://localhost:5173/#${hashWithFlag}`);
   } else {
-    void win.loadFile(join(__dirname, 'renderer', 'index.html'), { hash: normalized });
+    void win.loadFile(join(__dirname, 'renderer', 'index.html'), { hash: hashWithFlag });
   }
 
   return { ok: true, reused: false };

@@ -145,6 +145,10 @@ const SEARCH_ALL_QUICK_MS = 3_000;
 const UNSUPPORTED_ERR = /UNSUPPORTED_|SCRIPT_ERROR|PY_UNSUPPORTED|桌面版无法|不支持|未实现/i;
 const SEARCH_ALL_PREPARE_MS = 12_000;
 
+/** ★ 2026-10-13 EPG：内置默认 XMLTV 地址（走加速前缀）—— 用户线路没配 EPG URL 时兜底 */
+const DEFAULT_EPG_URL =
+  'https://gitproxy.click/https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_merged.xml';
+
 function raceTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), ms);
@@ -2132,29 +2136,45 @@ export class SpiderHost {
   /**
    * ★ 2026-10-13 EPG：走 TVBox 风格 EpgManager（epg_data.json 变体名映射 → XMLTV display-name
    * 精确匹配 → 多源合并），返回每个频道的「当前 / 下一档」。频道引用由渲染层传入。
+   * 线路级 `live.epg` / 频道级 `tvg-url` 都没有时，用内置默认 EPG（epg_merged.xml）。
    */
   async loadLiveEpg(index: number, refs: EpgChannelRef[]): Promise<LiveEpgResult> {
     const lives = this.config?.lives ?? [];
     const live = lives[Math.min(Math.max(index, 0), Math.max(lives.length - 1, 0))];
     const list = Array.isArray(refs) ? refs : [];
-    const urls = collectEpgUrls(live?.epg, list);
-    if (!urls.length || !list.length) return { byKey: {} };
+    if (!list.length) {
+      this.logger.i(`EPG：线路「${live?.name || index}」频道引用为空，跳过`);
+      return { byKey: {} };
+    }
+
+    let urls = collectEpgUrls(live?.epg, list);
+    if (!urls.length) {
+      urls = [DEFAULT_EPG_URL];
+      this.logger.i(
+        `EPG：线路「${live?.name || index}」未配置 EPG URL，使用内置默认 ${DEFAULT_EPG_URL}`,
+      );
+    }
 
     const mgr = this.ensureEpgManager();
     mgr.setEpgUrl(urls[0]);
+    this.logger.i(`EPG：开始拉取 ${urls[0]}`);
 
     const r = await mgr.refreshEpg();
     if (!r.ok) {
       this.logger.w(`EPG 拉取失败（${urls[0]}）：${r.error || '未知原因'}`);
       return { byKey: {} };
     }
+    this.logger.i(`EPG：拉取完成，开始按需解析 ${list.length} 个频道引用`);
 
     const channelNames: string[] = [];
     for (const ref of list) {
       const name = (ref.name || ref.tvgName || ref.tvgId || '').trim();
       if (name && !channelNames.includes(name)) channelNames.push(name);
     }
-    if (!channelNames.length) return { byKey: {} };
+    if (!channelNames.length) {
+      this.logger.i('EPG：无可匹配的频道名，跳过解析');
+      return { byKey: {} };
+    }
 
     await mgr.loadChannelGroup(channelNames);
 
@@ -2170,7 +2190,7 @@ export class SpiderHost {
       }
     }
     this.logger.i(
-      `EPG：1 个地址 / ${Object.keys(byKey).length} 个键命中（线路「${live?.name || index}」，请求 ${channelNames.length} 个频道）`,
+      `EPG：地址 ${urls[0]} / 命中 ${Object.keys(byKey).length} 键（线路「${live?.name || index}」，请求 ${channelNames.length} 个频道）`,
     );
     return { byKey };
   }

@@ -1,5 +1,5 @@
 // src/renderer/pages/LivePage.tsx
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import Hls from 'hls.js';
 import { client } from '../api/client';
 import { ipcInvoke } from '../api/ipc';
@@ -240,10 +240,11 @@ export default function LivePage() {
   const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
   const epgTimer = useRef<number | null>(null);
 
-  // 网络订阅源：仅保留「合并展示 + 静默刷新」，管理 UI 全部搬到配置页
-  const [subGroups, setSubGroups] = useState<LiveGroup[]>([]);
+  // 订阅源状态（仅用于顶栏展示与"刷新订阅"按钮）
   const [subCount, setSubCount] = useState(0);
-  const [subErr, setSubErr] = useState('');
+  const [subEnabled, setSubEnabled] = useState(0);
+  const [subRefreshing, setSubRefreshing] = useState(false);
+  const [subMsg, setSubMsg] = useState('');
 
   const [programsOpen, setProgramsOpen] = useState(false);
   const [programsLoading, setProgramsLoading] = useState(false);
@@ -287,77 +288,26 @@ export default function LivePage() {
     if (msg) setReconnectMsg(msg);
   }, []);
 
-  // ====== 静默刷新订阅源（挂载时自动执行一次） ======
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const list = await ipcInvoke<LiveSubscription[]>('live:subscription:list');
-        if (cancelled) return;
-        const arr = Array.isArray(list) ? list : [];
-        setSubCount(arr.length);
-        if (!arr.some((s) => s.enabled)) return;
-
-        const results = await ipcInvoke<LiveSubscriptionRefreshResult[]>('live:subscription:refreshAll');
-        if (cancelled) return;
-        const merged: LiveGroup[] = [];
-        for (const r of results || []) {
-          if (r.ok && r.groups && r.groups.length) merged.push(...r.groups);
-        }
-        setSubGroups(merged);
-      } catch (e) {
-        // 静默失败，只打日志；配置页可手动刷新查看具体错误
-        // eslint-disable-next-line no-console
-        console.warn('[LiveSub] 后台刷新失败：', e);
+  // ====== 重新加载 lives（顶部下拉） ======
+  const reloadLives = useCallback(async () => {
+    try {
+      const cfg = await client.cfgGet();
+      const m = await client.liveMeta();
+      setLives(m);
+      // 保持当前选中索引（若超界则归零）
+      const idx = liveIdx < m.length ? liveIdx : 0;
+      setLiveIdx(idx);
+      if (m.length && idx !== liveIdx) {
+        await loadLiveInternal(idx, m);
       }
-    })();
-    return () => { cancelled = true; };
-  }, []);
-
-  // ====== 合并：客户端直播 + 订阅源 ======
-  const allGroups = useMemo<LiveGroup[]>(() => {
-    const map = new Map<string, LiveGroup>();
-    for (const g of groups) {
-      map.set(g.group, { group: g.group, channels: [...g.channels] });
+    } catch (e) {
+      console.warn('[Live] reload lives 失败：', e);
     }
-    for (const g of subGroups) {
-      const exist = map.get(g.group);
-      if (exist) exist.channels.push(...g.channels);
-      else map.set(g.group, { group: g.group, channels: [...g.channels] });
-    }
-    return [...map.values()];
-  }, [groups, subGroups]);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const cfg = await client.cfgGet();
-        const m = await client.liveMeta();
-        if (cancelled) return;
-        setLives(m);
-        if (m.length) {
-          const start = cfg.ui.activeLiveIndex < m.length ? cfg.ui.activeLiveIndex : 0;
-          setLiveIdx(start);
-          await loadLive(start, m);
-        }
-      } catch (e) {
-        if (!cancelled) setErr((e as Error).message);
-      }
-    })();
-    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [liveIdx]);
 
-  function pickLive(index: number, meta?: LiveBean[]) {
-    const m = meta ?? lives;
-    if (!m.length) return;
-    setLiveIdx(index);
-    client.cfgSetActiveLive(index).catch(() => undefined);
-    void loadLive(index, m);
-  }
-
-  async function loadLive(index: number, meta?: LiveBean[]) {
+  // ====== 加载某个线路 ======
+  async function loadLiveInternal(index: number, meta?: LiveBean[]) {
     const m = meta ?? lives;
     if (!m.length) return;
     setLoading(true);
@@ -375,8 +325,13 @@ export default function LivePage() {
           ? group.channels.find((c) => c.name === mem.channelName)!
           : group.channels[0];
         if (group.channels.length && ch) {
-          pickChannel(group, ch.name, fromMem ? (mem.lineIdx || 0) : 0, r.groups);
+          pickChannelInternal(group, ch.name, fromMem ? (mem.lineIdx || 0) : 0, r.groups, index);
         }
+      } else {
+        setGroups([]);
+        setGroupName('');
+        setChannelName('');
+        setPlayUrl('');
       }
     } catch (e) {
       setErr((e as Error).message);
@@ -385,11 +340,19 @@ export default function LivePage() {
     }
   }
 
-  function pickChannel(g: LiveGroup, name: string, li: number, all = groups) {
+  function pickLive(index: number, meta?: LiveBean[]) {
+    const m = meta ?? lives;
+    if (!m.length) return;
+    setLiveIdx(index);
+    client.cfgSetActiveLive(index).catch(() => undefined);
+    void loadLiveInternal(index, m);
+  }
+
+  function pickChannelInternal(g: LiveGroup, name: string, li: number, all = groups, idx = liveIdx) {
     setGroupName(g.group);
     setChannelName(name);
     setLineIdx(li);
-    saveLiveMem({ liveIdx, groupName: g.group, channelName: name, lineIdx: li });
+    saveLiveMem({ liveIdx: idx, groupName: g.group, channelName: name, lineIdx: li });
     const ch = g.channels.find((c) => c.name === name);
     if (ch && ch.urls.length) {
       const line = splitLine(ch.urls[li] || ch.urls[0], li + 1);
@@ -397,8 +360,74 @@ export default function LivePage() {
     }
     if (all !== groups) setGroups(all);
   }
+  const pickChannel = pickChannelInternal;
 
-  const curGroup = allGroups.find((g) => g.group === groupName);
+  // ====== 订阅源状态 ======
+  const loadSubStatus = useCallback(async () => {
+    try {
+      const list = await ipcInvoke<LiveSubscription[]>('live:subscription:list');
+      const arr = Array.isArray(list) ? list : [];
+      setSubCount(arr.length);
+      setSubEnabled(arr.filter((s) => s.enabled).length);
+    } catch { /* ignore */ }
+  }, []);
+
+  const refreshSubs = useCallback(async () => {
+    setSubRefreshing(true);
+    setSubMsg('正在重新下载订阅源…');
+    try {
+      const results = await ipcInvoke<LiveSubscriptionRefreshResult[]>('live:subscription:refreshAll');
+      let ok = 0, fail = 0;
+      for (const r of results || []) {
+        if (r.ok) ok++;
+        else if (r.error !== '已停用') fail++;
+      }
+      setSubMsg(`订阅刷新：成功 ${ok} / 失败 ${fail}`);
+      await loadSubStatus();
+      await reloadLives();
+    } catch (e) {
+      setSubMsg(`刷新失败：${(e as Error).message}`);
+    } finally {
+      setSubRefreshing(false);
+      window.setTimeout(() => setSubMsg(''), 5000);
+    }
+  }, [loadSubStatus, reloadLives]);
+
+  // ====== 初始化 ======
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const cfg = await client.cfgGet();
+        const m = await client.liveMeta();
+        if (cancelled) return;
+        setLives(m);
+        if (m.length) {
+          const start = cfg.ui.activeLiveIndex < m.length ? cfg.ui.activeLiveIndex : 0;
+          setLiveIdx(start);
+          await loadLiveInternal(start, m);
+        }
+      } catch (e) {
+        if (!cancelled) setErr((e as Error).message);
+      }
+    })();
+    void loadSubStatus();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 监听配置页广播 → 重新拉 lives
+  useEffect(() => {
+    const handler = () => {
+      void loadSubStatus();
+      void reloadLives();
+    };
+    window.addEventListener('winbox:live-subscriptions-changed', handler);
+    return () => window.removeEventListener('winbox:live-subscriptions-changed', handler);
+  }, [loadSubStatus, reloadLives]);
+
+  // ====== EPG / 节目单（与原版一致） ======
+  const curGroup = groups.find((g) => g.group === groupName);
   const curChannel = curGroup?.channels.find((c) => c.name === channelName);
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
   const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
@@ -417,7 +446,6 @@ export default function LivePage() {
     } catch (e) {
       setEpg({});
       setEpgStatus('error');
-      // eslint-disable-next-line no-console
       console.warn('[EPG] 加载失败：', e);
     }
   }
@@ -452,8 +480,6 @@ export default function LivePage() {
     setProgramsLoading(true);
     setProgramsList([]);
     try {
-      // eslint-disable-next-line no-console
-      console.info('[EPG] 弹窗查询 keys =', keys);
       const raw = await client.epgPrograms(keys);
       const list: EpgProgramItem[] = ((raw as any[]) || [])
         .map((p: any) => ({
@@ -469,7 +495,6 @@ export default function LivePage() {
       else if (list.length) setProgramsDate(dayKey(list[0].start));
       else setProgramsDate(today);
     } catch (e) {
-      // eslint-disable-next-line no-console
       console.warn('[EPG] 拉取完整节目单失败', e);
     } finally {
       setProgramsLoading(false);
@@ -521,19 +546,47 @@ export default function LivePage() {
         <select value={liveIdx} onChange={(e) => pickLive(Number(e.target.value))} disabled={loading}>
           {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
         </select>
+
+        <button
+          type="button"
+          onClick={() => void refreshSubs()}
+          disabled={subRefreshing}
+          title="重新下载全部启用的订阅源到本地并更新直播线路"
+          style={{
+            marginLeft: 8,
+            padding: '4px 12px',
+            borderRadius: 6,
+            border: '1px solid #4ec9ff',
+            background: 'rgba(78,201,255,0.12)',
+            color: '#4ec9ff',
+            cursor: subRefreshing ? 'not-allowed' : 'pointer',
+            fontSize: 12,
+            lineHeight: '20px',
+            whiteSpace: 'nowrap',
+            opacity: subRefreshing ? 0.6 : 1,
+          }}
+        >
+          {subRefreshing ? '刷新订阅中…' : '刷新订阅'}
+        </button>
+
+        {subMsg && (
+          <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.75 }}>{subMsg}</span>
+        )}
+
         <span className="status" style={{ marginLeft: 'auto' }}>
-          {loading ? '加载中…' : `${allGroups.length} 组`}
+          {loading ? '加载中…' : `${groups.length} 组`}
         </span>
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
-          订阅源 {subCount} 个
+          订阅 {subEnabled}/{subCount}
         </span>
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
           EPG：{epgStatusText}
         </span>
       </div>
+
       <div className="layout-2 content" style={{ padding: 12 }}>
         <div className="left">
-          {allGroups.map((g) => (
+          {groups.map((g) => (
             <div
               key={g.group}
               className={`nav-item ${g.group === groupName ? 'active' : ''}`}
@@ -625,7 +678,7 @@ export default function LivePage() {
               )}
             </>
           ) : (
-            <div className="empty">{allGroups.length ? '选择左侧分组' : '无直播（请先导入含 lives 的配置）'}</div>
+            <div className="empty">{groups.length ? '选择左侧分组' : '无直播（请先导入含 lives 的配置）'}</div>
           )}
         </div>
       </div>

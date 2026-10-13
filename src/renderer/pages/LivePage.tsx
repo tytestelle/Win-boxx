@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { client } from '../api/client';
 import type { LiveGroup, LiveBean, LiveEpgEntry, EpgChannelRef } from '../../shared/types';
 import VideoPlayer from '../components/VideoPlayer';
@@ -20,7 +20,6 @@ function saveLiveMem(m: LiveMem): void {
 
 type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 
-/** ★ 节目单条目（IPC 后 Date 会变成 ISO 字符串，这里统一成 Date） */
 interface EpgProgramItem {
   title: string;
   description: string;
@@ -28,7 +27,6 @@ interface EpgProgramItem {
   stop: Date;
 }
 
-/** ★ YYYY-MM-DD（本地时区） */
 function dayKey(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -36,16 +34,138 @@ function dayKey(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-/** ★ 把 IPC 返回的 start/stop（可能是 Date 或 ISO 字符串）统一成 Date */
 function toDate(v: unknown): Date {
   if (v instanceof Date) return v;
   if (typeof v === 'string' || typeof v === 'number') return new Date(v);
   return new Date();
 }
 
-/** ★ HH:mm */
 function hhmm(d: Date): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/** ★ 2026-10-13 判断是否是直播 URL（RTMP/RTSP/FLV/WS 协议 或 m3u8 直播流） */
+function isLiveUrl(url: string): boolean {
+  const u = (url || '').toLowerCase().trim();
+  if (!u) return false;
+  if (/^(rtmp|rtsp|rtp|flv|mms|ws|wss):\/\//.test(u)) return true;
+  if (u.includes('.m3u8')) return true;
+  if (u.includes('/live/') || u.includes('live.')) return true;
+  return false;
+}
+
+/**
+ * ★ 2026-10-13 直播播放器包装：
+ *   - 监听内部 <video> 的 `ended` 事件 —— 直播流播到缓冲区末尾必然触发，
+ *     播放器会显示「已播完全部剧集」，这就是用户看到的现象。这里捕获后延迟重连。
+ *   - 监听 `error`（网络/源不支持）→ 同样重连。
+ *   - 靠父组件用 `key` 强制重新挂载来重连（比调 video.load() 更稳）。
+ */
+function LiveVideoWrapper({
+  url,
+  onReconnect,
+  onVideoError,
+}: {
+  url: string;
+  onReconnect: () => void;
+  onVideoError: (msg: string) => void;
+}) {
+  const holderRef = useRef<HTMLDivElement>(null);
+  const reconnectRef = useRef(onReconnect);
+  const errorRef = useRef(onVideoError);
+  reconnectRef.current = onReconnect;
+  errorRef.current = onVideoError;
+
+  useEffect(() => {
+    const holder = holderRef.current;
+    if (!holder) return;
+
+    let cleanupFns: Array<() => void> = [];
+    let reconnectTimer: number | null = null;
+    let attachedVideo: HTMLVideoElement | null = null;
+
+    const scheduleReconnect = (delayMs: number) => {
+      if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        reconnectRef.current();
+      }, delayMs);
+    };
+
+    const attach = (): boolean => {
+      const v = holder.querySelector('video');
+      if (!v || v === attachedVideo) return v === attachedVideo;
+      attachedVideo = v;
+      // eslint-disable-next-line no-console
+      console.info('[LIVE] 检测到 <video>，已挂载重连监听器');
+
+      const onEnded = () => {
+        // eslint-disable-next-line no-console
+        console.warn('[LIVE] ended 事件触发（直播流被当成点播）→ 800ms 后自动重连');
+        scheduleReconnect(800);
+      };
+      const onError = () => {
+        const err = v.error;
+        const code = err?.code;
+        const msg =
+          code === 1 ? 'MEDIA_ERR_ABORTED（用户中止）'
+            : code === 2 ? 'MEDIA_ERR_NETWORK（网络错误）'
+              : code === 3 ? 'MEDIA_ERR_DECODE（解码错误）'
+                : code === 4 ? 'MEDIA_ERR_SRC_NOT_SUPPORTED（源不支持）'
+                  : `未知错误(${code ?? '?'})`;
+        // eslint-disable-next-line no-console
+        console.warn('[LIVE] video error：', msg, err?.message || '');
+        errorRef.current(msg);
+        // 网络错误 / 源不支持 → 延迟重连
+        if (code === 2 || code === 4) scheduleReconnect(1500);
+      };
+      const onStalled = () => {
+        // eslint-disable-next-line no-console
+        console.warn('[LIVE] stalled 事件（网络卡顿）');
+      };
+      const onWaiting = () => { /* 正常缓冲，不重连 */ };
+      const onPlay = () => {
+        // 播放正常 → 取消挂起的重连
+        if (reconnectTimer != null) { window.clearTimeout(reconnectTimer); reconnectTimer = null; }
+        errorRef.current('');
+      };
+
+      v.addEventListener('ended', onEnded);
+      v.addEventListener('error', onError);
+      v.addEventListener('stalled', onStalled);
+      v.addEventListener('waiting', onWaiting);
+      v.addEventListener('play', onPlay);
+      v.addEventListener('playing', onPlay);
+
+      cleanupFns.push(() => {
+        v.removeEventListener('ended', onEnded);
+        v.removeEventListener('error', onError);
+        v.removeEventListener('stalled', onStalled);
+        v.removeEventListener('waiting', onWaiting);
+        v.removeEventListener('play', onPlay);
+        v.removeEventListener('playing', onPlay);
+      });
+      return true;
+    };
+
+    if (!attach()) {
+      const t = window.setInterval(() => { if (attach()) window.clearInterval(t); }, 300);
+      cleanupFns.push(() => window.clearInterval(t));
+    }
+
+    return () => {
+      if (reconnectTimer != null) window.clearTimeout(reconnectTimer);
+      for (const fn of cleanupFns) fn();
+      cleanupFns = [];
+      attachedVideo = null;
+    };
+  }, [url]);
+
+  return (
+    <div ref={holderRef} style={{ width: '100%', height: '100%' }}>
+      <VideoPlayer url={url} />
+    </div>
+  );
 }
 
 export default function LivePage() {
@@ -58,19 +178,29 @@ export default function LivePage() {
   const [playUrl, setPlayUrl] = useState('');
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState('');
-  /** ★ 2026-09-29 EPG：键（tvg-id / tvg-name / 频道名）→ 当前 / 下一档 */
   const [epg, setEpg] = useState<Record<string, LiveEpgEntry>>({});
-  /** ★ 2026-10-13 EPG 状态提示 */
   const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
   const epgTimer = useRef<number | null>(null);
 
-  // ---- ★ 2026-10-13 完整节目单弹窗 ----
+  // ---- 完整节目单弹窗 ----
   const [programsOpen, setProgramsOpen] = useState(false);
   const [programsLoading, setProgramsLoading] = useState(false);
   const [programsList, setProgramsList] = useState<EpgProgramItem[]>([]);
   const [programsChannel, setProgramsChannel] = useState('');
-  const [programsDate, setProgramsDate] = useState(''); // YYYY-MM-DD
+  const [programsDate, setProgramsDate] = useState('');
   const programsScrollRef = useRef<HTMLDivElement>(null);
+
+  // ---- ★ 2026-10-13 断线重连状态 ----
+  /** 每次重连自增，用于给播放器换 key 强制重新挂载 */
+  const [reconnectKey, setReconnectKey] = useState(0);
+  /** 界面上的重连提示（空 = 不显示） */
+  const [reconnectMsg, setReconnectMsg] = useState('');
+  /** 本次会话重连次数（换 URL 时清零） */
+  const reconnectCountRef = useRef(0);
+  /** 上次重连时间戳（防抖） */
+  const lastReconnectAtRef = useRef(0);
+  /** 最大连续重连次数，超过就提示用户 */
+  const MAX_RECONNECT = 30;
 
   useEffect(() => {
     let cancelled = false;
@@ -144,12 +274,50 @@ export default function LivePage() {
     if (all !== groups) setGroups(all);
   }
 
+  // ★ 换 URL 时重置重连计数
+  useEffect(() => {
+    reconnectCountRef.current = 0;
+    lastReconnectAtRef.current = 0;
+    setReconnectMsg('');
+  }, [playUrl]);
+
+  // ★ 断线重连核心逻辑（供 LiveVideoWrapper 调用）
+  const doReconnect = useCallback(() => {
+    const now = Date.now();
+    // 3 秒内的重复触发只算一次（ended + error 可能同时来）
+    if (now - lastReconnectAtRef.current < 3000) return;
+    lastReconnectAtRef.current = now;
+    reconnectCountRef.current += 1;
+    const n = reconnectCountRef.current;
+    if (n > MAX_RECONNECT) {
+      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请手动刷新或切换线路`);
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.info(`[LIVE] 第 ${n} 次重连：${playUrl}`);
+    setReconnectMsg(`断线重连中…（第 ${n} 次）`);
+    setReconnectKey((k) => k + 1);
+    // 3 秒后自动隐藏提示（若播放恢复，wrapper 的 onPlay 也会清空）
+    window.setTimeout(() => {
+      setReconnectMsg((cur) => (cur.startsWith('断线重连中') ? '' : cur));
+    }, 3000);
+  }, [playUrl]);
+
+  // ★ 手动重连按钮
+  const manualReconnect = useCallback(() => {
+    reconnectCountRef.current = 0;
+    lastReconnectAtRef.current = 0;
+    setReconnectMsg('手动重连中…');
+    setReconnectKey((k) => k + 1);
+    window.setTimeout(() => setReconnectMsg(''), 2000);
+  }, []);
+
   const curGroup = groups.find((g) => g.group === groupName);
   const curChannel = curGroup?.channels.find((c) => c.name === channelName);
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
   const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
 
-  // ★ EPG：换线路 / 分组变化后拉一次节目单（主进程负责 XMLTV 拉取、缓存与频道匹配）
+  // ---- EPG ----
   async function refreshEpg(index: number, gs: LiveGroup[]) {
     const refs: EpgChannelRef[] = gs
       .flatMap((g) => g.channels)
@@ -162,8 +330,6 @@ export default function LivePage() {
       setEpg(r.byKey);
       const n = Object.keys(r.byKey).length;
       setEpgStatus(n ? 'ok' : 'empty');
-      // eslint-disable-next-line no-console
-      console.info(`[EPG] 命中 ${n} 个键`);
     } catch (e) {
       setEpg({});
       setEpgStatus('error');
@@ -178,7 +344,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx, groups]);
 
-  /** ★ 只在「当前节目结束 / 下一档开始」的时刻再拉一次（不做轮询） */
   useEffect(() => {
     if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
     if (!curChannel) return;
@@ -193,7 +358,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
-  // ---- ★ 打开完整节目单弹窗 ----
   async function openPrograms(name: string) {
     const channel = (name || '').trim();
     if (!channel) return;
@@ -212,7 +376,6 @@ export default function LivePage() {
         }))
         .sort((a, b) => a.start.getTime() - b.start.getTime());
       setProgramsList(list);
-      // 默认选中今天（若今天没有节目，选第一条的日期）
       const today = dayKey(new Date());
       if (list.some((p) => dayKey(p.start) === today)) setProgramsDate(today);
       else if (list.length) setProgramsDate(dayKey(list[0].start));
@@ -229,14 +392,12 @@ export default function LivePage() {
     setProgramsOpen(false);
   }
 
-  /** ★ 打开后自动滚动到当前节目 */
   useEffect(() => {
     if (!programsOpen || programsLoading) return;
     const el = programsScrollRef.current?.querySelector('[data-current="1"]') as HTMLElement | null;
     if (el) el.scrollIntoView({ block: 'center', behavior: 'auto' });
   }, [programsOpen, programsLoading, programsList, programsDate]);
 
-  /** ★ ESC 关闭弹窗 */
   useEffect(() => {
     if (!programsOpen) return;
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') closePrograms(); };
@@ -244,7 +405,6 @@ export default function LivePage() {
     return () => window.removeEventListener('keydown', onKey);
   }, [programsOpen]);
 
-  // ---- 从节目单里提取所有日期 tab ----
   const dateTabs = Array.from(new Set(programsList.map((p) => dayKey(p.start)))).sort();
   const dateList = programsDate ? programsList.filter((p) => dayKey(p.start) === programsDate) : programsList;
   const nowMs = Date.now();
@@ -256,7 +416,6 @@ export default function LivePage() {
           : epgStatus === 'error' ? '失败（看日志）'
             : '未触发';
 
-  /** ★ 日期 tab 显示：今天 / 明天 / 后天 / MM-DD 周X */
   function dateLabel(key: string): string {
     const [y, m, d] = key.split('-').map((s) => parseInt(s, 10));
     const date = new Date(y, m - 1, d);
@@ -316,7 +475,6 @@ export default function LivePage() {
                   ))}
                 </div>
               )}
-              {/* ★ EPG：当前 / 下一档；点击可打开完整节目单 */}
               {curEpg && (curEpg.current || curEpg.next) && (
                 <div
                   className="live-epg"
@@ -337,9 +495,45 @@ export default function LivePage() {
                   <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>📺</span>
                 </div>
               )}
+
+              {/* ============ ★ 播放器 + 断线重连 ============ */}
               {playUrl ? (
-                <div className="live-player">
-                  <VideoPlayer url={playUrl} />
+                <div className="live-player" style={{ position: 'relative' }}>
+                  {/* 播放器：靠 key 变更加载新实例，key 含 reconnectKey 触发重连 */}
+                  <LiveVideoWrapper
+                    key={`${playUrl}__${reconnectKey}`}
+                    url={playUrl}
+                    onReconnect={doReconnect}
+                    onVideoError={(msg) => { if (msg) setReconnectMsg(msg); }}
+                  />
+
+                  {/* 重连状态提示 */}
+                  {reconnectMsg && (
+                    <div
+                      style={{
+                        position: 'absolute', top: 12, left: 12,
+                        padding: '6px 12px', borderRadius: 6,
+                        background: 'rgba(0,0,0,0.65)', color: '#ffb74d', fontSize: 13,
+                        pointerEvents: 'none', zIndex: 10,
+                      }}
+                    >
+                      {reconnectMsg}
+                    </div>
+                  )}
+
+                  {/* 手动重连按钮（右下角） */}
+                  <button
+                    onClick={manualReconnect}
+                    title="手动重新加载该直播流"
+                    style={{
+                      position: 'absolute', bottom: 12, right: 12,
+                      padding: '6px 10px', borderRadius: 6, cursor: 'pointer',
+                      background: 'rgba(0,0,0,0.55)', color: '#ddd',
+                      border: '1px solid rgba(255,255,255,0.2)', fontSize: 12, zIndex: 10,
+                    }}
+                  >
+                    ↻ 重连
+                  </button>
                 </div>
               ) : (
                 <div className="empty">无播放地址</div>
@@ -351,7 +545,7 @@ export default function LivePage() {
         </div>
       </div>
 
-      {/* ================= ★ 完整节目单弹窗 ================= */}
+      {/* ================= 完整节目单弹窗 ================= */}
       {programsOpen && (
         <div
           onClick={closePrograms}
@@ -374,7 +568,6 @@ export default function LivePage() {
               overflow: 'hidden',
             }}
           >
-            {/* 标题栏 */}
             <div
               style={{
                 display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -394,7 +587,6 @@ export default function LivePage() {
               >×</button>
             </div>
 
-            {/* 日期 tab */}
             {dateTabs.length > 0 && (
               <div style={{ display: 'flex', gap: 6, padding: '10px 16px 0', flexWrap: 'wrap' }}>
                 {dateTabs.map((d) => (
@@ -412,7 +604,6 @@ export default function LivePage() {
               </div>
             )}
 
-            {/* 节目列表 */}
             <div ref={programsScrollRef} style={{ overflowY: 'auto', padding: '10px 8px 14px' }}>
               {programsLoading ? (
                 <div style={{ padding: 32, textAlign: 'center', color: '#888' }}>加载中…</div>

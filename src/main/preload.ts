@@ -255,3 +255,14 @@ const api = {
 
 contextBridge.exposeInMainWorld('api', api);
 export type Api = typeof api;
+
+// =========================================================================
+// ★ 2026-10-13（用户报「订阅源添加失败：IPC 桥不可用」）：
+//   上面 api 里的每个方法都通过 IPC.* 常量走特定 channel；
+//   而网络直播订阅源用的是动态 channel（'live:subscription:xxx'），
+//   无法预先在 api 里列出，所以这里额外暴露一个通用 invoke 桥。
+//   渲染层 ipcInvoke() 会优先使用 window.winboxIpc.invoke。
+// =========================================================================
+contextBridge.exposeInMainWorld('winboxIpc', {
+  invoke: (channel: string, ...args: unknown[]) => ipcRenderer.invoke(channel, ...args),
+});

@@ -15,6 +15,8 @@ import { DEFAULT_PLAYER_SETTINGS, type PlayerSettings, type MpvStatus } from '..
 import type { DavServer } from '../../shared/webdav';
 // ★ 2026-10-13（用户要求）：网络直播订阅源管理面板（从 LivePage 搬到配置页）
 import LiveSubscriptionPanel from '../components/LiveSubscriptionPanel';
+// ★ 2026-10-13（用户要求）：导入直播源弹窗（本地文件 / 网络订阅 + 管理表格）
+import LiveImportModal from '../components/LiveImportModal';
 
 type TabId = 'sources' | 'livesub' | 'health' | 'profiles' | 'account' | 'storage' | 'appearance' | 'play' | 'shortcut' | 'network' | 'backup';
 
@@ -76,6 +78,8 @@ export default function ConfigPage() {
   const [warn, setWarn] = useState<string[]>([]);
   const [err, setErr] = useState('');
   const [lastOk, setLastOk] = useState('');
+  // ★ 2026-10-13（用户要求）：导入直播源弹窗开关
+  const [liveImportOpen, setLiveImportOpen] = useState(false);
   // 外观主题
   const [theme, setTheme] = useState<Theme>(() => currentTheme());
   /** ★ 2026-09-30（用户要求）：是否展示「发现」页（默认展示；关掉后导航与默认落地页相应变化） */
@@ -451,6 +455,9 @@ export default function ConfigPage() {
   /**
    * ★ 2026-09-30（用户要求）：导入本地 TXT / M3U 直播源（文件选择器）。
    * 主进程落盘到 <userData>/local-live/ 并追加/更新一条直播线路；导入后「直播」页顶部线路下拉即可选到。
+   *
+   * ★ 2026-10-13：改为由 `LiveImportModal` 的「本地文件」按钮调用（原「导入直播源（TXT / M3U）」
+   * 按钮直接变成打开弹窗）。
    */
   async function doImportLiveLocal() {
     setBusy(true);
@@ -863,9 +870,9 @@ export default function ConfigPage() {
           <button disabled={busy} onClick={doImportPackage}>
             导入本地包
           </button>
-          {/* ★ 2026-09-30（用户要求）：本地 TXT / M3U 直播源（导入后直播页线路下拉可见） */}
-          <button disabled={busy} onClick={doImportLiveLocal} title="选择本地 .txt / .m3u / .m3u8 直播源文件；导入后到「直播」页顶部线路下拉切换">
-            导入直播源（TXT / M3U）
+          {/* ★ 2026-10-13（用户要求）：导入直播源弹窗 —— 本地文件 / 网络订阅源 + 管理表格 */}
+          <button disabled={busy} onClick={() => setLiveImportOpen(true)} title="本地 TXT/M3U 文件 或 网络订阅源（http/https）；添加后立即注册到直播页线路下拉">
+            导入直播源（本地 / 网络）
           </button>
         </div>
         {lastOk && <div className="status" style={{ marginBottom: 8 }}>✅ {lastOk}</div>}
@@ -1871,6 +1878,16 @@ export default function ConfigPage() {
       </div>
       </>
       )}
+
+      {/* ★ 2026-10-13（用户要求）：导入直播源弹窗（本地文件 / 网络订阅源 + 管理表格）
+          · 「本地文件」按钮回调 doImportLiveLocal —— 复用它原有的本地 TXT / M3U 导入逻辑
+          · 「网络订阅源」标签内添加后，主进程会通过 live:subscriptions-changed 广播，
+            直播页与弹窗表格均会立即刷新，无需重启 */}
+      <LiveImportModal
+        open={liveImportOpen}
+        onClose={() => setLiveImportOpen(false)}
+        onImportLocalFile={doImportLiveLocal}
+      />
     </div>
   );
 }

@@ -236,6 +236,9 @@ app.whenReady().then(async () => {
     fileLogger.w('播放诊断初始化失败：' + (e as Error).message);
   }
   registerIpc(host, dav, dlna, updater, localPkgs);
+  // ★ 新增：注册网络直播订阅源 IPC（必须在 app.whenReady() 之后调用——
+  //   LiveSubscriptionManager 会读 app.getPath('userData')；且需早于 createWindow 打开窗口）。
+  registerLiveSubscriptionIpc();
   // 老板键：注入窗口提供者（主窗口 + 播放器窗口）并按上次设置注册全局快捷键
   bossKey.start(() => {
     const ws: BrowserWindow[] = [];

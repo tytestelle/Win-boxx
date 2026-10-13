@@ -146,7 +146,7 @@ const UNSUPPORTED_ERR = /UNSUPPORTED_|SCRIPT_ERROR|PY_UNSUPPORTED|桌面版无�
 const SEARCH_ALL_PREPARE_MS = 12_000;
 
 const DEFAULT_EPG_URL =
-  'https://gitproxy.click/https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_merged.xml';
+  'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_merged.xml';
 
 function raceTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {

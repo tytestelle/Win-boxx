@@ -26,6 +26,8 @@ import { isDetailWindow, openDetailRoute } from './lib/detailWin';
 import { isSearchWindow, openSearchWindow } from './lib/searchWin';
 import { useTheme } from './lib/theme';
 import { client } from './api/client';
+// ★ 2026-10-14（用户要求）：导航点击 → 独立新窗口（多开）走通用 IPC 桥
+import { ipcInvoke } from './api/ipc';
 import type { Episode } from '../shared/types';
 
 /**
@@ -165,6 +167,29 @@ function AppShell() {
     .filter((g) => g.items.length > 0);
   /** 返回/回退的落点：发现被关掉时回「点播」 */
   const backHome = showDiscover ? '/' : '/home';
+
+  /**
+   * ★ 2026-10-14（用户要求）：导航点击 → **在新窗口中打开**（多开），不影响当前窗口。
+   *   - 当前窗口已在该路由 → 忽略（避免误触堆窗口）
+   *   - 否则调主进程 openRouteWindow：
+   *       · 同路由已开 → 聚焦该窗口（不重载、保留位置/尺寸）
+   *       * 未开 → 新建无边框独立窗口（可自由拖动、独立缩放）
+   */
+  const handleNavClick = (e: React.MouseEvent, route: string) => {
+    e.preventDefault();
+    if (loc.pathname === route) return;
+    void ipcInvoke('win:openRouteWindow', route).catch(() => undefined);
+  };
+
+  /**
+   * ★ 2026-10-14：每次路由变化上报给主进程 —— 主进程据此维护「路由 → 窗口」注册表，
+   *   使 openRouteWindow 能正确去重（同一顶层路由不重复开窗）。
+   *   非顶层路由（/detail/:key/:id、/player 等）主进程会忽略。
+   */
+  useEffect(() => {
+    void ipcInvoke('win:notifyRouteChange', loc.pathname).catch(() => undefined);
+  }, [loc.pathname]);
+
   useEffect(() => {
     if (!showDiscover && loc.pathname === '/') nav('/home', { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -527,7 +552,13 @@ function AppShell() {
               <div key={g.label} className="ap-group">
                 <div className="ap-group-label">{g.label}</div>
                 {g.items.map((n) => (
-                  <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => 'ap-nav' + (isActive ? ' active' : '')}>
+                  <NavLink
+                    key={n.to}
+                    to={n.to}
+                    end={n.end}
+                    className={({ isActive }) => 'ap-nav' + (isActive ? ' active' : '')}
+                    onClick={(e) => handleNavClick(e, n.to)}
+                  >
                     <span className="ap-nav-ico">{AP_ICONS[n.to]}</span>
                     <span className="ap-nav-txt">{n.label}</span>
                   </NavLink>
@@ -568,7 +599,13 @@ function AppShell() {
           </div>
           <nav className="db-nav">
             {navItems.map((n) => (
-              <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => 'db-chip' + (isActive ? ' active' : '')}>
+              <NavLink
+                key={n.to}
+                to={n.to}
+                end={n.end}
+                className={({ isActive }) => 'db-chip' + (isActive ? ' active' : '')}
+                onClick={(e) => handleNavClick(e, n.to)}
+              >
                 {n.label}
               </NavLink>
             ))}
@@ -588,7 +625,13 @@ function AppShell() {
         <nav className="nf-nav">
           <span className="nf-logo">WIN-BOX</span>
           {navItems.map((n) => (
-            <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => 'nf-link' + (isActive ? ' active' : '')}>
+            <NavLink
+              key={n.to}
+              to={n.to}
+              end={n.end}
+              className={({ isActive }) => 'nf-link' + (isActive ? ' active' : '')}
+              onClick={(e) => handleNavClick(e, n.to)}
+            >
               {n.label}
             </NavLink>
           ))}

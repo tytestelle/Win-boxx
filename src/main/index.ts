@@ -54,10 +54,67 @@ const dav = new DavService(
 /** ★ 2026-09-29 DLNA 投屏（SSDP 发现 + AVTransport 三动作；对位 CatClaw Dlna.cs = TVBox osc/dlna） */
 const dlna = new DlnaService(fileLogger);
 /**
- * ★ 2026-09-29 启动强制更新：本地版本低于 GitHub 最新 Release 时强制更新（不更新不可用）——
- *   查 `api.github.com`（失败不锁死）→ 代理加速下载 Setup → 拉起安装程序并退出本程序。
+ * ★★ 2026-10-13（用户要求「屏蔽软件的更新功能」）★★
+ *   用**哑更新器**替换真实 UpdateService：
+ *     - check()   → 永远返回 hasUpdate=false（渲染层不会弹强制更新窗口 / 不锁死应用）
+ *     - download()→ 永远返回 ok=false，不下载任何安装包
+ *     - launch()  → 永远返回 ok=false，不拉起安装程序
+ *     - downloadedPath() → 永远 null
+ *   返回值同时塞入多个常见字段名（hasUpdate / latest / version / forced / mandatory 等），
+ *   兼容渲染层不同读法；即便某个字段名对不上，也不会出现「undefined 让渲染层误判有更新」的情形。
+ *
+ *   `as unknown as UpdateService` 强转：保留真实类型签名给 registerIpc 使用，
+ *   免得改 registerIpc 的参数类型。
+ *
+ *   ⚠ 保留 UpdateService import 是有意为之（强转需要类型）；如需彻底移除更新模块，
+ *     把下面这个对象换成自定义 interface，并同步改 registerIpc 签名，改动面较大。
  */
-const updater = new UpdateService(fileLogger);
+const updater = (() => {
+  const CURRENT_VERSION = app.getVersion();
+  const noopCheck = async () => ({
+    // —— 常见「有无更新」判据（覆盖多种命名习惯，全部指向「无更新」）——
+    hasUpdate: false,
+    updateAvailable: false,
+    available: false,
+    needUpdate: false,
+    shouldUpdate: false,
+    hasNewVersion: false,
+    forced: false,
+    mandatory: false,
+    forceUpdate: false,
+    // —— 版本号字段（统一填当前版本，避免渲染层做「latest !== current」比对时误判）——
+    current: CURRENT_VERSION,
+    currentVersion: CURRENT_VERSION,
+    localVersion: CURRENT_VERSION,
+    latest: CURRENT_VERSION,
+    latestVersion: CURRENT_VERSION,
+    version: CURRENT_VERSION,
+    tag: CURRENT_VERSION,
+    tagName: CURRENT_VERSION,
+    tag_name: CURRENT_VERSION,
+    version_name: CURRENT_VERSION,
+    remoteVersion: CURRENT_VERSION,
+    // —— 下载/说明相关（一律空）——
+    downloadUrl: '',
+    url: '',
+    notes: '',
+    releaseNotes: '',
+    body: '',
+    publishedAt: '',
+    name: '',
+  });
+
+  const noopDownload = async () => ({ ok: false, error: '更新功能已禁用' });
+  const noopLaunch = async () => ({ ok: false, error: '更新功能已禁用' });
+  const noopDownloadedPath = () => null as string | null;
+
+  return {
+    check: noopCheck,
+    download: noopDownload,
+    downloadedPath: noopDownloadedPath,
+    launch: noopLaunch,
+  } as unknown as UpdateService;
+})();
 /**
  * ★ 2026-09-29（用户要求）本地包（影视壳/影视仓 目录包）：登记表 + `/pkg` 资源路由 + py 就地运行。
  *   导入安装目录下的 imports 副本，原始包可移动/删除，不影响已导入订阅。

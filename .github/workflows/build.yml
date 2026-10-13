@@ -5,7 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -19,8 +19,6 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          # 如果后续添加了 package-lock.json，可取消注释以下缓存配置
-          # cache: 'npm'
 
       - name: Install dependencies
         run: npm install
@@ -36,10 +34,12 @@ jobs:
 
       - name: Package release (electron-builder)
         run: npm run dist
+        env:
+          # 从 GitHub Secrets 中读取 WINBOX_SUPPORT_IMAGE
+          WINBOX_SUPPORT_IMAGE: ${{ secrets.WINBOX_SUPPORT_IMAGE }}
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: win-box-installer
-          # 上传安装包（根据 package.json 中的 artifactName 配置）
           path: release1.21.01/*.exe

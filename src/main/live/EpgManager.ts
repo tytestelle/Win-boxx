@@ -1,5 +1,6 @@
 // src/main/live/EpgManager.ts
-// XMLTV EPG 管理器 —— 移植自 TVBox EpgManager.java（含归一化模糊匹配兜底）
+// XMLTV EPG 管理器 —— 移植自 TVBox EpgManager.java
+// 含多候选加速前缀自动选择 + 归一化模糊匹配兜底
 
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
@@ -16,11 +17,23 @@ const HASH_FILE_NAME = 'epg.hash';
 const EPG_DATA_FILE_NAME = 'epg_data_cache.json';
 const EPG_DATA_HASH_FILE = 'epg_data_cache.hash';
 
-const EPG_DATA_RAW_URL =
-  'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json';
-// ★ 加速前缀：如需更换只改这一行
-const GITHUB_PROXY = 'https://gitproxy.click/';
-const EPG_DATA_REMOTE_URL = GITHUB_PROXY + EPG_DATA_RAW_URL;
+/**
+ * ★ 2026-10-13：多个加速前缀，谁先成功用谁（自动降级）。
+ * 顺序按实测可用性排列；第一个挂了会自动试下一个。
+ */
+const GITHUB_PROXIES = [
+  'https://gh-proxy.org/',        // 你日志里"更新检查"用的就是这个，实测可用
+  'https://ghfast.top/',
+  'https://githubproxy.cc/',
+  'https://mirror.ghproxy.com/',
+  'https://ghproxy.net/',
+  'https://gitproxy.click/',      // 老前缀，2026-10 已挂，保底放最后
+  '',                              // 空 = 直连 raw.githubusercontent.com（国内大概率不通）
+];
+
+/** 探测单个前缀用的轻量 URL（epg_data.json.hash，几十字节） */
+const PROBE_RAW =
+  'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json.hash';
 
 export interface EpgProgram {
   title: string;
@@ -34,7 +47,7 @@ export interface EpgRefreshResult {
   error?: string;
 }
 
-// ===================== XML 工具（无依赖） =====================
+// ===================== XML 工具 =====================
 function attrValue(attrs: string, name: string): string {
   const re = new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"|\\b${name}\\s*=\\s*'([^']*)'`);
   const m = re.exec(attrs);
@@ -55,21 +68,12 @@ function stripXmlText(s: string): string {
   return t.trim();
 }
 
-/**
- * ★ 2026-10-13：频道名归一化（用于模糊匹配兜底）。
- * 目标：`CCTV-1 高清` / `CCTV1高清` / `CCTV-1 HD` / `CCTV1` 归一化后都能对上。
- * 保留大小写（避免 CCTV 与 cctv 混淆），去掉空白、横杠、常见清晰度后缀、括号内容。
- */
 function normalizeChannelName(name: string): string {
   if (!name) return '';
   let s = name.trim();
-  // 去掉括号内容（含中英文括号）
   s = s.replace(/[（(][^）)]*[）)]/g, '');
-  // 去掉清晰度后缀（顺序敏感：先长后短）
   s = s.replace(/超清|蓝光|高清|标清|原画|流畅|超高清|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
-  // 去掉空白、横杠、下划线、点
   s = s.replace(/[\s\-_.·]+/g, '');
-  // 去掉结尾的"台""频道""高清"（有些源叫 CCTV1台）
   s = s.replace(/(频道|台)$/, '');
   return s.toUpperCase();
 }
@@ -81,13 +85,13 @@ export class EpgManager {
   private readonly programsByEpgId = new Map<string, EpgProgram[]>();
   private readonly iconUrlByEpgId = new Map<string, string>();
   private readonly loadedEpgIds = new Set<string>();
-
-  /** ★ 归一化名 → epgid（用于模糊匹配：CCTV1 高清 与 CCTV-1 归一到同一个键） */
   private readonly normalizedNameToEpgId = new Map<string, string>();
-  /** ★ 归一化名 → XMLTV channelId（解析时构建） */
   private readonly normalizedToXmlChannelId = new Map<string, string>();
-  /** ★ 归一化名 → iconUrl（解析时构建） */
   private readonly normalizedToIconUrl = new Map<string, string>();
+
+  /** ★ 已确定可用的加速前缀（'' = 直连）；null = 还没探测过 */
+  private activeProxy: string | null = null;
+  private proxyProbing: Promise<string> | null = null;
 
   private parsed = false;
   private epgUrl: string;
@@ -124,6 +128,85 @@ export class EpgManager {
     return idx > 0 ? v.substring(0, idx).trim() : v;
   }
 
+  // =====================================================================
+  // ★ 前缀探测：遍历 GITHUB_PROXIES，第一个能拿到 .hash 响应的就是 activeProxy
+  // =====================================================================
+  private async probeProxy(): Promise<string> {
+    if (this.activeProxy !== null) return this.activeProxy;
+    if (this.proxyProbing) return this.proxyProbing;
+
+    this.proxyProbing = (async (): Promise<string> => {
+      for (const prefix of GITHUB_PROXIES) {
+        const url = prefix + PROBE_RAW;
+        const label = prefix ? prefix : '直连';
+        try {
+          fileLogger.i(`${TAG} 探测加速前缀：${label}`);
+          const ctrl = new AbortController();
+          const t = setTimeout(() => ctrl.abort(), 8_000);
+          const res = await fetch(url, {
+            signal: ctrl.signal,
+            headers: { 'User-Agent': 'Mozilla/5.0 Win-Box', Accept: '*/*' },
+          });
+          clearTimeout(t);
+          if (res.ok) {
+            const txt = (await res.text()).trim();
+            if (txt && txt.length < 512) {
+              fileLogger.i(`${TAG} 加速前缀选定：${label}（探测返回 ${txt.length}B）`);
+              this.activeProxy = prefix;
+              return prefix;
+            }
+            fileLogger.w(`${TAG} 前缀「${label}」返回内容异常，跳过`);
+          } else {
+            fileLogger.w(`${TAG} 前缀「${label}」HTTP ${res.status}，跳过`);
+          }
+        } catch (e) {
+          fileLogger.w(`${TAG} 前缀「${label}」探测失败：${String(e)}`);
+        }
+      }
+      fileLogger.w(`${TAG} 所有加速前缀均不可用，退化为直连（国内大概率不通）`);
+      this.activeProxy = '';
+      return '';
+    })();
+
+    try {
+      return await this.proxyProbing;
+    } finally {
+      this.proxyProbing = null;
+    }
+  }
+
+  /** 把裸 raw 地址拼上已选前缀后请求；前缀未定先探测 */
+  private async fetchViaProxy(rawUrl: string, timeoutMs: number, asBuffer: false): Promise<string>;
+  private async fetchViaProxy(rawUrl: string, timeoutMs: number, asBuffer: true): Promise<Buffer | null>;
+  private async fetchViaProxy(rawUrl: string, timeoutMs: number, asBuffer: boolean): Promise<string | Buffer | null> {
+    const prefix = await this.probeProxy();
+    const url = prefix + rawUrl;
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      const res = await fetch(url, {
+        signal: ctrl.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0 Win-Box', Accept: '*/*' },
+      });
+      clearTimeout(t);
+      if (!res.ok) {
+        fileLogger.w(`${TAG} ${url} → HTTP ${res.status}`);
+        // 该前缀在这个大文件上失败 → 清掉，下次换一个重试
+        if (res.status === 403 || res.status === 404 || res.status >= 500) {
+          this.activeProxy = null;
+        }
+        return asBuffer ? null : '';
+      }
+      if (asBuffer) return Buffer.from(await res.arrayBuffer());
+      return (await res.text()).trim();
+    } catch (e) {
+      fileLogger.w(`${TAG} ${url} → ${String(e)}`);
+      // 请求失败也清掉前缀，下次重新探测
+      this.activeProxy = null;
+      return asBuffer ? null : '';
+    }
+  }
+
   loadEpgDataMap(resetXmlCache: boolean): void {
     this.nameToEpgId.clear();
     this.normalizedNameToEpgId.clear();
@@ -138,7 +221,6 @@ export class EpgManager {
             if (!item?.epgid || !item?.name) continue;
             const epgid = String(item.epgid).trim();
             if (!epgid) continue;
-            // 归一化 epgid 也放一份（用于反查）
             const normEpgid = normalizeChannelName(epgid);
             if (normEpgid && !this.normalizedNameToEpgId.has(normEpgid)) {
               this.normalizedNameToEpgId.set(normEpgid, epgid);
@@ -158,7 +240,7 @@ export class EpgManager {
           `${TAG} 加载 epg_data.json[${source}]，精确变体=${this.nameToEpgId.size}，归一化键=${this.normalizedNameToEpgId.size}`,
         );
       } else {
-        fileLogger.w(`${TAG} epg_data.json 尚未下载（${this.epgDataFile} 不存在），请检查网络/加速前缀`);
+        fileLogger.w(`${TAG} epg_data.json 尚未下载（${this.epgDataFile} 不存在）`);
       }
     } catch (e) {
       fileLogger.w(`${TAG} 加载 epg_data.json 失败[${source}]: ${String(e)}`);
@@ -181,7 +263,10 @@ export class EpgManager {
     if (this.epgDataRefreshRunning) return;
     this.epgDataRefreshRunning = true;
     try {
-      const remoteHash = await this.fetchText(EPG_DATA_REMOTE_URL + '.hash', 10_000);
+      const hashRaw = 'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json.hash';
+      const dataRaw = 'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json';
+
+      const remoteHash = await this.fetchViaProxy(hashRaw, 15_000, false);
       const localHash = existsSync(this.epgDataHashFile)
         ? readFileSync(this.epgDataHashFile, 'utf-8').trim()
         : '';
@@ -189,10 +274,10 @@ export class EpgManager {
         fileLogger.i(`${TAG} epg_data.json 远程 hash 未变化，使用本地缓存`);
         return;
       }
-      fileLogger.i(`${TAG} 下载 epg_data.json ← ${EPG_DATA_REMOTE_URL}`);
-      const buf = await this.fetchBuffer(EPG_DATA_REMOTE_URL, 60_000);
+      fileLogger.i(`${TAG} 下载 epg_data.json ← ${dataRaw}`);
+      const buf = await this.fetchViaProxy(dataRaw, 60_000, true);
       if (!buf || buf.length === 0) {
-        fileLogger.w(`${TAG} epg_data.json 下载为空（可能加速前缀失效）`);
+        fileLogger.w(`${TAG} epg_data.json 下载为空`);
         return;
       }
       try {
@@ -221,7 +306,17 @@ export class EpgManager {
     if (this.refreshRunning) return { ok: false, error: '正在刷新中' };
     this.refreshRunning = true;
     try {
-      const remoteHash = await this.fetchText(this.epgUrl + '.hash', 10_000);
+      // ★ 本地文件存在 + 未过 6 小时 → 直接用，不再联网（避免每次切线路都重下几十 MB）
+      if (existsSync(this.epgFile) && statSync(this.epgFile).size > 1024) {
+        const age = Date.now() - statSync(this.epgFile).mtimeMs;
+        if (age < 6 * 3600 * 1000) {
+          fileLogger.i(`${TAG} EPG 本地文件 ${Math.round(statSync(this.epgFile).size / 1024)}KB 未过期（${Math.round(age / 60000)} 分钟前），直接用`);
+          this.resetXmlCache();
+          return { ok: true };
+        }
+      }
+
+      const remoteHash = await this.fetchViaProxy(this.epgUrl + '.hash', 10_000, false);
       const localHash = existsSync(this.hashFile)
         ? readFileSync(this.hashFile, 'utf-8').trim()
         : '';
@@ -230,18 +325,21 @@ export class EpgManager {
         this.resetXmlCache();
         return { ok: true };
       }
-      if (!remoteHash && existsSync(this.epgFile)) {
-        fileLogger.i(`${TAG} EPG hash 拉取失败但本地文件存在，用本地 ${statSync(this.epgFile).size}B`);
-        this.resetXmlCache();
-        return { ok: true };
-      }
+
       fileLogger.i(`${TAG} 开始下载 EPG ← ${this.epgUrl}`);
       const tmp = this.epgFile + '.tmp';
-      await this.downloadToFile(this.epgUrl, tmp);
-      if (!existsSync(tmp) || statSync(tmp).size === 0) {
-        return { ok: false, error: 'EPG 文件下载为空' };
+      const buf = await this.fetchViaProxy(this.epgUrl, 180_000, true);
+      if (!buf || buf.length === 0) {
+        if (existsSync(this.epgFile)) {
+          fileLogger.w(`${TAG} 下载失败但本地存在，用本地`);
+          this.resetXmlCache();
+          return { ok: true };
+        }
+        return { ok: false, error: 'EPG 下载失败（加速前缀不可用）' };
       }
-      fileLogger.i(`${TAG} EPG 下载完成 ${statSync(tmp).size}B`);
+      writeFileSync(tmp, buf);
+      fileLogger.i(`${TAG} EPG 下载完成 ${buf.length}B`);
+
       const head = readFileSync(tmp).subarray(0, 2);
       if (head.length === 2 && head[0] === 0x1f && head[1] === 0x8b) {
         fileLogger.i(`${TAG} EPG 是 gzip，解压中`);
@@ -298,7 +396,6 @@ export class EpgManager {
     const key = channelName.trim();
     const hit = this.nameToEpgId.get(key);
     if (hit) return hit;
-    // ★ 归一化兜底
     const nk = normalizeChannelName(key);
     if (nk) {
       const nHit = this.normalizedNameToEpgId.get(nk);
@@ -311,7 +408,7 @@ export class EpgManager {
     return this.lookupEpgId(channelName);
   }
 
-  // ============== XML 扫描（含归一化模糊匹配兜底） ==============
+  // ============== XML 扫描 ==============
   private parseXmlForEpgIds(file: string, requested: Set<string>): Promise<void> {
     return new Promise((resolve) => {
       try {
@@ -319,8 +416,7 @@ export class EpgManager {
         const xml = readFileSync(file, 'utf-8');
         fileLogger.i(`${TAG} 已读入 XML ${xml.length}B，开始扫描（请求 ${requested.size} 个频道）`);
 
-        // 预构建 requested 的归一化集合
-        const requestedNorm = new Map<string, string>(); // 归一化 → 原 epgid
+        const requestedNorm = new Map<string, string>();
         for (const r of requested) {
           const nr = normalizeChannelName(r);
           if (nr && !requestedNorm.has(nr)) requestedNorm.set(nr, r);
@@ -331,7 +427,6 @@ export class EpgManager {
         const iconByEpgId = new Map<string, string>();
         const wantedChannelIds = new Set<string>();
 
-        // ---- 第一遍：<channel> ----
         const channelRe = /<channel\b([^>]*)>([\s\S]*?)<\/channel>/g;
         let m: RegExpExecArray | null;
         let totalChannel = 0;
@@ -358,16 +453,13 @@ export class EpgManager {
             /<icon\b[^>]*?\bsrc\s*=\s*'([^']*)'/.exec(body);
           const icon = iconMatch ? (iconMatch[1] || '').trim() : '';
 
-          // 三级匹配
           let matched: string | null = null;
           let how = '';
 
-          // 1) 精确等于 requested 里的 epgid
           for (const d of displayNames) {
             const t = d.trim();
             if (requested.has(t)) { matched = t; how = 'exact'; break; }
           }
-          // 2) 走 epg_data.json 变体表（精确）
           if (!matched) {
             for (const d of displayNames) {
               const t = d.trim();
@@ -375,7 +467,6 @@ export class EpgManager {
               if (id && requested.has(id)) { matched = id; how = 'variant'; break; }
             }
           }
-          // 3) ★ 归一化模糊匹配（display-name 归一化后与 requested 的归一化集合对应）
           if (!matched) {
             for (const d of displayNames) {
               const nd = normalizeChannelName(d);
@@ -384,7 +475,6 @@ export class EpgManager {
               if (r) { matched = r; how = 'norm'; break; }
             }
           }
-          // 4) ★ 归一化+变体表：display-name 归一化后命中 epg_data.json 变体表，且其 epgid 在 requested 里
           if (!matched) {
             for (const d of displayNames) {
               const nd = normalizeChannelName(d);
@@ -404,7 +494,6 @@ export class EpgManager {
             wantedChannelIds.add(channelId);
             if (icon && !iconByEpgId.has(matched)) iconByEpgId.set(matched, icon);
 
-            // 归一化表也记下：便于后续查 icon
             const mNorm = normalizeChannelName(matched);
             if (mNorm && !this.normalizedToXmlChannelId.has(mNorm)) {
               this.normalizedToXmlChannelId.set(mNorm, channelId);
@@ -421,7 +510,6 @@ export class EpgManager {
           `${TAG} channel 扫描完成：共 ${totalChannel} 个 channel；精确 ${matchByExact} / 变体 ${matchByVariant} / 归一化 ${matchByNorm}`,
         );
 
-        // ---- 第二遍：<programme> ----
         const progRe = /<programme\b([^>]*)>([\s\S]*?)<\/programme>/g;
         let totalProg = 0;
         let usedProg = 0;
@@ -453,7 +541,6 @@ export class EpgManager {
           `${TAG} programme 扫描完成：共 ${totalProg} 条；命中 ${usedProg} 条（属于 ${newPrograms.size} 个 channel）`,
         );
 
-        // ---- 合并 ----
         for (const [chId, list] of newPrograms) this.programsByChannelId.set(chId, list);
         for (const [epgid, ids] of idsByEpgId) {
           const existing = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
@@ -503,7 +590,6 @@ export class EpgManager {
     const epgid = this.lookupEpgId(channelName) ?? channelName.trim();
     const direct = this.programsByEpgId.get(epgid);
     if (direct && direct.length) return direct.slice();
-    // ★ 归一化兜底：拿归一化名反查 xmlChannelId
     const nk = normalizeChannelName(channelName);
     if (nk) {
       const xmlId = this.normalizedToXmlChannelId.get(nk);
@@ -511,7 +597,6 @@ export class EpgManager {
         const list = this.programsByChannelId.get(xmlId);
         if (list && list.length) return list.slice();
       }
-      // 再查一次归一化 epgid
       const nEpgid = this.normalizedNameToEpgId.get(nk);
       if (nEpgid) {
         const l2 = this.programsByEpgId.get(nEpgid);
@@ -570,43 +655,5 @@ export class EpgManager {
     const iso = `${main.slice(0, 4)}-${main.slice(4, 6)}-${main.slice(6, 8)}T${main.slice(8, 10)}:${main.slice(10, 12)}:${main.slice(12, 14)}${zone.slice(0, 3)}:${zone.slice(3, 5)}`;
     const d = new Date(iso);
     return Number.isNaN(d.getTime()) ? null : d;
-  }
-
-  private async fetchText(url: string, timeoutMs: number): Promise<string> {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), timeoutMs);
-      const res = await fetch(url, { signal: ctrl.signal });
-      clearTimeout(t);
-      if (!res.ok) return '';
-      return (await res.text()).trim();
-    } catch {
-      return '';
-    }
-  }
-
-  private async fetchBuffer(url: string, timeoutMs: number): Promise<Buffer | null> {
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), timeoutMs);
-      const res = await fetch(url, { signal: ctrl.signal });
-      clearTimeout(t);
-      if (!res.ok) return null;
-      return Buffer.from(await res.arrayBuffer());
-    } catch {
-      return null;
-    }
-  }
-
-  private async downloadToFile(url: string, target: string): Promise<void> {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 180_000);
-    try {
-      const res = await fetch(url, { signal: ctrl.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      writeFileSync(target, Buffer.from(await res.arrayBuffer()));
-    } finally {
-      clearTimeout(t);
-    }
   }
 }

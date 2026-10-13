@@ -41,51 +41,39 @@ function hhmm(d: Date): string {
 }
 
 // =========================================================================
-// ★ 新增：流类型探测器（模拟 TVBox/酷9 的后端探测逻辑）
+// 流类型探测器
 // =========================================================================
 class StreamDetector {
-  /**
-   * 通过发送 HEAD 请求探测 URL 的真实内容类型。
-   * 如果 HEAD 请求失败，则回退到 GET 请求（仅读取少量数据）。
-   */
   static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
-    // 1. 根据后缀快速判断（部分情况仍可依赖）
     const lower = url.toLowerCase();
     if (lower.includes('.m3u8')) return 'hls';
     if (lower.includes('.flv')) return 'flv';
     if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
     if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(lower)) return 'native';
-
-    // 2. 对于无后缀/代理链接，进行主动探测
     try {
       const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
-      const contentType = (res.headers.get('content-type') || '').toLowerCase();
-
-      if (contentType.includes('mpegurl') || contentType.includes('m3u8')) return 'hls';
-      if (contentType.includes('flv')) return 'flv';
-      if (contentType.includes('mp2t') || contentType.includes('mpegts')) return 'ts';
-      if (contentType.includes('video/') || contentType.includes('audio/')) return 'native';
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('mpegurl') || ct.includes('m3u8')) return 'hls';
+      if (ct.includes('flv')) return 'flv';
+      if (ct.includes('mp2t') || ct.includes('mpegts')) return 'ts';
+      if (ct.includes('video/') || ct.includes('audio/')) return 'native';
     } catch {
-      // HEAD 请求失败（可能是跨域或服务器不支持），尝试 GET 但只读取开头
       try {
         const res = await fetch(url, { method: 'GET', mode: 'cors' });
         const text = await res.text();
-        // 检查内容特征
         if (text.trim().startsWith('#EXTM3U')) return 'hls';
         if (text.includes('FLV')) return 'flv';
-        // 其他情况默认按 HLS 处理（因为很多 TS 流实际上也是 HLS 封装）
         return 'hls';
       } catch {
         return 'unknown';
       }
     }
-    // 3. 无法确定时，默认按 HLS 处理（兼容性最广）
     return 'hls';
   }
 }
 
 // =========================================================================
-// ★ 播放器组件（集成智能探测与代理）
+// 播放器组件（带原生控件 + 断线重连监听）
 // =========================================================================
 function LiveVideoPlayer({
   url,
@@ -133,10 +121,7 @@ function LiveVideoPlayer({
         manifestLoadingRetryDelay: 500,
         levelLoadingTimeOut: 15000,
         fragLoadingTimeOut: 30000,
-        // 允许跨域请求
-        xhrSetup: (xhr: XMLHttpRequest) => {
-          xhr.withCredentials = false;
-        },
+        xhrSetup: (xhr: XMLHttpRequest) => { xhr.withCredentials = false; },
       });
       hlsRef.current = hls;
       hls.loadSource(sourceUrl);
@@ -149,8 +134,7 @@ function LiveVideoPlayer({
 
       hls.on(Hls.Events.ERROR, (_evt: unknown, data: any) => {
         if (destroyed) return;
-        const fatal = data?.fatal;
-        if (!fatal) return;
+        if (!data?.fatal) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
           cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
           try { hls.startLoad(); } catch {}
@@ -191,28 +175,14 @@ function LiveVideoPlayer({
       }
     };
 
-    // 启动探测并播放
     (async () => {
       const kind = await StreamDetector.detect(url);
       if (destroyed) return;
-
-      // ★ 对于探测结果为 'unknown' 或已知的代理链接，尝试通过代理播放
-      //    这里我们使用 hls.js 的 xhrSetup 来添加请求头，模拟代理行为
-      //    如果仍然失败，则回退到原生播放
-
-      if (kind === 'hls') {
-        playHls(url);
-      } else if (kind === 'flv') {
-        void playMpegts('flv', url);
-      } else if (kind === 'ts') {
-        void playMpegts('mpegts', url);
-      } else if (kind === 'native') {
-        playNative();
-      } else {
-        // unknown：对于 .php 等链接，尝试用 hls.js 直接加载（hls.js 会自己处理）
-        // 如果失败，hls.js 的错误回调会触发重连
-        playHls(url);
-      }
+      if (kind === 'hls') playHls(url);
+      else if (kind === 'flv') void playMpegts('flv', url);
+      else if (kind === 'ts') void playMpegts('mpegts', url);
+      else if (kind === 'native') playNative();
+      else playHls(url);
     })();
 
     const onEnded = () => cbRef.current.onReconnect();
@@ -246,7 +216,7 @@ function LiveVideoPlayer({
       ref={videoRef}
       autoPlay
       playsInline
-      controls={false}
+      controls  /* ← 开启浏览器原生控件（全屏、音量、暂停等） */
       style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
     />
   );
@@ -285,7 +255,7 @@ export default function LivePage() {
   const lastReconnectAtRef = useRef(0);
   const MAX_RECONNECT = 50;
 
-  // ★ 换频道 → 直接把原始 URL 交给内联播放器（它自己识别类型）
+  // 换频道 → 直接把原始 URL 交给内联播放器
   useEffect(() => {
     if (!playUrl) { setPlaybackUrl(''); return; }
     setPlaybackUrl(playUrl);
@@ -301,7 +271,7 @@ export default function LivePage() {
     reconnectCountRef.current += 1;
     const n = reconnectCountRef.current;
     if (n > MAX_RECONNECT) {
-      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请手动刷新或切换线路`);
+      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请切换线路`);
       return;
     }
     setReconnectMsg(`断线重连中…（第 ${n} 次）`);
@@ -310,20 +280,6 @@ export default function LivePage() {
       setReconnectMsg((cur) => (cur.startsWith('断线重连中') ? '' : cur));
     }, 3000);
   }, []);
-
-  const manualReconnect = useCallback(() => {
-    reconnectCountRef.current = 0;
-    lastReconnectAtRef.current = 0;
-    setReconnectMsg('手动重连中…');
-    setPlaybackUrl('');
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        setPlaybackUrl(playUrl);
-        setReconnectKey((k) => k + 1);
-        window.setTimeout(() => setReconnectMsg(''), 1000);
-      });
-    });
-  }, [playUrl]);
 
   const handleVideoError = useCallback((msg: string) => {
     if (msg) setReconnectMsg(msg);
@@ -598,6 +554,7 @@ export default function LivePage() {
                     <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
                   )}
 
+                  {/* 断线重连提示（左上角浮层，不可点击） */}
                   {reconnectMsg && (
                     <div
                       style={{
@@ -610,20 +567,6 @@ export default function LivePage() {
                       {reconnectMsg}
                     </div>
                   )}
-
-                  <button
-                    type="button"
-                    onClick={manualReconnect}
-                    title="手动重新加载该直播流"
-                    style={{
-                      position: 'absolute', bottom: 12, right: 12,
-                      padding: '6px 10px', borderRadius: 6, cursor: 'pointer',
-                      background: 'rgba(0,0,0,0.65)', color: '#ddd',
-                      border: '1px solid rgba(255,255,255,0.25)', fontSize: 12, zIndex: 20,
-                    }}
-                  >
-                    ↻ 重连
-                  </button>
                 </div>
               ) : (
                 <div className="empty">无播放地址</div>

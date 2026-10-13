@@ -32,6 +32,13 @@ jobs:
       - name: Build application
         run: npm run build
 
+      - name: Create placeholder LICENSE.txt
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "LICENSE.txt")) {
+            "MIT License`n`nCopyright (c) 2026 Win-Box" | Out-File -Encoding utf8 LICENSE.txt
+          }
+
       - name: Package with electron-builder
         run: npx electron-builder --win --publish never
 

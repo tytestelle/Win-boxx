@@ -36,6 +36,8 @@ import { MpvController } from '../player/MpvController';
 // ★ 2026-10-08 详情页独立窗口（外观开关控制；见 renderer/lib/detailWin.ts）
 import { openDetailWindow, detailWindowReady } from '../player/DetailWindow';
 import { openSearchWindow, searchWindowReady } from '../player/SearchWindow';
+// ★ 2026-10-14（用户要求）：EPG 节目单独立窗口（可拖到屏幕任意位置、默认置顶）
+import { openEpgWindow, epgWindowReady } from '../player/EpgWindow';
 import type { MpvCommand, MpvStartOptions } from '../../shared/player';
 // 老板键
 import { bossKey, BOSS_DEFAULT_ACCEL } from '../bossKey';
@@ -683,5 +685,19 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
     (_e: any, channelNames: string | string[]) => host.getLiveEpgPrograms(channelNames),
     log,
   );
+
+  // ★ 2026-10-14（用户要求）：EPG 独立窗口 —— 直播页点「正在播 / 下一档 / 📺」时调用。
+  //   单例复用：切换频道时通知已开窗口换参数（不重载、不丢位置）。
+  registerHandler(IPC.EPG_OPEN_WINDOW, (_e: any, p: { channelName: string; tvgId?: string; tvgName?: string }) =>
+    openEpgWindow({
+      channelName: String(p?.channelName || ''),
+      tvgId: p?.tvgId ? String(p.tvgId) : undefined,
+      tvgName: p?.tvgName ? String(p.tvgName) : undefined,
+    }), log);
+  registerHandler(IPC.EPG_WINDOW_READY, (e: any) => {
+    epgWindowReady(e.sender.id);
+    return { ok: true };
+  }, log);
+
   registerHandler('live:meta', () => host.lives, log);
 }

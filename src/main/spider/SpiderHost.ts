@@ -2160,10 +2160,14 @@ export class SpiderHost {
     }
     this.logger.i(`EPG：拉取完成，开始按需解析 ${list.length} 个频道引用`);
 
+    // ★ 收集**所有变体名**（name / tvgName / tvgId）——之前只用第一个非空值，
+    //   导致 tvg-id / tvg-name 对应的节目永远匹配不上，弹窗查不到。
     const channelNames: string[] = [];
     for (const ref of list) {
-      const name = (ref.name || ref.tvgName || ref.tvgId || '').trim();
-      if (name && !channelNames.includes(name)) channelNames.push(name);
+      for (const k of [ref.name, ref.tvgName, ref.tvgId]) {
+        const n = (k || '').trim();
+        if (n && !channelNames.includes(n)) channelNames.push(n);
+      }
     }
     if (!channelNames.length) {
       this.logger.i('EPG：无可匹配的频道名，跳过解析');
@@ -2176,9 +2180,7 @@ export class SpiderHost {
     const now = Date.now();
     let hitCount = 0;
     for (const ref of list) {
-      const name = (ref.name || ref.tvgName || ref.tvgId || '').trim();
-      if (!name) continue;
-      const entry = this.buildLiveEpgEntry(mgr, name, now);
+      const entry = this.buildLiveEpgEntry(mgr, ref, now);
       if (!entry.current && !entry.next) continue;
       hitCount++;
       for (const k of [ref.tvgId, ref.tvgName, ref.name]) {
@@ -2191,7 +2193,18 @@ export class SpiderHost {
     return { byKey };
   }
 
-  private buildLiveEpgEntry(mgr: EpgManager, channelName: string, now: number): LiveEpgEntry {
+  /** ★ 传 ref（含 tvgId / tvgName / name），内部依次尝试，命中即用 */
+  private buildLiveEpgEntry(mgr: EpgManager, ref: EpgChannelRef, now: number): LiveEpgEntry {
+    const keys = [ref.tvgId, ref.tvgName, ref.name]
+      .map((k) => (k || '').trim())
+      .filter((k): k is string => !!k);
+
+    let programs: EpgProgram[] = [];
+    for (const k of keys) {
+      const got = mgr.getProgramsForChannel(k);
+      if (got.length) { programs = got; break; }
+    }
+
     const fmt = (d: Date): string => {
       const hh = String(d.getHours()).padStart(2, '0');
       const mm = String(d.getMinutes()).padStart(2, '0');
@@ -2209,7 +2222,6 @@ export class SpiderHost {
           }
         : undefined;
 
-    const programs = mgr.getProgramsForChannel(channelName);
     let cur: EpgProgram | null = null;
     let nxt: EpgProgram | null = null;
     for (const p of programs) {
@@ -2229,9 +2241,17 @@ export class SpiderHost {
     return this.epgMgr;
   }
 
-  /** ★ EPG 直查：某频道完整节目单 */
-  getLiveEpgPrograms(channelName: string) {
-    return this.epgMgr ? this.epgMgr.getProgramsForChannel(channelName) : [];
+  /** ★ EPG 直查：支持单 key 或多 key 数组（渲染层会把 tvg-id / tvg-name / name 全部传进来，依次尝试） */
+  getLiveEpgPrograms(channelNames: string | string[]) {
+    if (!this.epgMgr) return [];
+    const list = Array.isArray(channelNames) ? channelNames : [channelNames];
+    for (const n of list) {
+      const trimmed = String(n || '').trim();
+      if (!trimmed) continue;
+      const got = this.epgMgr.getProgramsForChannel(trimmed);
+      if (got.length) return got;
+    }
+    return [];
   }
   /** ★ EPG 直查：某频道当前节目 */
   getLiveEpgCurrent(channelName: string) {

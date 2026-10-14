@@ -20,8 +20,8 @@ jobs:
         with:
           node-version: 20
 
-      # ★ 2026-10-14（新增）：CI 里需要 JDK 才能编译 JVM stubs（供测试用）
-      - name: Setup Java (for JVM stubs)
+      # ★ 需要 JDK 来编译 stubs-src（提供 javac / jar 命令）
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
@@ -30,42 +30,113 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      # ★ 2026-10-14（新增）：把 resources/jvm/stubs-src/**.java 编译成 resources/jvm/stubs/stubs.jar
-      #   失败根因：stubs.jar 是构建产物、不在 git 里；CI 干净 checkout 没有 → 测试编译 android.* 找不到符号。
-      - name: Compile JVM stubs
+      # ==================================================================
+      # ★ 生成 JVM stubs（Android 桩库）
+      #
+      #   背景：stubs-src/ 里只有部分 Java 源码（android.view.View、org.json.JSONObject 等），
+      #         它们引用的基础类（android.content.Context、android.net.Uri 等）没有源码。
+      #   方案：从 Maven Central 下载「完整 Android 类库」作为 classpath，
+      #         编译 stubs-src 得到定制类，然后把两者合并成 stubs.jar。
+      # ==================================================================
+      - name: Prepare JVM stubs
         shell: pwsh
         run: |
-          $src = "resources/jvm/stubs-src"
-          $outDir = "resources/jvm/stubs"
-          if (-not (Test-Path $src)) { throw "stubs-src 目录不存在：$src" }
-          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $stubsSrc = "resources/jvm/stubs-src"
+          $stubsDir = "resources/jvm/stubs"
+          $classes  = Join-Path $stubsDir "classes"
 
-          $classes = Join-Path $outDir "classes"
+          if (-not (Test-Path $stubsSrc)) { throw "缺少 $stubsSrc" }
+          New-Item -ItemType Directory -Force -Path $stubsDir | Out-Null
           Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $classes | Out-Null
 
-          $files = Get-ChildItem -Path $src -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
+          # ----- 1. 下载 Robolectric android-all（完整 Android framework 类） -----
+          #    ~200 MB，但下载一次即可。Robolectric 版本是为「JVM 上运行 Android 代码」打包的，
+          #    纯 Java 实现、无 JNI 依赖 → 在 Windows JVM 上可直接用。
+          $androidAll = Join-Path $stubsDir "android-all-base.jar"
+          if (-not (Test-Path $androidAll)) {
+            $androidAllUrl = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
+            Write-Host "⬇  下载 android-all.jar（~200MB，仅一次）…"
+            $attempts = 0
+            while ($attempts -lt 3) {
+              $attempts++
+              try {
+                Invoke-WebRequest -Uri $androidAllUrl -OutFile $androidAll -UseBasicParsing -TimeoutSec 900
+                break
+              } catch {
+                Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+                if ($attempts -ge 3) { throw "android-all 下载失败" }
+                Start-Sleep -Seconds 5
+              }
+            }
+          }
+          Write-Host "✓ android-all: $((Get-Item $androidAll).Length) B"
+
+          # ----- 2. 下载 org.json（android-all 里未必包含，且 stubs-src 里有 JSONObject 引用） -----
+          $orgJson = Join-Path $stubsDir "org-json-base.jar"
+          if (-not (Test-Path $orgJson)) {
+            $orgJsonUrl = "https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar"
+            Write-Host "⬇  下载 org.json…"
+            Invoke-WebRequest -Uri $orgJsonUrl -OutFile $orgJson -UseBasicParsing -TimeoutSec 300
+          }
+          Write-Host "✓ org.json: $((Get-Item $orgJson).Length) B"
+
+          # ----- 3. 编译 stubs-src（用两个 jar 作为 classpath） -----
+          $files = Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
           if ($files.Count -eq 0) { throw "stubs-src 下没有 .java 文件" }
           Write-Host "🔨 编译 $($files.Count) 个 .java 文件…"
-          javac -encoding UTF-8 -d $classes $files
-          if ($LASTEXITCODE -ne 0) { throw "javac 编译失败" }
 
-          $jar = Join-Path $outDir "stubs.jar"
-          Remove-Item -Force $jar -ErrorAction SilentlyContinue
-          jar cf $jar -C $classes .
-          if (-not (Test-Path $jar)) { throw "stubs.jar 未生成" }
-          Write-Host "✓ stubs.jar 生成：$jar（$((Get-Item $jar).Length) B）"
+          $cp = "$androidAll;$orgJson"
+          javac -encoding UTF-8 -cp $cp -d $classes $files
+          if ($LASTEXITCODE -ne 0) { throw "javac 编译失败（见上方详细错误）" }
 
-      - name: Run typecheck
-        run: npm run typecheck
+          # ----- 4. 组装 stubs.jar -----
+          #    先放 android-all + org.json（基线），再用 stubs-src 编译结果**覆盖**同名类。
+          $stubsJar = Join-Path $stubsDir "stubs.jar"
+          Copy-Item $androidAll $stubsJar -Force
 
-      # ★ 2026-10-14（新增）：准备 JRE（Windows x64）—— 供 jar 源运行（jar-spider）
+          Push-Location $classes
+          # 把编译出的所有 class 追加/覆盖进 stubs.jar
+          jar uf "../stubs.jar" .
+          Pop-Location
+
+          # org.json：如果 android-all 里没有，就从 org.json jar 里补
+          # （用 jar 的 uf 更新即可；同名类由 stubs-src 覆盖后已经是定制版）
+          Push-Location $stubsDir
+          $tempExtract = "temp-orgjson"
+          Remove-Item -Recurse -Force $tempExtract -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $tempExtract | Out-Null
+          Push-Location $tempExtract
+          jar xf "../org-json-base.jar"
+          Pop-Location
+          # 只补充 stubs.jar 里没有的 org/json/* 类（不覆盖 stubs-src 定制版）
+          Push-Location $tempExtract
+          jar uf "../stubs.jar" .
+          Pop-Location
+          Remove-Item -Recurse -Force $tempExtract -ErrorAction SilentlyContinue
+          Pop-Location
+
+          if (-not (Test-Path $stubsJar)) { throw "stubs.jar 未生成" }
+          Write-Host "✓ stubs.jar 生成：$stubsJar（$((Get-Item $stubsJar).Length) B）"
+
+          # ----- 5. 校验：抽样检查关键类是否在 stubs.jar 里 -----
+          Push-Location $stubsDir
+          $list = & jar tf stubs.jar
+          Pop-Location
+          foreach ($needle in @("android/content/Context.class", "android/net/Uri.class", "android/view/View.class", "android/widget/ScrollView.class", "org/json/JSONObject.class", "org/json/JSONException.class")) {
+            if ($list -notmatch [regex]::Escape($needle)) { throw "stubs.jar 缺少 $needle" }
+            Write-Host "  ✓ $needle"
+          }
+
+      # ==================================================================
+      # ★ 准备 JRE（供 jar-spider 运行 .jar 源使用）
+      # ==================================================================
       - name: Prepare JRE (Windows x64)
         shell: pwsh
         run: |
           $jreDir = "resources/jvm/jre"
           if (Test-Path "$jreDir/bin/java.exe") {
-            Write-Host "✓ JRE 已存在，跳过下载：$jreDir"
+            Write-Host "✓ JRE 已存在，跳过"
             & "$jreDir/bin/java.exe" -version
             exit 0
           }
@@ -74,13 +145,13 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
           $extract = Join-Path $env:RUNNER_TEMP "jre-extract"
           Write-Host "⬇  下载 JRE：$url"
-          $attempts = 0; $maxAttempts = 3
-          while ($attempts -lt $maxAttempts) {
+          $attempts = 0
+          while ($attempts -lt 3) {
             $attempts++
             try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600; break }
             catch {
               Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
-              if ($attempts -ge $maxAttempts) { throw "JRE 下载失败" }
+              if ($attempts -ge 3) { throw "JRE 下载失败" }
               Start-Sleep -Seconds 5
             }
           }
@@ -92,6 +163,9 @@ jobs:
           if (-not (Test-Path "$jreDir/bin/java.exe")) { throw "JRE 准备失败" }
           & "$jreDir/bin/java.exe" -version
           Write-Host "✓ JRE 就绪：$jreDir"
+
+      - name: Run typecheck
+        run: npm run typecheck
 
       - name: Run tests
         run: npm run test
@@ -106,15 +180,15 @@ jobs:
             "MIT License`n`nCopyright (c) 2026 Win-Box" | Out-File -Encoding utf8 LICENSE.txt
           }
 
-      # ★ 打包前校验：JRE + stubs.jar 都要在
-      - name: Verify JRE and stubs before packaging
+      # ★ 打包前校验：JRE 和 stubs.jar 都必须在
+      - name: Verify before packaging
         shell: pwsh
         run: |
-          $java = "resources/jvm/jre/bin/java.exe"
+          $java  = "resources/jvm/jre/bin/java.exe"
           $stubs = "resources/jvm/stubs/stubs.jar"
-          if (-not (Test-Path $java)) { throw "打包前校验失败：$java 不存在" }
-          if (-not (Test-Path $stubs)) { throw "打包前校验失败：$stubs 不存在" }
-          Write-Host "✓ java.exe: $((Get-Item $java).Length) B"
+          if (-not (Test-Path $java))  { throw "缺少 $java" }
+          if (-not (Test-Path $stubs)) { throw "缺少 $stubs" }
+          Write-Host "✓ java.exe:  $((Get-Item $java).Length) B"
           Write-Host "✓ stubs.jar: $((Get-Item $stubs).Length) B"
 
       - name: Package with electron-builder

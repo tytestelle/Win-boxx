@@ -64,10 +64,11 @@
       "!resources/.tmp/**",
       "!resources/jvm/stubs-src/**",
       "!resources/jvm/tools/**",
+      "resources/jvm/tools/dex2jar/**",
       "!resources/jvm/libs/jython-standalone-2.7.3.jar",
       "!resources/**/hs_err_pid*.log",
-       "!resources/**/replay_pid*.log",
-       "!resources/**/__pycache__/**"
+      "!resources/**/replay_pid*.log",
+      "!resources/**/__pycache__/**"
     ],
     "asarUnpack": [
       "resources/**"

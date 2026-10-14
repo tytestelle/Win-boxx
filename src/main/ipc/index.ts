@@ -1,623 +1,642 @@
-// src/renderer/pages/LivePage.tsx
-import { useEffect, useRef, useState, useCallback } from 'react';
-import Hls from 'hls.js';
-import { client } from '../api/client';
-import { ipcInvoke } from '../api/ipc';
-import type {
-  LiveGroup,
-  LiveBean,
-  LiveEpgEntry,
-  EpgChannelRef,
-  LiveSubscription,
-} from '../../shared/types';
-import { splitLine } from '../../engine/live/LiveUtils';
+// src/main/ipc/index.ts — register all IPC handlers
+import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, nativeTheme } from 'electron';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { registerHandler } from '../util/ipcGuard';
+import { fileLogger } from '../util/logger';
+import { SpiderHost } from '../spider/SpiderHost';
+import { resourcesDir, userDataDir, spiderCacheDir } from '../util/paths';
+import type { LocalPkgStore } from '../store/LocalPkgStore';
+import { pkgSubUrl } from '../../engine/config/localPkg';
+import {
+  openWebHomeWindow,
+  webHomeReq,
+  webHomeCookie,
+  webHomePlay,
+  type FmReqPayload,
+  type WebHomeOpenInit,
+} from '../webbridge/WebHomeWindow';
+import { clearAppCache } from '../util/cacheClean';
+import { nameFromLocalFile } from '../util/importNaming';
+import { join, basename } from 'node:path';
+import { IPC } from '../../shared/ipc-channels';
+import { dataDirReport } from '../util/dataDirBootstrap';
+import { proxySettingsView, setProxySettings, getProxySettings, type ProxySettings } from '../net/proxy';
+import { buildBackupFile, parseBackupFile } from '../settings/backup';
+import type { BackupExportResult, BackupImportResult, BackupSettingsState } from '../../shared/backup';
+import type { DavServer } from '../../shared/webdav';
+import type { DavService } from '../webdav/DavService';
+import type { DlnaCastTarget, DlnaDevice } from '../../shared/dlna';
+import type { DlnaService } from '../dlna/DlnaService';
+import type { UpdateProgress } from '../../shared/update';
+import type { UpdateService } from '../update/UpdateService';
+// Independent player window
+import { openPlayerWindow, playerSwitchEpisode, isPlayerOpen, closePlayerWindow, playerSetMini, playerIsMini, playerWindow, playerResendInit, onPlayerWindowClosed, isPlayerWindow, playerSetFullscreen, playerIsFullscreen, playerSetResizable } from '../player/PlayerWindow';
+import { MpvController } from '../player/MpvController';
+import { openDetailWindow, detailWindowReady } from '../player/DetailWindow';
+import { openSearchWindow, searchWindowReady } from '../player/SearchWindow';
+import {
+  openEpgWindow,
+  epgWindowReady,
+  getPendingGroups,
+  type EpgChannelItem,
+  type EpgGroupItem,
+} from '../player/EpgWindow';
+import type { MpvCommand, MpvStartOptions } from '../../shared/player';
+// Boss key
+import { bossKey, BOSS_DEFAULT_ACCEL } from '../bossKey';
+import { playerSettings } from '../player/playerSettings';
+import { detectPlayers, launchPlayer, seekArgs } from '../torrent/externalPlayer';
+import { ok } from '../../shared/ipc-result';
+import type { IpcMainInvokeEvent } from 'electron';
+import type { BossKeySettings, EpgChannelRef, ImportReport, MultiConfigEntry, SiteConfig, SourceBean, SourceMoveDirection, SourceUpdatePatch } from '../../shared/types';
+import type { MetaSettings } from '../../shared/meta';
+import type { PlayerSettings } from '../../shared/player';
+// Local file live-source import (shared with network subscription download path)
+import { importLiveFileFromPath } from '../live/importLiveFile';
+// Generic route window
+import { openRouteWindow, setWindowRoute } from '../player/RouteWindow';
 
-// ---- 频道选择记忆 ----
-const LIVE_MEM_KEY = 'winbox-live-mem';
-interface LiveMem { liveIdx?: number; groupName?: string; channelName?: string; lineIdx?: number }
-function loadLiveMem(): LiveMem {
-  try { return JSON.parse(localStorage.getItem(LIVE_MEM_KEY) || '{}') as LiveMem; } catch { return {}; }
+function winOf(e: IpcMainInvokeEvent): BrowserWindow | null {
+  return BrowserWindow.fromWebContents(e.sender);
 }
-function saveLiveMem(m: LiveMem): void {
-  try { localStorage.setItem(LIVE_MEM_KEY, JSON.stringify(m)); } catch { /* ignore */ }
-}
 
-type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
-
-class StreamDetector {
-  static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
-    const lower = url.toLowerCase();
-    if (lower.includes('.m3u8')) return 'hls';
-    if (lower.includes('.flv')) return 'flv';
-    if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
-    if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(lower)) return 'native';
+// 2026-10-14: broadcast live:changed to every window (including standalone live windows).
+// Triggered after successful local TXT/M3U import and after network subscription import
+// (subscription may carry `lives`). Live page listens and auto-reloads the active line.
+function broadcastLiveChanged(payload: { index?: number; name?: string; replaced?: boolean }): void {
+  for (const w of BrowserWindow.getAllWindows()) {
+    if (w.isDestroyed()) continue;
     try {
-      const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
-      const ct = (res.headers.get('content-type') || '').toLowerCase();
-      if (ct.includes('mpegurl') || ct.includes('m3u8')) return 'hls';
-      if (ct.includes('flv')) return 'flv';
-      if (ct.includes('mp2t') || ct.includes('mpegts')) return 'ts';
-      if (ct.includes('video/') || ct.includes('audio/')) return 'native';
+      w.webContents.send(IPC.LIVE_CHANGED, payload);
     } catch {
-      try {
-        const res = await fetch(url, { method: 'GET', mode: 'cors' });
-        const text = await res.text();
-        if (text.trim().startsWith('#EXTM3U')) return 'hls';
-        if (text.includes('FLV')) return 'flv';
-        return 'hls';
-      } catch {
-        return 'unknown';
-      }
+      // window already closed, ignore
     }
-    return 'hls';
   }
 }
 
-function LiveVideoPlayer({
-  url,
-  onReconnect,
-  onVideoError,
-}: {
-  url: string;
-  onReconnect: () => void;
-  onVideoError: (msg: string) => void;
-}) {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const hlsRef = useRef<any>(null);
-  const mpegtsRef = useRef<any>(null);
-  const cbRef = useRef({ onReconnect, onVideoError });
-  cbRef.current = { onReconnect, onVideoError };
+// Session id generated once per main-process boot (changes on each restart).
+const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v || !url) return;
+export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService, updater: UpdateService, pkgs: LocalPkgStore): void {
+  const log = fileLogger;
+  const mpv = new MpvController(fileLogger);
 
-    let destroyed = false;
-    const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
-    const destroyMpegts = () => { if (mpegtsRef.current) { try { mpegtsRef.current.destroy(); } catch {} mpegtsRef.current = null; } };
-
-    const safePlay = () => {
-      const p = v.play();
-      if (p && typeof p.catch === 'function') p.catch(() => undefined);
-    };
-
-    const playNative = () => {
-      v.src = url;
-      v.load();
-      safePlay();
-    };
-
-    const playHls = (sourceUrl: string) => {
-      if (!Hls.isSupported()) { playNative(); return; }
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-        backBufferLength: 30,
-        maxBufferLength: 20,
-        manifestLoadingTimeOut: 15000,
-        manifestLoadingMaxRetry: 6,
-        manifestLoadingRetryDelay: 500,
-        levelLoadingTimeOut: 15000,
-        fragLoadingTimeOut: 30000,
-        xhrSetup: (xhr: XMLHttpRequest) => { xhr.withCredentials = false; },
-      });
-      hlsRef.current = hls;
-      hls.loadSource(sourceUrl);
-      hls.attachMedia(v);
-
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        if (destroyed) return;
-        safePlay();
-      });
-
-      hls.on(Hls.Events.ERROR, (_evt: unknown, data: any) => {
-        if (destroyed) return;
-        if (!data?.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
-          try { hls.startLoad(); } catch {}
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          cbRef.current.onVideoError('HLS 解码错误，尝试恢复…');
-          try { hls.recoverMediaError(); } catch {}
-        } else {
-          cbRef.current.onVideoError(`HLS 失败：${data.details || data.type}`);
-          destroyHls();
-          cbRef.current.onReconnect();
-        }
-      });
-    };
-
-    const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
-      try {
-        // @ts-ignore 动态加载可选依赖
-        const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
-        const mpegts: any = (mod as any)?.default || (mod as any);
-        if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
-          playNative();
-          return;
-        }
-        const player = mpegts.createPlayer(
-          { type, url: sourceUrl, isLive: true },
-          { enableWorker: true, enableStashBuffer: false, stashInitialSize: 128, lazyLoad: false },
-        );
-        mpegtsRef.current = player;
-        player.attachMediaElement(v);
-        player.load();
-        try { player.play(); } catch {}
-        player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
-          cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
-          cbRef.current.onReconnect();
-        });
-      } catch {
-        playNative();
-      }
-    };
-
-    (async () => {
-      const kind = await StreamDetector.detect(url);
-      if (destroyed) return;
-      if (kind === 'hls') playHls(url);
-      else if (kind === 'flv') void playMpegts('flv', url);
-      else if (kind === 'ts') void playMpegts('mpegts', url);
-      else if (kind === 'native') playNative();
-      else playHls(url);
-    })();
-
-    const onEnded = () => cbRef.current.onReconnect();
-    const onErr = () => {
-      const err = v.error;
-      const code = err?.code;
-      const msg = code === 1 ? '用户中止' : code === 2 ? '网络错误' : code === 3 ? '解码错误' : code === 4 ? '源不支持' : `错误(${code ?? '?'})`;
-      cbRef.current.onVideoError(msg);
-      if (code === 2 || code === 4) cbRef.current.onReconnect();
-    };
-    const onPlaying = () => cbRef.current.onVideoError('');
-    v.addEventListener('ended', onEnded);
-    v.addEventListener('error', onErr);
-    v.addEventListener('playing', onPlaying);
-    v.addEventListener('play', onPlaying);
-
-    return () => {
-      destroyed = true;
-      v.removeEventListener('ended', onEnded);
-      v.removeEventListener('error', onErr);
-      v.removeEventListener('playing', onPlaying);
-      v.removeEventListener('play', onPlaying);
-      destroyHls();
-      destroyMpegts();
-      try { v.removeAttribute('src'); v.load(); } catch {}
-    };
-  }, [url]);
-
-  return (
-    <video
-      ref={videoRef}
-      autoPlay
-      playsInline
-      controls
-      style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
-    />
-  );
-}
-
-export default function LivePage() {
-  const [lives, setLives] = useState<LiveBean[]>([]);
-  const [liveIdx, setLiveIdx] = useState(0);
-  const [groups, setGroups] = useState<LiveGroup[]>([]);
-  const [groupName, setGroupName] = useState('');
-  const [channelName, setChannelName] = useState('');
-  const [lineIdx, setLineIdx] = useState(0);
-  const [playUrl, setPlayUrl] = useState('');
-  const [playbackUrl, setPlaybackUrl] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState('');
-  const [epg, setEpg] = useState<Record<string, LiveEpgEntry>>({});
-  const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
-  const epgTimer = useRef<number | null>(null);
-
-  const [subCount, setSubCount] = useState(0);
-  const [subEnabled, setSubEnabled] = useState(0);
-
-  const [reconnectKey, setReconnectKey] = useState(0);
-  const [reconnectMsg, setReconnectMsg] = useState('');
-  const reconnectCountRef = useRef(0);
-  const lastReconnectAtRef = useRef(0);
-  const MAX_RECONNECT = 50;
-
-  useEffect(() => {
-    if (!playUrl) { setPlaybackUrl(''); return; }
-    setPlaybackUrl(playUrl);
-    reconnectCountRef.current = 0;
-    lastReconnectAtRef.current = 0;
-    setReconnectMsg('');
-  }, [playUrl]);
-
-  const doReconnect = useCallback(() => {
-    const now = Date.now();
-    if (now - lastReconnectAtRef.current < 3000) return;
-    lastReconnectAtRef.current = now;
-    reconnectCountRef.current += 1;
-    const n = reconnectCountRef.current;
-    if (n > MAX_RECONNECT) {
-      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请切换线路`);
-      return;
-    }
-    setReconnectMsg(`断线重连中…（第 ${n} 次）`);
-    setReconnectKey((k) => k + 1);
-    window.setTimeout(() => {
-      setReconnectMsg((cur) => (cur.startsWith('断线重连中') ? '' : cur));
-    }, 3000);
-  }, []);
-
-  const handleVideoError = useCallback((msg: string) => {
-    if (msg) setReconnectMsg(msg);
-  }, []);
-
-  const reloadLives = useCallback(async () => {
+  // Custom frameless window controls
+  ipcMain.handle(IPC.WIN_MINIMIZE, (e) => winOf(e)?.minimize());
+  ipcMain.handle(IPC.WIN_MAXIMIZE, (e) => {
+    const w = winOf(e);
+    if (!w) return;
+    if (isPlayerWindow(w) && playerIsFullscreen()) { void playerSetFullscreen(false); return; }
+    if (w.isMaximized()) w.unmaximize();
+    else w.maximize();
+  });
+  ipcMain.handle(IPC.WIN_CLOSE, (e) => winOf(e)?.close());
+  ipcMain.handle(IPC.WIN_IS_MAXIMIZED, (e) => !!winOf(e)?.isMaximized());
+  registerHandler(IPC.WIN_SET_ALWAYS_ON_TOP, (e: IpcMainInvokeEvent, on: unknown) => {
+    const w = winOf(e);
+    if (!w) return false;
+    const flag = !!on;
     try {
-      const cfg = await client.cfgGet();
-      const m = await client.liveMeta();
-      setLives(m);
-      const idx = liveIdx < m.length ? liveIdx : 0;
-      setLiveIdx(idx);
-      if (m.length && idx !== liveIdx) {
-        await loadLiveInternal(idx, m);
-      }
-    } catch (e) {
-      console.warn('[Live] reload lives 失败：', e);
+      w.setAlwaysOnTop(flag, 'floating');
+    } catch {
+      w.setAlwaysOnTop(flag);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveIdx]);
+    return w.isAlwaysOnTop();
+  }, log);
+  registerHandler(IPC.WIN_IS_ALWAYS_ON_TOP, (e: IpcMainInvokeEvent) => !!winOf(e)?.isAlwaysOnTop(), log);
 
-  async function loadLiveInternal(index: number, meta?: LiveBean[]) {
-    const m = meta ?? lives;
-    if (!m.length) return;
-    setLoading(true);
-    setErr('');
-    try {
-      const r = await client.loadLive(index);
-      setGroups(r.groups);
-      if (r.groups.length) {
-        const mem = loadLiveMem();
-        const fromMem = mem.liveIdx === index;
-        const g = fromMem && mem.groupName ? r.groups.find((x) => x.group === mem.groupName) : undefined;
-        const group = g || r.groups[0];
-        setGroupName(group.group);
-        const ch = fromMem && mem.channelName && group.channels.some((c) => c.name === mem.channelName)
-          ? group.channels.find((c) => c.name === mem.channelName)!
-          : group.channels[0];
-        if (group.channels.length && ch) {
-          pickChannelInternal(group, ch.name, fromMem ? (mem.lineIdx || 0) : 0, r.groups, index);
-        }
-      } else {
-        setGroups([]);
-        setGroupName('');
-        setChannelName('');
-        setPlayUrl('');
-      }
-    } catch (e) {
-      setErr((e as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }
+  registerHandler(IPC.SYSTEM_PING, () => 'pong', log);
+  registerHandler(IPC.SYSTEM_SESSION_ID, () => SESSION_ID, log);
+  registerHandler(IPC.APP_QUIT, () => {
+    app.quit();
+    return { ok: true };
+  }, log);
+  registerHandler(IPC.THEME_SET, (_e: any, theme: string) => {
+    nativeTheme.themeSource = theme === 'light' ? 'light' : theme === 'dark' ? 'dark' : 'system';
+    const w = winOf(_e as IpcMainInvokeEvent);
+    const dark = nativeTheme.shouldUseDarkColors;
+    if (w && !isPlayerWindow(w)) w.setBackgroundColor(dark ? '#0a0c10' : '#dce4ec');
+  }, log);
+  registerHandler(IPC.APP_ICON, () => {
+    const p = join(resourcesDir(), 'ui', 'icon32.png');
+    if (!existsSync(p)) return '';
+    return 'data:image/png;base64,' + readFileSync(p).toString('base64');
+  }, log);
+  registerHandler(IPC.SYSTEM_DATA_DIR, () => ({
+    path: userDataDir(),
+    mode: dataDirReport.mode,
+    planned: dataDirReport.planned,
+    reason: dataDirReport.reason,
+    migration: dataDirReport.migration,
+  }), log);
 
-  function pickLive(index: number, meta?: LiveBean[]) {
-    const m = meta ?? lives;
-    if (!m.length) return;
-    setLiveIdx(index);
-    client.cfgSetActiveLive(index).catch(() => undefined);
-    void loadLiveInternal(index, m);
-  }
+  registerHandler(IPC.CONFIG_IMPORT, async (e: any, args: { url?: string; json?: string; name?: string }) => {
+    const r = await host.importConfig(args || {});
+    return { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls };
+  }, log);
 
-  function pickChannelInternal(g: LiveGroup, name: string, li: number, all = groups, idx = liveIdx) {
-    setGroupName(g.group);
-    setChannelName(name);
-    setLineIdx(li);
-    saveLiveMem({ liveIdx: idx, groupName: g.group, channelName: name, lineIdx: li });
-    const ch = g.channels.find((c) => c.name === name);
-    if (ch && ch.urls.length) {
-      const line = splitLine(ch.urls[li] || ch.urls[0], li + 1);
-      setPlayUrl(line.url);
-    }
-    if (all !== groups) setGroups(all);
-  }
-  const pickChannel = pickChannelInternal;
+  registerHandler(IPC.CONFIG_LIST_SITES, () => host.sites, log);
+  registerHandler(IPC.CONFIG_DIAGNOSE, () => host.importReport, log);
 
-  const loadSubStatus = useCallback(async () => {
-    try {
-      const list = await ipcInvoke<LiveSubscription[]>('live:subscription:list');
-      const arr = Array.isArray(list) ? list : [];
-      setSubCount(arr.length);
-      setSubEnabled(arr.filter((s) => s.enabled).length);
-    } catch { /* ignore */ }
-  }, []);
+  registerHandler(IPC.CFG_GET, () => host.cfgSnapshot(), log);
+  registerHandler(IPC.DRIVE_BIND_KEYS, () => host.driveBindLearned(), log);
+  registerHandler(IPC.CFG_ADD_SOURCE, (_e: any, bean: SourceBean) => host.cfgAddSource(bean), log);
+  registerHandler(IPC.CFG_UPDATE_SOURCE, (_e: any, a: { key: string; patch: SourceUpdatePatch }) =>
+    host.cfgUpdateSource(a.key, a.patch || {}), log);
+  registerHandler(IPC.CFG_DELETE_SOURCE, (_e: any, key: string) => host.cfgDeleteSource(key), log);
+  registerHandler(IPC.CFG_MOVE_SOURCE, (_e: any, a: { key: string; direction: SourceMoveDirection }) =>
+    host.cfgMoveSource(a.key, a.direction), log);
+  registerHandler(IPC.CFG_SET_ACTIVE_SOURCE, (_e: any, key: string) => host.cfgSetActiveSource(key), log);
+  registerHandler(IPC.CFG_SET_ACTIVE_LIVE, (_e: any, index: number) => host.cfgSetActiveLive(index), log);
 
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const cfg = await client.cfgGet();
-        const m = await client.liveMeta();
-        if (cancelled) return;
-        setLives(m);
-        if (m.length) {
-          const start = cfg.ui.activeLiveIndex < m.length ? cfg.ui.activeLiveIndex : 0;
-          setLiveIdx(start);
-          await loadLiveInternal(start, m);
-        }
-      } catch (e) {
-        if (!cancelled) setErr((e as Error).message);
-      }
-    })();
-    void loadSubStatus();
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // 2026-10-14: after network subscription import, broadcast live:changed too
+  // (subscription may carry lives). Renderer only refreshes list, no side effect if empty.
+  registerHandler(IPC.CFG_IMPORT_URL, async (_e: any, a: { url: string; name?: string }) => {
+    const r = await host.importConfig({ url: a.url, name: a.name });
+    broadcastLiveChanged({ name: a.name });
+    return { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls };
+  }, log);
 
-  useEffect(() => {
-    const w = window as any;
-    const off = w?.winboxIpc?.on?.('live:subscriptions-changed', () => {
-      void loadSubStatus();
-      void reloadLives();
+  registerHandler(IPC.CFG_PROFILES, () => host.cfgProfiles(), log);
+  registerHandler(IPC.CFG_PROFILE_SAVE, (_e: any, name: string) => host.cfgSaveAsProfile(name), log);
+  registerHandler(IPC.CFG_PROFILE_ACTIVATE, (_e: any, id: string) => host.cfgActivateProfile(id), log);
+  registerHandler(IPC.CFG_PROFILE_DELETE, (_e: any, id: string) => host.cfgDeleteProfile(id), log);
+  registerHandler(IPC.CFG_PROFILE_UPDATE_NAME, (_e: any, a: { id: string; name: string }) => host.cfgUpdateProfileName(a.id, a.name), log);
+  registerHandler(IPC.CFG_PROFILE_SITES, () => host.cfgProfileSites(), log);
+  registerHandler(IPC.CFG_SWITCH_PROFILE_SOURCE, (_e: any, a: { profileId: string; key: string }) =>
+    host.cfgSwitchProfileSource(String(a?.profileId || ''), String(a?.key || '')), log);
+
+  registerHandler(IPC.CACHE_CLEAR, async () => {
+    const r = clearAppCache(userDataDir(), spiderCacheDir());
+    try { host.rewarmAfterCacheClear(); } catch { /* ignore */ }
+    return r;
+  }, log);
+  registerHandler(IPC.VOD_DEBUG, (_e: any, key: string) => host.debug(key), log);
+  registerHandler(IPC.VOD_AUDIT, () => host.auditAll(), log);
+  registerHandler(IPC.DRIVE_GET, () => host.driveList(), log);
+  registerHandler(IPC.DRIVE_SET, (_e: any, a: { provider: string; token: string }) => host.driveSet(a.provider, a.token), log);
+  registerHandler(IPC.DRIVE_REMOVE, (_e: any, provider: string) => host.driveRemove(provider), log);
+  registerHandler(IPC.DRIVE_QR_CREATE, (_e: any, provider?: string) => host.driveQrCreate(provider), log);
+  registerHandler(IPC.DRIVE_QR_POLL, (_e: any, provider: string, sid: string) => host.driveQrPoll(provider, sid), log);
+  registerHandler(IPC.DRIVE_WEB_LOGIN, (_e: any, provider: string) => host.driveWebLogin(provider), log);
+
+  registerHandler(IPC.SUBTITLE_GET, () => host.subtitleGetSettings(), log);
+  registerHandler(IPC.SUBTITLE_SET, (_e: any, patch: any) => host.subtitleSetSettings(patch || {}), log);
+  registerHandler(IPC.SUBTITLE_PROVIDERS, () => host.subtitleProviderView(), log);
+  registerHandler(IPC.SUBTITLE_SEARCH, (_e: any, name: string) => host.subtitleSearch(String(name)), log);
+  registerHandler(IPC.SUBTITLE_FETCH, (_e: any, cand: any) => host.subtitleFetch(cand), log);
+  registerHandler(IPC.DANMAKU_GET, () => host.danmakuGetSettings(), log);
+  registerHandler(IPC.DANMAKU_SET, (_e: any, patch: any) => host.danmakuSetSettings(patch || {}), log);
+  registerHandler(IPC.DANMAKU_SEARCH, (_e: any, name: string, season?: number) =>
+    host.danmakuSearch(String(name), Number.isFinite(Number(season)) && Number(season) > 0 ? Number(season) : undefined), log);
+  registerHandler(IPC.DANMAKU_EPISODES, (_e: any, bangumiId: number, animeTitle?: string, source?: string) =>
+    host.danmakuEpisodes(Number(bangumiId), animeTitle ? String(animeTitle) : undefined, source ? String(source) : ''), log);
+  registerHandler(IPC.DANMAKU_FETCH, (_e: any, episodeId: number, source?: string) =>
+    host.danmakuFetch(Number(episodeId), source ? String(source) : ''), log);
+  registerHandler(IPC.META_SEARCH, (_e: any, name: string, year?: string, provider?: string) => host.metaSearch(String(name || ''), year ? String(year) : undefined, provider === 'tmdb' || provider === 'douban' ? provider : undefined), log);
+  registerHandler(IPC.META_EXTRA, (_e: any, name: string, year?: string) => host.metaExtra(String(name || ''), year ? String(year) : undefined), log);
+  registerHandler(IPC.META_DISCOVER, (_e: any, refresh?: boolean) => host.metaDiscover(!!refresh), log);
+  registerHandler(IPC.META_MOVIE_HOT, () => host.metaMovieHot(), log);
+  registerHandler(IPC.META_DISCOVER_IMAGES, (_e: any, name: string, mediaType: string, year?: string, kind?: string) =>
+    host.metaDiscoverImages(String(name || ''), mediaType === 'tv' ? 'tv' : 'movie', /^\d{4}$/.test(String(year)) ? String(year) : undefined, kind === 'poster' ? 'poster' : 'backdrop'), log);
+  registerHandler(IPC.META_GENRES, () => host.metaGenres(), log);
+  registerHandler(IPC.META_GENRE_PAGE, (_e: any, mediaType: string, genreId: number, page: number) => host.metaGenrePage(String(mediaType || 'movie'), Number(genreId) || 0, Number(page) || 1), log);
+  registerHandler(IPC.META_GET_SETTINGS, () => host.metaGetSettings(), log);
+  registerHandler(IPC.META_SET_SETTINGS, (_e: any, patch: unknown) => host.metaSetSettings((patch || {}) as Partial<MetaSettings>), log);
+  registerHandler(IPC.META_SUGGEST, (_e: any, q: string) => host.metaSuggest(String(q || '')), log);
+  registerHandler(IPC.META_IMAGES, (_e: any, mediaType: string, tmdbId: number) =>
+    host.metaImages(String(mediaType || 'movie') === 'tv' ? 'tv' : 'movie', Number(tmdbId) || 0), log);
+  registerHandler(IPC.CFG_MERGE_EXPORT, (_e: any, ids: string[]) => host.mergeProfilesExport(ids), log);
+  registerHandler(IPC.CFG_EXPORT_SAVE, async (_e: any, a: { content: string; defaultName?: string }) => {
+    const w = winOf(_e as IpcMainInvokeEvent);
+    const r = await dialog.showSaveDialog(w ?? undefined!, {
+      title: 'Save As',
+      defaultPath: a.defaultName || 'merged-subscription.json',
+      filters: [{ name: 'JSON Config', extensions: ['json'] }],
     });
-    return () => { if (typeof off === 'function') off(); };
-  }, [loadSubStatus, reloadLives]);
-
-  /**
-   * ★ 2026-10-14（用户要求）：监听主进程广播的「直播源已变更」→ 自动重新加载。
-   *
-   * 背景：用户导入本地 TXT/M3U 直播源后，主进程只把结果返回给**发起导入的窗口**（配置页），
-   * 直播页窗口收不到通知 → 必须手动切走再切回才加载（用户抱怨「加载慢 + 不能自动刷新」）。
-   *
-   * 现在：主进程 `broadcastLiveChanged` 会把 `live:changed` 推给所有窗口，
-   * 直播页收到后**重新拉取线路列表 + 强制重载当前激活线路**（主进程侧已 preloadLive 预热，
-   * loadLive 命中缓存秒开）。如果新导入的源排在末尾（index 变大），当前 liveIdx 仍在范围内，
-   * 用户需要手动下拉切换 —— 这是预期行为（不抢用户焦点）。
-   */
-  useEffect(() => {
-    const w = window as any;
-    const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
-      console.log('[Live] 收到 live:changed 广播：', payload);
-      void (async () => {
-        try {
-          const m = await client.liveMeta();
-          setLives(m);
-          // 保持当前索引不变；若超出范围则退回 0
-          const idx = liveIdx < m.length ? liveIdx : 0;
-          if (idx !== liveIdx) setLiveIdx(idx);
-          if (m.length) {
-            // 强制重新加载当前激活线路（主进程侧已预热，命中缓存秒开）
-            await loadLiveInternal(idx, m);
-          }
-        } catch (e) {
-          console.warn('[Live] live:changed 处理后失败：', e);
-        }
-      })();
+    if (r.canceled || !r.filePath) return { saved: false, path: '' };
+    writeFileSync(r.filePath, a.content, 'utf-8');
+    return { saved: true, path: r.filePath };
+  }, log);
+  registerHandler(IPC.BACKUP_EXPORT, async (_e: any, renderer: Record<string, string>): Promise<BackupExportResult> => {
+    const w = winOf(_e as IpcMainInvokeEvent);
+    const settings: BackupSettingsState = {
+      ...host.settingsSnapshot(),
+      player: playerSettings.settings,
+      proxy: getProxySettings(),
+      bossKey: bossKey.settings,
+    };
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    const file = buildBackupFile(settings, renderer || {}, {
+      exportedAt: new Date().toISOString(),
+      appVersion: app.getVersion(),
     });
-    return () => { if (typeof off === 'function') off(); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveIdx]);
+    const r = await dialog.showSaveDialog(w ?? undefined!, {
+      title: 'Export Backup',
+      defaultPath: `win-box-backup-${stamp}.json`,
+      filters: [{ name: 'Win-Box Backup', extensions: ['json'] }],
+    });
+    if (r.canceled || !r.filePath) return { saved: false, path: '' };
+    writeFileSync(r.filePath, JSON.stringify(file, null, 2), 'utf-8');
+    log.i(`backup export: sources=${settings.userConfig.sources.length} tokens=${Object.keys(settings.driveTokens).length} ls=${Object.keys(file.renderer).length} -> ${r.filePath}`);
+    return { saved: true, path: r.filePath };
+  }, log);
+  registerHandler(IPC.BACKUP_IMPORT, async (_e: any): Promise<BackupImportResult> => {
+    const w = winOf(_e as IpcMainInvokeEvent);
+    const picked = await dialog.showOpenDialog(w ?? undefined!, {
+      title: 'Import Backup',
+      properties: ['openFile'],
+      filters: [{ name: 'Win-Box Backup', extensions: ['json'] }],
+    });
+    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false, canceled: true };
+    const path = picked.filePaths[0];
+    let text = '';
+    try {
+      text = readFileSync(path, 'utf-8');
+    } catch (e) {
+      return { ok: false, error: `read failed: ${(e as Error).message}` };
+    }
+    const parsed = parseBackupFile(text);
+    if (!parsed.ok) {
+      log.w(`backup import failed: ${parsed.error}`);
+      return { ok: false, error: parsed.error };
+    }
+    const s = parsed.file.settings;
+    host.restoreSettings(s);
+    if (s.player) playerSettings.settings = s.player;
+    if (s.proxy) {
+      setProxySettings(s.proxy);
+      host.resetSpidersForProxyChange();
+    }
+    if (s.bossKey) {
+      bossKey.settings = s.bossKey;
+      bossKey.apply();
+    }
+    log.i(`backup import ok: sources=${s.userConfig?.sources?.length ?? 0} tokens=${Object.keys(s.driveTokens || {}).length} ls=${Object.keys(parsed.file.renderer).length} <- ${path}`);
+    return { ok: true, path, renderer: parsed.file.renderer };
+  }, log);
+  registerHandler(IPC.UI_GOTO_DRIVE_BIND, () => {
+    const pwin = playerWindow();
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (w === pwin || w.isDestroyed()) continue;
+      try {
+        if (w.isMinimized()) w.restore();
+        w.show();
+        w.focus();
+        w.webContents.send(IPC.NAV_DRIVE_BIND);
+      } catch { /* ignore */ }
+      break;
+    }
+    return true;
+  }, log);
+  registerHandler(IPC.CFG_IMPORT_JSON_LOCAL, async (e: any, customName?: string): Promise<{
+    ok: boolean; file?: string; name?: string; error?: string;
+    result?: { config: SiteConfig; report: ImportReport; warnings: string[]; urls?: MultiConfigEntry[] };
+  }> => {
+    const win = winOf(e);
+    const picked = await dialog.showOpenDialog(win ?? undefined!, {
+      properties: ['openFile'],
+      filters: [{ name: 'JSON Subscription', extensions: ['json'] }],
+    });
+    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false };
+    const filePath = picked.filePaths[0];
+    try {
+      const text = readFileSync(filePath, 'utf-8');
+      if (!text.trim()) return { ok: false, error: 'selected .json is empty' };
+      const name = nameFromLocalFile(filePath, customName);
+      const r = await host.importConfig({ json: text, name });
+      return {
+        ok: true,
+        file: basename(filePath),
+        name,
+        result: { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls },
+      };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }, log);
 
-  const curGroup = groups.find((g) => g.group === groupName);
-  const curChannel = curGroup?.channels.find((c) => c.name === channelName);
-  const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
-  const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
+  registerHandler(IPC.CFG_IMPORT_PY_LOCAL, async (e: any): Promise<{ ok: boolean; key?: string; error?: string }> => {
+    const win = winOf(e);
+    const picked = await dialog.showOpenDialog(win ?? undefined!, {
+      properties: ['openFile'],
+      filters: [{ name: 'Python Spider', extensions: ['py'] }],
+    });
+    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false };
+    const srcPath = picked.filePaths[0];
+    let importedApi = '';
+    try {
+      const name = nameFromLocalFile(srcPath);
+      const api = importedApi = pkgs.importPython(srcPath);
+      const bean = host.cfgAddSource({ key: name, name, type: 3, api, ext: '', jar: '' } as SourceBean);
+      return { ok: true, key: bean.key };
+    } catch (err) {
+      if (importedApi) {
+        try { pkgs.discardImport(importedApi, host.cfgSnapshot()); }
+        catch (cleanup) { log.w(`import cleanup failed: ${String(cleanup)}`); }
+      }
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }, log);
 
-  async function refreshEpg(index: number, gs: LiveGroup[], currentChannelName: string) {
-    if (!currentChannelName) { setEpg({}); setEpgStatus('empty'); return; }
-    const refs: EpgChannelRef[] = [];
-    outer: for (const g of gs) {
-      for (const c of g.channels) {
-        if (c.name !== currentChannelName) continue;
-        const r: EpgChannelRef = {
-          tvgId: c['tvg-id'],
-          tvgName: c['tvg-name'],
-          name: c.name,
-          epg: c.epg,
+  registerHandler(IPC.CFG_IMPORT_PACKAGE, async (e: any, customName?: string): Promise<{
+    ok: boolean; root?: string; rel?: string; sites?: number; name?: string; error?: string;
+    warnings?: string[];
+    result?: { config: SiteConfig; report: ImportReport; warnings: string[]; urls?: MultiConfigEntry[] };
+  }> => {
+    const win = winOf(e);
+    const picked = await dialog.showOpenDialog(win ?? undefined!, {
+      properties: ['openDirectory'],
+      title: 'Select local package directory',
+    });
+    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false };
+    const root = picked.filePaths[0];
+    let importedUrl = '';
+    try {
+      const found = pkgs.importSubscription(root);
+      if (!found) {
+        return {
+          ok: false,
+          error: 'no usable subscription JSON found in this directory',
         };
-        if (r.tvgId || r.tvgName || r.name) refs.push(r);
-        break outer;
       }
+      const name = nameFromLocalFile(root, customName);
+      const url = importedUrl = pkgSubUrl(found.index, found.rel);
+      const r = await host.importConfig({ url, name });
+      return {
+        ok: true,
+        root: pkgs.rootOf(found.index) || root,
+        rel: found.rel,
+        sites: found.sites,
+        name,
+        warnings: found.warnings,
+        result: { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls },
+      };
+    } catch (err) {
+      if (importedUrl) {
+        try { pkgs.discardImport(importedUrl, host.cfgSnapshot()); }
+        catch (cleanup) { log.w(`import cleanup failed: ${String(cleanup)}`); }
+      }
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
-    if (!refs.length) { setEpg({}); setEpgStatus('empty'); return; }
-    setEpgStatus('loading');
-    try {
-      const r = await client.liveEpg(index, refs);
-      setEpg(r.byKey);
-      setEpgStatus(Object.keys(r.byKey).length ? 'ok' : 'empty');
-    } catch (e) {
-      setEpg({});
-      setEpgStatus('error');
-      console.warn('[EPG] 加载失败：', e);
+  }, log);
+
+  // 2026-10-14: after local TXT/M3U live import, broadcast + preload.
+  registerHandler(IPC.CFG_IMPORT_LIVE_LOCAL, async (e: any): Promise<{
+    ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string;
+  }> => {
+    const win = winOf(e);
+    const picked = await dialog.showOpenDialog(win ?? undefined!, {
+      properties: ['openFile'],
+      filters: [{ name: 'Live Source (TXT / M3U)', extensions: ['txt', 'm3u', 'm3u8'] }],
+    });
+    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false };
+    const r = importLiveFileFromPath(host, picked.filePaths[0]);
+    if (r.ok) {
+      broadcastLiveChanged({ index: r.index, name: r.name, replaced: r.replaced });
+      if (typeof r.index === 'number' && r.index >= 0) host.preloadLive(r.index);
     }
-  }
+    return r;
+  }, log);
 
-  useEffect(() => {
-    if (!groups.length) return;
-    void refreshEpg(liveIdx, groups, channelName);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveIdx, groups, channelName]);
+  registerHandler(IPC.WEBHOME_OPEN, (_e: any, init: WebHomeOpenInit) => openWebHomeWindow(init || { url: '' }), log);
+  registerHandler(IPC.WEBHOME_FM_REQ, (_e: any, payload: FmReqPayload) => webHomeReq(payload || { url: '' }), log);
+  registerHandler(IPC.WEBHOME_FM_PLAY, (_e: any, payload: { url?: string; title?: unknown }) => webHomePlay(payload || {}), log);
+  registerHandler(IPC.WEBHOME_FM_COOKIE, (_e: any, domain: string) => webHomeCookie(domain), log);
 
-  useEffect(() => {
-    if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
-    if (!curChannel) return;
-    const e = epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name];
-    const at = e?.current?.endTime ?? e?.next?.startTime;
-    if (!at) return;
-    const delay = Math.max(1000, Math.min(at - Date.now() + 1000, 6 * 3600 * 1000));
-    epgTimer.current = window.setTimeout(() => { void refreshEpg(liveIdx, groups, channelName); }, delay);
-    return () => {
-      if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
+  registerHandler(IPC.VOD_HOME, (_e: any, key: string) => host.home(key), log);
+  registerHandler(IPC.VOD_CATEGORY, (_e: any, a: { key: string; tid: string; pg: string; extend?: Record<string, string> }) =>
+    host.category(a.key, a.tid, a.pg, a.extend || {}), log);
+  registerHandler(IPC.VOD_DETAIL, (_e: any, a: { key: string; ids: string[] }) => host.detail(a.key, a.ids), log);
+  registerHandler(IPC.VOD_SEARCH, (_e: any, a: { key: string; wd: string }) => host.search(a.key, a.wd), log);
+  registerHandler(IPC.VOD_SEARCH_ALL, async (e: any, a: { wd: string; refresh?: boolean } | string) => {
+    const arg = typeof a === 'string' ? { wd: a, refresh: false } : a || { wd: '', refresh: false };
+    const w = winOf(e as IpcMainInvokeEvent);
+    host.onSearchAllProgress = (ev) => {
+      try { w?.webContents.send(IPC.VOD_SEARCH_ALL_PROGRESS, ev); } catch { /* ignore */ }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [epg, groupName, channelName, liveIdx]);
-
-  /**
-   * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
-   *   - 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`（当前分组名）
-   *     → EPG 窗口左侧渲染「分组 → 频道」列表，点分组展开、点频道加载其节目预告。
-   *   - 传 `channelName / tvgId / tvgName` 作为「初始频道」= 主窗口**当前正在播放的频道**
-   *     → EPG 窗口顶部「↩ 当前」按钮可一键切回。
-   */
-  async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
-    const name = (channel.name || '').trim();
-    if (!name) return;
-    // ★ 传整个直播源的所有分组（不只是当前分组）
-    const groupList = groups
-      .map((g) => ({
-        group: String(g.group || '').trim(),
-        channels: g.channels
-          .map((c) => ({
-            name: String(c.name || '').trim(),
-            tvgId: String(c['tvg-id'] || '').trim(),
-            tvgName: String(c['tvg-name'] || '').trim(),
-          }))
-          .filter((c) => !!c.name),
-      }))
-      .filter((g) => !!g.group && g.channels.length > 0);
     try {
-      await ipcInvoke('epg:openWindow', {
-        channelName: name,
-        tvgId: (channel['tvg-id'] || '').trim(),
-        tvgName: (channel['tvg-name'] || '').trim(),
-        groups: groupList,
-        currentGroup: groupName,
-      });
-    } catch (e) {
-      console.warn('[EPG] 打开节目单窗口失败', e);
+      return await host.searchAll(arg.wd, { refresh: !!arg.refresh });
+    } finally {
+      host.onSearchAllProgress = undefined;
     }
-  }
+  }, log);
+  registerHandler(IPC.VOD_PLAY, async (_e: any, a: { key: string; flag: string; id: string }) => {
+    const r = await host.play(a.key, a.flag, a.id);
+    if (r.externalLink) {
+      try { clipboard.writeText(r.externalLink); } catch { /* ignore */ }
+    }
+    return r;
+  }, log);
 
-  const epgStatusText =
-    epgStatus === 'loading' ? '加载中…'
-      : epgStatus === 'ok' ? `命中 ${Object.keys(epg).length} 键`
-        : epgStatus === 'empty' ? '无节目单'
-          : epgStatus === 'error' ? '失败（看日志）'
-            : '未触发';
+  registerHandler(IPC.PLAYER_OPEN, (_e: any, init: any) => {
+    openPlayerWindow(init);
+    return { ok: true };
+  }, log);
+  registerHandler(IPC.PLAYER_SWITCH_EP, (_e: any, request: number | import('../../shared/playerEpisode').PlayerEpisodeSwitch) => {
+    return { switched: playerSwitchEpisode(request) };
+  }, log);
+  registerHandler(IPC.PLAYER_IS_OPEN, () => ({ open: isPlayerOpen() }), log);
+  registerHandler(IPC.PLAYER_GET_INIT, () => ({ open: isPlayerOpen() }), log);
+  registerHandler(IPC.PLAYER_READY, () => {
+    playerResendInit();
+    return { ok: true };
+  }, log);
+  registerHandler(IPC.PLAYER_SET_MINI, (_e: any, isMini: boolean) => {
+    playerSetMini(!!isMini);
+    return { mini: playerIsMini() };
+  }, log);
+  registerHandler(IPC.PLAYER_IS_MINI, () => ({ mini: playerIsMini() }), log);
+  registerHandler(IPC.PLAYER_SET_FULLSCREEN, async (_e: any, fullscreen: boolean) => ({ fullscreen: await playerSetFullscreen(!!fullscreen) }), log);
+  registerHandler(IPC.PLAYER_IS_FULLSCREEN, () => ({ fullscreen: playerIsFullscreen() }), log);
+  registerHandler(IPC.PLAYER_SET_RESIZABLE, (_e: any, resizable: boolean) => ({ resizable: playerSetResizable(!!resizable) }), log);
+  registerHandler('player:close', () => {
+    closePlayerWindow();
+    return { ok: true };
+  }, log);
 
-  return (
-    <>
-      <div className="topbar">
-        <select value={liveIdx} onChange={(e) => pickLive(Number(e.target.value))} disabled={loading}>
-          {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
-        </select>
+  registerHandler(IPC.WIN_OPEN_DETAIL, (_e: any, a: { key?: string; id?: string; query?: string }) =>
+    openDetailWindow(a || {}), log);
+  registerHandler(IPC.WIN_OPEN_SEARCH, (_e: any, term: string) => openSearchWindow(term), log);
+  registerHandler(IPC.WIN_ROUTE_READY, (e: any) => {
+    searchWindowReady(e.sender.id);
+    detailWindowReady(e.sender.id);
+    return { ok: true };
+  }, log);
+  registerHandler(IPC.WIN_REPORT_ERROR, (e: any, message: string) => {
+    log.w(`renderer-error wc=${e.sender.id}: ${String(message).replace(/https?:\/\/\S+/gi, '[url]').slice(0, 3000)}`);
+    return { ok: true };
+  }, log);
 
-        <span className="status" style={{ marginLeft: 'auto' }}>
-          {loading ? '加载中…' : `${groups.length} 组`}
-        </span>
-        <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
-          订阅 {subEnabled}/{subCount}
-        </span>
-        <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
-          EPG：{epgStatusText}
-        </span>
-      </div>
+  registerHandler(IPC.OPEN_ROUTE_WINDOW, (_e: any, route: string) =>
+    openRouteWindow(String(route || '')), log);
+  registerHandler(IPC.NOTIFY_ROUTE_CHANGE, (e: any, route: string) => {
+    const w = winOf(e as IpcMainInvokeEvent);
+    if (w && !w.isDestroyed()) setWindowRoute(w, String(route || ''));
+    return { ok: true };
+  }, log);
 
-      <div className="layout-2 content" style={{ padding: 12 }}>
-        <div className="left">
-          {groups.map((g) => (
-            <div
-              key={g.group}
-              className={`nav-item ${g.group === groupName ? 'active' : ''}`}
-              onClick={() => {
-                setGroupName(g.group);
-                if (g.channels.length) pickChannel(g, g.channels[0].name, 0, groups);
-              }}
-            >
-              {g.group} <span className="muted">({g.channels.length})</span>
-            </div>
-          ))}
-        </div>
-        <div className="right">
-          {err && <div className="err" style={{ marginBottom: 10 }}>{err}</div>}
-          {curGroup ? (
-            <>
-              <div className="row" style={{ marginBottom: 10, maxHeight: 180, overflow: 'auto' }}>
-                {curGroup.channels.map((c) => (
-                  <span
-                    key={c.name}
-                    className={`tag ${c.name === channelName ? 'active' : ''}`}
-                    onClick={() => pickChannel(curGroup, c.name, 0, groups)}
-                    onDoubleClick={() => openPrograms(c)}
-                    title="双击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
-                  >
-                    {c.name}
-                  </span>
-                ))}
-              </div>
-              {lines.length > 1 && (
-                <div className="row" style={{ marginBottom: 8 }}>
-                  <span className="muted">线路：</span>
-                  {lines.map((l) => (
-                    <span
-                      key={l.index}
-                      className={`tag ${l.index - 1 === lineIdx ? 'active' : ''}`}
-                      onClick={() => {
-                        setLineIdx(l.index - 1);
-                        setPlayUrl(l.url);
-                        saveLiveMem({ liveIdx, groupName, channelName, lineIdx: l.index - 1 });
-                      }}
-                    >
-                      {l.name}
-                    </span>
-                  ))}
-                </div>
-              )}
-              {curEpg && (curEpg.current || curEpg.next) && curChannel && (
-                <div
-                  className="live-epg"
-                  onClick={() => openPrograms(curChannel)}
-                  style={{ cursor: 'pointer' }}
-                  title="点击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
-                >
-                  {curEpg.current && (
-                    <span className="live-epg-now">
-                      <b>正在播</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '（无标题）'}
-                    </span>
-                  )}
-                  {curEpg.next && (
-                    <span className="muted">
-                      <b>下一档</b> {curEpg.next.start} {curEpg.next.title || '（无标题）'}
-                    </span>
-                  )}
-                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>📺</span>
-                </div>
-              )}
+  registerHandler(IPC.MPV_STATUS, () => mpv.status(), log);
+  registerHandler(IPC.MPV_START, (e: any, opts: MpvStartOptions) => {
+    const w = winOf(e as IpcMainInvokeEvent);
+    if (!w) throw new Error('player window missing');
+    return mpv.start(w, opts || ({ url: '' } as MpvStartOptions));
+  }, log);
+  registerHandler(IPC.MPV_CMD, (_e: any, cmd: MpvCommand) => ({ ok: mpv.command(cmd) }), log);
+  registerHandler(IPC.MPV_STOP, () => {
+    mpv.stop();
+    return { ok: true };
+  }, log);
+  onPlayerWindowClosed(() => mpv.dispose());
+  app.on('will-quit', () => {
+    try {
+      mpv.dispose();
+    } catch {
+      /* ignore */
+    }
+  });
 
-              {playUrl ? (
-                <div className="live-player" style={{ position: 'relative' }}>
-                  {playbackUrl ? (
-                    <LiveVideoPlayer
-                      key={`${playbackUrl}__${reconnectKey}`}
-                      url={playbackUrl}
-                      onReconnect={doReconnect}
-                      onVideoError={handleVideoError}
-                    />
-                  ) : (
-                    <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
-                  )}
-                  {reconnectMsg && (
-                    <div
-                      style={{
-                        position: 'absolute', top: 12, left: 12,
-                        padding: '6px 12px', borderRadius: 6,
-                        background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13,
-                        pointerEvents: 'none', zIndex: 20,
-                      }}
-                    >{reconnectMsg}</div>
-                  )}
-                </div>
-              ) : (
-                <div className="empty">无播放地址</div>
-              )}
-            </>
-          ) : (
-            <div className="empty">{groups.length ? '选择左侧分组' : '无直播（请先导入含 lives 的配置）'}</div>
-          )}
-        </div>
-      </div>
-      {/* ★ 2026-10-14：节目单弹窗已改为独立窗口（见 main/player/EpgWindow.ts + pages/EpgWinPage.tsx）*/}
-    </>
+  registerHandler(IPC.BOSS_GET, () => bossKey.settings, log);
+  registerHandler(IPC.BOSS_SET, (_e: any, patch: Partial<BossKeySettings>) => {
+    const cur = bossKey.settings;
+    bossKey.settings = {
+      enabled: patch?.enabled ?? cur.enabled,
+      accel: (patch?.accel ?? cur.accel).trim() || BOSS_DEFAULT_ACCEL,
+    };
+    const registered = bossKey.apply();
+    return { settings: bossKey.settings, registered: registered || !bossKey.settings.enabled };
+  }, log);
+  registerHandler(IPC.QUARK_CLEANUP, () => {
+    void host.quarkDeletePending().catch(() => undefined);
+    return true;
+  }, log);
+
+  registerHandler(IPC.PROXY_GET, () => proxySettingsView(), log);
+  registerHandler(IPC.PROXY_SET, (_e: any, patch: Partial<ProxySettings>) => {
+    const next = setProxySettings(patch || {});
+    host.resetSpidersForProxyChange();
+    return next;
+  }, log);
+
+  registerHandler(IPC.PLAYER_PREFS_GET, () => playerSettings.settings, log);
+  registerHandler(IPC.PLAYER_PREFS_SET, (_e: any, patch: Partial<PlayerSettings>) => playerSettings.update(patch || {}), log);
+  registerHandler(
+    IPC.BT_DETECT_PLAYERS,
+    () => detectPlayers(playerSettings.settings.btExternalPlayer).map((p) => ({ id: p.id, name: p.name, path: p.path })),
+    log,
   );
+  registerHandler(
+    IPC.VOD_DETECT_PLAYERS,
+    () => detectPlayers(playerSettings.settings.vodExternalPlayer).map((p) => ({ id: p.id, name: p.name, path: p.path })),
+    log,
+  );
+  registerHandler(IPC.VOD_OPEN_EXTERNAL, (_e: any, a: { url?: string; path?: string; seek?: number }) => {
+    if (!playerSettings.settings.vodExternalPlayerEnabled) {
+      return { ok: false, error: 'vod external player disabled' };
+    }
+    const u = String(a?.url || '').trim();
+    if (!u) return { ok: false, error: 'empty url' };
+    const pick = String(a?.path || '').trim();
+    const players = detectPlayers(pick || playerSettings.settings.vodExternalPlayer);
+    if (!players.length) return { ok: false, error: 'no player detected' };
+    const p = players[0];
+    const seek = Math.max(0, Math.floor(Number(a?.seek) || 0));
+    const started = launchPlayer(p.path, u, seekArgs(p.id, seek));
+    log.i(`vod: external "${p.name}"${seek > 0 ? ` seek=${seek}s` : ''} -> ${u.slice(0, 120)}`);
+    return started ? { ok: true, player: p.name } : { ok: false, error: `cannot launch "${p.name}"` };
+  }, log);
+
+  registerHandler(IPC.DAV_LIST, () => dav.list(), log);
+  registerHandler(IPC.DAV_SET, (_e: any, s: DavServer) => dav.set(s || ({} as DavServer)), log);
+  registerHandler(IPC.DAV_REMOVE, (_e: any, id: string) => {
+    dav.remove(String(id || ''));
+  }, log);
+  registerHandler(
+    IPC.DAV_BROWSE,
+    (_e: any, a: { id: string; path?: string }) => dav.browse(String(a?.id || ''), a?.path || '/'),
+    log,
+  );
+  registerHandler(IPC.DAV_OPEN_EXTERNAL, (_e: any, url: string) => {
+    const u = String(url || '').trim();
+    if (!u) return { ok: false, error: 'empty url' };
+    const players = detectPlayers(playerSettings.settings.btExternalPlayer);
+    if (!players.length) return { ok: false, error: 'no player detected' };
+    const p = players[0];
+    const started = launchPlayer(p.path, u);
+    log.i(`webdav: external "${p.name}" -> ${u.slice(0, 120)}`);
+    return started ? { ok: true, player: p.name } : { ok: false, error: `cannot launch "${p.name}"` };
+  }, log);
+
+  registerHandler(IPC.DLNA_DISCOVER, () => dlna.discover(), log);
+  registerHandler(IPC.DLNA_CAST, (_e: any, a: { device: DlnaDevice; target: DlnaCastTarget }) =>
+    dlna.cast(a?.device, a?.target || ({ url: '', name: '', positionMs: 0 } as DlnaCastTarget)), log);
+
+  registerHandler(IPC.UPDATE_CHECK, () => updater.check(), log);
+  registerHandler(IPC.UPDATE_DOWNLOAD, async () => {
+    const push = (p: UpdateProgress): void => {
+      for (const w of BrowserWindow.getAllWindows()) {
+        if (!w.isDestroyed()) w.webContents.send(IPC.UPDATE_PROGRESS, p);
+      }
+    };
+    return updater.download(push);
+  }, log);
+  registerHandler(IPC.UPDATE_INSTALL, async () => {
+    const path = updater.downloadedPath();
+    if (!path) throw new Error('installer missing');
+    const r = await updater.launch(path);
+    if (!r.ok) throw new Error(r.error || 'cannot launch installer');
+    setTimeout(() => app.quit(), 1500);
+    return { ok: true, path };
+  }, log);
+
+  registerHandler(IPC.LIVE_LOAD, (_e: any, index: number) => host.loadLive(index), log);
+  registerHandler(
+    IPC.LIVE_EPG,
+    (_e: any, a: { index: number; channels: EpgChannelRef[] }) => host.loadLiveEpg(Number(a?.index) || 0, a?.channels || []),
+    log,
+  );
+  registerHandler(
+    IPC.EPG_PROGRAMS,
+    (_e: any, channelNames: string | string[]) => host.getLiveEpgPrograms(channelNames),
+    log,
+  );
+
+  ipcMain.handle(IPC.EPG_OPEN_WINDOW, (_e, p: {
+    channelName: string;
+    tvgId?: string;
+    tvgName?: string;
+    groups?: Array<{ group?: string; channels?: Array<{ name?: string; tvgId?: string; tvgName?: string }> }>;
+    currentGroup?: string;
+  }) => {
+    const groups: EpgGroupItem[] = Array.isArray(p?.groups)
+      ? p!.groups!
+          .map((g) => {
+            const channels: EpgChannelItem[] = Array.isArray(g?.channels)
+              ? g!.channels!
+                  .map((c) => ({
+                    name: String(c?.name || '').trim(),
+                    tvgId: c?.tvgId ? String(c.tvgId).trim() : undefined,
+                    tvgName: c?.tvgName ? String(c.tvgName).trim() : undefined,
+                  }))
+                  .filter((c) => !!c.name)
+              : [];
+            return { group: String(g?.group || '').trim(), channels };
+          })
+          .filter((g) => !!g.group && g.channels.length > 0)
+      : [];
+    return openEpgWindow({
+      channelName: String(p?.channelName || ''),
+      tvgId: p?.tvgId ? String(p.tvgId) : undefined,
+      tvgName: p?.tvgName ? String(p.tvgName) : undefined,
+      groups,
+      currentGroup: String(p?.currentGroup || ''),
+    });
+  });
+  ipcMain.handle(IPC.EPG_WINDOW_READY, (e) => {
+    epgWindowReady(e.sender.id);
+    return { ok: true };
+  });
+  ipcMain.handle(IPC.EPG_GET_CHANNELS, () => getPendingGroups());
+
+  registerHandler('live:meta', () => host.lives, log);
 }

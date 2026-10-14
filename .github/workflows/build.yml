@@ -43,7 +43,7 @@ jobs:
         uses: actions/checkout@v4
 
       # ==================================================================
-      # 0a. 可选：删除指定 tag 的 Release（手动触发 + 填了 delete_tag 才执行）
+      # 0a. 可选：删除指定 tag 的 Release
       # ==================================================================
       - name: Delete existing release (if requested)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.delete_tag != ''
@@ -60,23 +60,19 @@ jobs:
           else
             echo "（无同名 Release）"
           fi
-          # 兜底：Release 不存在但 tag 存在时，单独删 tag
           gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" 2>/dev/null \
             && echo "✓ Tag 已删除" \
             || echo "（无同名 tag）"
           echo "Done."
 
       # ==================================================================
-      # 0b. 计算版本号 + 北京时间戳 + 短 commit id
-      #     最终版本形如：1.21.2-2026-10-14-13-05-30-abc1234
-      #     tag：v1.21.2-2026-10-14-13-05-30-abc1234
+      # 0b. 计算完整版本号（基础版本 + 北京时间 + 短 sha）
       # ==================================================================
-      - name: Resolve full version (base + Beijing time + short sha)
+      - name: Resolve full version
         if: github.event.inputs.action != 'delete-only'
         id: ver
         shell: pwsh
         run: |
-          # ---- 1. 基础版本号：输入优先，否则用 package.json ----
           $base = "${{ github.event.inputs.base_version }}".Trim()
           if (-not $base) {
             $pkg = Get-Content package.json -Raw | ConvertFrom-Json
@@ -88,45 +84,36 @@ jobs:
           $base = $base -replace '^v', ''
           if ($base -notmatch '^\d+\.\d+\.\d+') { throw "基础版本号格式非法：$base" }
 
-          # ---- 2. 北京时间戳（UTC + 8h；中国无夏令时，直接加 8 小时即可） ----
+          # 北京时间（UTC+8）
           $bj = (Get-Date).ToUniversalTime().AddHours(8)
           $bjStamp = $bj.ToString('yyyy-MM-dd-HH-mm-ss')
-          Write-Host "Beijing time stamp: $bjStamp"
 
-          # ---- 3. 短 commit id（7 位） ----
           $sha = "${{ github.sha }}"
           $shortSha = $sha.Substring(0, 7)
-          Write-Host "short sha: $shortSha"
 
-          # ---- 4. 组合完整版本（符合 semver：1.21.2-<prerelease>） ----
           $full = "${base}-${bjStamp}-${shortSha}"
           $tag  = "v$full"
+
+          "base=$base"              >> $env:GITHUB_OUTPUT
+          "bj_stamp=$bjStamp"       >> $env:GITHUB_OUTPUT
+          "short_sha=$shortSha"     >> $env:GITHUB_OUTPUT
+          "full=$full"              >> $env:GITHUB_OUTPUT
+          "tag=$tag"                >> $env:GITHUB_OUTPUT
+          "output_dir=release$full" >> $env:GITHUB_OUTPUT
           Write-Host "full version: $full"
-          Write-Host "tag: $tag"
 
-          "base=$base"                              >> $env:GITHUB_OUTPUT
-          "bj_stamp=$bjStamp"                       >> $env:GITHUB_OUTPUT
-          "short_sha=$shortSha"                     >> $env:GITHUB_OUTPUT
-          "full=$full"                              >> $env:GITHUB_OUTPUT
-          "tag=$tag"                                >> $env:GITHUB_OUTPUT
-          "output_dir=release$full"                 >> $env:GITHUB_OUTPUT
-
-      # ==================================================================
-      # 0c. 把完整版本号写入 package.json（供 electron-builder 用）
-      # ==================================================================
       - name: Apply version to package.json
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
         run: |
           $v = "${{ steps.ver.outputs.full }}"
           $pkg = Get-Content package.json -Raw | ConvertFrom-Json
-          $old = $pkg.version
           $pkg.version = $v
           if ($pkg.build.directories.output) {
             $pkg.build.directories.output = "release$v"
           }
           $pkg | ConvertTo-Json -Depth 32 | Set-Content package.json -Encoding utf8
-          Write-Host "package.json version: $old -> $v"
+          Write-Host "package.json version -> $v"
 
       - name: Setup Node.js
         if: github.event.inputs.action != 'delete-only'
@@ -175,7 +162,7 @@ jobs:
           & "$jreDir/bin/java.exe" -version
 
       # ==================================================================
-      # 2. dex2jar → resources/jvm/d2j/（代码唯一读取位置）
+      # 2. dex2jar → resources/jvm/d2j/
       # ==================================================================
       - name: Prepare dex2jar
         if: github.event.inputs.action != 'delete-only'
@@ -240,7 +227,7 @@ jobs:
           }
 
       # ==================================================================
-      # 4. Patch stubs-src
+      # 4. Patch stubs-src（补 SharedPreferences.Mem + OkHttp）
       # ==================================================================
       - name: Patch stubs-src
         if: github.event.inputs.action != 'delete-only'
@@ -310,7 +297,11 @@ jobs:
           echo "patched"
 
       # ==================================================================
-      # 5. Compile stubs.jar
+      # 5. ★★★ 编译 stubs.jar —— 关键修复：把 jvm 顶层的 SpiderRunner / PythonRunner 也编进去 ★★★
+      #
+      #   历史问题：只编译 stubs-src/**，导致 SpiderRunner.class 缺失，
+      #             java -cp "...;stubs.jar" SpiderRunner 报「找不到或无法加载主类」。
+      #   修复：把 resources/jvm/SpiderRunner.java 和 resources/jvm/PythonRunner.java 一起编译。
       # ==================================================================
       - name: Compile stubs.jar
         if: github.event.inputs.action != 'delete-only'
@@ -323,6 +314,7 @@ jobs:
           Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $classes | Out-Null
 
+          # ---- 5.1 下载 android-all（提供 android.* 类） ----
           $androidAll = Join-Path $stubsDir "android-all-base.jar"
           if (-not (Test-Path $androidAll)) {
             $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
@@ -334,23 +326,69 @@ jobs:
             }
           }
 
+          # ---- 5.2 收集源码：stubs-src 全部 + jvm 顶层的 SpiderRunner / PythonRunner ----
+          $sources = @()
+          $sources += Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
+
+          # ★ 关键：SpiderRunner.java / PythonRunner.java 在 jvm 顶层，不在 stubs-src/ 里
+          $topSources = @(
+            "resources/jvm/SpiderRunner.java",
+            "resources/jvm/PythonRunner.java"
+          )
+          foreach ($t in $topSources) {
+            if (Test-Path $t) {
+              $resolved = (Resolve-Path $t).Path
+              Write-Host "adding top-level source: $t"
+              $sources += $resolved
+            } else {
+              Write-Warning "top-level source not found: $t"
+            }
+          }
+
+          if ($sources.Count -eq 0) { throw "未找到任何 .java 源文件" }
+          Write-Host "Compiling $($sources.Count) .java files..."
+          Write-Host "  - stubs-src: $(($sources | Where-Object { $_ -like "*stubs-src*" }).Count)"
+          Write-Host "  - jvm top:   $(($sources | Where-Object { $_ -notlike "*stubs-src*" }).Count)"
+
+          # ---- 5.3 编译 ----
           $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" | ForEach-Object { $_.FullName }
           $cp = ($libs + $androidAll) -join ";"
-          $files = Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
-          Write-Host "Compiling $($files.Count) .java files..."
-          javac -encoding UTF-8 -cp $cp -d $classes $files
+          javac -encoding UTF-8 -cp $cp -d $classes $sources
           if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
+          # ---- 5.4 检查 SpiderRunner.class 是否生成在 classes 根 ----
+          $spiderRunnerClass = Join-Path $classes "SpiderRunner.class"
+          if (-not (Test-Path $spiderRunnerClass)) {
+            # 可能在某个默认包目录下，搜一下
+            $found = Get-ChildItem $classes -Recurse -Filter "SpiderRunner.class" -ErrorAction SilentlyContinue
+            if ($found) {
+              Write-Host "SpiderRunner.class found at: $($found[0].FullName)"
+              $spiderRunnerClass = $found[0].FullName
+            } else {
+              throw "编译后仍未找到 SpiderRunner.class（源里有 SpiderRunner.java 吗？）"
+            }
+          } else {
+            Write-Host "SpiderRunner.class at classes root: $spiderRunnerClass"
+          }
+
+          # ---- 5.5 组装 stubs.jar：android-all 作基线 + 编译产物覆盖 ----
           $stubsJar = Join-Path $stubsDir "stubs.jar"
           Copy-Item $androidAll $stubsJar -Force
           Push-Location $classes
           & jar uf "../stubs.jar" .
           Pop-Location
+
+          # ---- 5.6 校验 jar 里含 SpiderRunner ----
+          $jarList = & jar tf $stubsJar
+          if ($jarList -notmatch '^SpiderRunner\.class$' -and $jarList -notmatch 'SpiderRunner\.class') {
+            throw "stubs.jar 中未找到 SpiderRunner.class"
+          }
+          Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B, SpiderRunner OK"
+
           Remove-Item -Force $androidAll -ErrorAction SilentlyContinue
-          Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
 
       # ==================================================================
-      # 6. 校验 + dex2jar 独立验证
+      # 6. 校验 + dex2jar 独立验证 + SpiderRunner 加载验证
       # ==================================================================
       - name: Verify resources
         if: github.event.inputs.action != 'delete-only'
@@ -370,11 +408,25 @@ jobs:
             if (-not (Test-Path $m)) { throw "missing: $m" }
             Write-Host "OK: $m"
           }
+
+          # 独立验证 1：dex2jar
+          Write-Host "`n=== 独立验证 dex2jar ==="
           $jre = "resources/jvm/jre/bin/java.exe"
           $d2j = (Resolve-Path "resources/jvm/d2j").Path
           & $jre -cp "$d2j\*" com.googlecode.dex2jar.tools.Dex2jarCmd --version
           if ($LASTEXITCODE -ne 0) { throw "dex2jar verification failed" }
-          Write-Host "dex2jar OK"
+
+          # 独立验证 2：SpiderRunner 主类可加载（跑一次，立即退出）
+          Write-Host "`n=== 独立验证 SpiderRunner 可加载 ==="
+          $stubs = (Resolve-Path "resources/jvm/stubs/stubs.jar").Path
+          $libs  = (Resolve-Path "resources/jvm/libs").Path
+          & $jre -cp "$stubs;$libs\*" SpiderRunner 2>&1 | Out-Host
+          # SpiderRunner 无参数时应该输出用法或报错，但**不能**是「找不到或无法加载主类」
+          $out = & $jre -cp "$stubs;$libs\*" SpiderRunner 2>&1 | Out-String
+          if ($out -match "找不到或无法加载主类|Could not find or load main class") {
+            throw "SpiderRunner 主类无法加载：$out"
+          }
+          Write-Host "SpiderRunner OK"
 
       # ==================================================================
       # 7. 测试 & 构建
@@ -411,17 +463,14 @@ jobs:
         shell: pwsh
         run: |
           $dir = "${{ steps.ver.outputs.output_dir }}"
-          Write-Host "=== $dir 内容 ==="
           if (Test-Path $dir) {
-            Get-ChildItem $dir -Recurse -File |
-              Select-Object FullName, Length |
-              Format-Table -AutoSize
+            Get-ChildItem $dir -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize
           } else {
             throw "release 目录不存在: $dir"
           }
 
       # ==================================================================
-      # 9. 上传到 Actions Artifacts
+      # 9. 上传到 Artifacts
       # ==================================================================
       - name: Upload build artifacts
         if: github.event.inputs.action != 'delete-only'
@@ -434,11 +483,7 @@ jobs:
             ${{ steps.ver.outputs.output_dir }}/latest.yml
 
       # ==================================================================
-      # 10. ★ 发布到 GitHub Release
-      #     每个构建都创建一个独立 tag：
-      #       v<base>-<bj-time>-<sha7>
-      #     例：v1.21.2-2026-10-14-13-05-30-abc1234
-      #     想回退那次构建 → git checkout abc1234
+      # 10. 发布到 GitHub Release
       # ==================================================================
       - name: Upload to GitHub Release
         if: github.event_name != 'pull_request' && github.event.inputs.action != 'delete-only'

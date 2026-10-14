@@ -376,11 +376,30 @@ export default function LivePage() {
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
   const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
 
-  async function refreshEpg(index: number, gs: LiveGroup[]) {
-    const refs: EpgChannelRef[] = gs
-      .flatMap((g) => g.channels)
-      .map((c) => ({ tvgId: c['tvg-id'], tvgName: c['tvg-name'], name: c.name, epg: c.epg }))
-      .filter((r) => !!(r.tvgId || r.tvgName || r.name));
+  /**
+   * ★ 2026-10-14（用户要求「只加载当前频道的 EPG」）：
+   *   旧实现把所有分组的**所有频道**都传给主进程 → EpgManager 要为几百个 channelId
+   *   保存 programme → worker 内部内存暴涨、结果传输大 → 主进程被拖慢。
+   *   现改为**只请求当前正在播的频道**：
+   *     · 数据量从「几百个频道 × 几十条节目」降到「1 个频道 × 几十条节目」
+   *     · 切换频道时重新请求（只重新请求这一个频道，不重复整组）
+   */
+  async function refreshEpg(index: number, gs: LiveGroup[], currentChannelName: string) {
+    if (!currentChannelName) { setEpg({}); setEpgStatus('empty'); return; }
+    const refs: EpgChannelRef[] = [];
+    outer: for (const g of gs) {
+      for (const c of g.channels) {
+        if (c.name !== currentChannelName) continue;
+        const r: EpgChannelRef = {
+          tvgId: c['tvg-id'],
+          tvgName: c['tvg-name'],
+          name: c.name,
+          epg: c.epg,
+        };
+        if (r.tvgId || r.tvgName || r.name) refs.push(r);
+        break outer;
+      }
+    }
     if (!refs.length) { setEpg({}); setEpgStatus('empty'); return; }
     setEpgStatus('loading');
     try {
@@ -396,9 +415,9 @@ export default function LivePage() {
 
   useEffect(() => {
     if (!groups.length) return;
-    void refreshEpg(liveIdx, groups);
+    void refreshEpg(liveIdx, groups, channelName);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [liveIdx, groups]);
+  }, [liveIdx, groups, channelName]);
 
   useEffect(() => {
     if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
@@ -407,7 +426,7 @@ export default function LivePage() {
     const at = e?.current?.endTime ?? e?.next?.startTime;
     if (!at) return;
     const delay = Math.max(1000, Math.min(at - Date.now() + 1000, 6 * 3600 * 1000));
-    epgTimer.current = window.setTimeout(() => { void refreshEpg(liveIdx, groups); }, delay);
+    epgTimer.current = window.setTimeout(() => { void refreshEpg(liveIdx, groups, channelName); }, delay);
     return () => {
       if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
     };
@@ -419,15 +438,24 @@ export default function LivePage() {
    *   - 不再在直播页内开浮窗（会遮视频、拖不出去）
    *   - 主进程创建/复用一个无边框独立窗口，**默认置顶**，可拖动到屏幕任意位置
    *   - 单例：切换频道时通知已开窗口换参数（不重载、不丢位置）
+   *   - ★ 追加 `channels` 参数：当前分组的全部频道 → EPG 窗口内可下拉切换
    */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();
     if (!name) return;
+    const chList = (curGroup?.channels || [])
+      .map((c) => ({
+        name: String(c.name || '').trim(),
+        tvgId: String(c['tvg-id'] || '').trim(),
+        tvgName: String(c['tvg-name'] || '').trim(),
+      }))
+      .filter((c) => !!c.name);
     try {
       await ipcInvoke('epg:openWindow', {
         channelName: name,
         tvgId: (channel['tvg-id'] || '').trim(),
         tvgName: (channel['tvg-name'] || '').trim(),
+        channels: chList,
       });
     } catch (e) {
       console.warn('[EPG] 打开节目单窗口失败', e);

@@ -1,750 +1,623 @@
-// src/main/ipc/index.ts — 注册所有 IPC handler
-import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, nativeTheme } from 'electron';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { registerHandler } from '../util/ipcGuard';
-import { fileLogger } from '../util/logger';
-import { SpiderHost } from '../spider/SpiderHost';
-import { resourcesDir, userDataDir, spiderCacheDir } from '../util/paths';
-import type { LocalPkgStore } from '../store/LocalPkgStore';
-import { pkgSubUrl } from '../../engine/config/localPkg';
-import {
-  openWebHomeWindow,
-  webHomeReq,
-  webHomeCookie,
-  webHomePlay,
-  type FmReqPayload,
-  type WebHomeOpenInit,
-} from '../webbridge/WebHomeWindow';
-import { clearAppCache } from '../util/cacheClean';
-import { nameFromLocalFile } from '../util/importNaming';
-import { join, basename } from 'node:path';
-import { IPC } from '../../shared/ipc-channels';
-import { dataDirReport } from '../util/dataDirBootstrap';
-import { proxySettingsView, setProxySettings, getProxySettings, type ProxySettings } from '../net/proxy';
-import { buildBackupFile, parseBackupFile } from '../settings/backup';
-import type { BackupExportResult, BackupImportResult, BackupSettingsState } from '../../shared/backup';
-import type { DavServer } from '../../shared/webdav';
-import type { DavService } from '../webdav/DavService';
-import type { DlnaCastTarget, DlnaDevice } from '../../shared/dlna';
-import type { DlnaService } from '../dlna/DlnaService';
-import type { UpdateProgress } from '../../shared/update';
-import type { UpdateService } from '../update/UpdateService';
-// 独立播放器窗口
-import { openPlayerWindow, playerSwitchEpisode, isPlayerOpen, closePlayerWindow, playerSetMini, playerIsMini, playerWindow, playerResendInit, onPlayerWindowClosed, isPlayerWindow, playerSetFullscreen, playerIsFullscreen, playerSetResizable } from '../player/PlayerWindow';
-// ★ 2026-10-08 MPV 高兼容播放内核（独立播放器窗口内嵌 --wid）
-import { MpvController } from '../player/MpvController';
-// ★ 2026-10-08 详情页独立窗口（外观开关控制；见 renderer/lib/detailWin.ts）
-import { openDetailWindow, detailWindowReady } from '../player/DetailWindow';
-import { openSearchWindow, searchWindowReady } from '../player/SearchWindow';
-// ★ 2026-10-14（用户要求）：EPG 节目单独立窗口（可拖到屏幕任意位置、默认置顶）
-//   ★ 传「分组 → 频道」两级列表；用 raw ipcMain.handle（不走 IpcResult 信封）与渲染层 ipcInvoke 保持一致
-import {
-  openEpgWindow,
-  epgWindowReady,
-  getPendingGroups,
-  type EpgChannelItem,
-  type EpgGroupItem,
-} from '../player/EpgWindow';
-import type { MpvCommand, MpvStartOptions } from '../../shared/player';
-// 老板键
-import { bossKey, BOSS_DEFAULT_ACCEL } from '../bossKey';
-import { playerSettings } from '../player/playerSettings';
-import { detectPlayers, launchPlayer, seekArgs } from '../torrent/externalPlayer';
-import { ok } from '../../shared/ipc-result';
-import type { IpcMainInvokeEvent } from 'electron';
-import type { BossKeySettings, EpgChannelRef, ImportReport, MultiConfigEntry, SiteConfig, SourceBean, SourceMoveDirection, SourceUpdatePatch } from '../../shared/types';
-import type { MetaSettings } from '../../shared/meta';
-import type { PlayerSettings } from '../../shared/player';
-// ★ 2026-10-13：本地文件导入直播源（抽出的公共函数；网络订阅源下载完成后走同一条链路）
-import { importLiveFileFromPath } from '../live/importLiveFile';
-// ★ 2026-10-14（用户要求）：通用路由窗口（导航点击 → 独立新窗口，多开）
-import { openRouteWindow, setWindowRoute } from '../player/RouteWindow';
+// src/renderer/pages/LivePage.tsx
+import { useEffect, useRef, useState, useCallback } from 'react';
+import Hls from 'hls.js';
+import { client } from '../api/client';
+import { ipcInvoke } from '../api/ipc';
+import type {
+  LiveGroup,
+  LiveBean,
+  LiveEpgEntry,
+  EpgChannelRef,
+  LiveSubscription,
+} from '../../shared/types';
+import { splitLine } from '../../engine/live/LiveUtils';
 
-function winOf(e: IpcMainInvokeEvent): BrowserWindow | null {
-  return BrowserWindow.fromWebContents(e.sender);
+// ---- 频道选择记忆 ----
+const LIVE_MEM_KEY = 'winbox-live-mem';
+interface LiveMem { liveIdx?: number; groupName?: string; channelName?: string; lineIdx?: number }
+function loadLiveMem(): LiveMem {
+  try { return JSON.parse(localStorage.getItem(LIVE_MEM_KEY) || '{}') as LiveMem; } catch { return {}; }
+}
+function saveLiveMem(m: LiveMem): void {
+  try { localStorage.setItem(LIVE_MEM_KEY, JSON.stringify(m)); } catch { /* ignore */ }
 }
 
-/** ★ 本次主进程启动的会话标识（模块求值 = 应用启动一次；重启必变） */
-const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+type EpgStatus = 'idle' | 'loading' | 'ok' | 'empty' | 'error';
 
-export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService, updater: UpdateService, pkgs: LocalPkgStore): void {
-  const log = fileLogger;
-  /** ★ 2026-10-08 MPV 播放内核（单会话；播放器窗口关闭/退出应用会 dispose） */
-  const mpv = new MpvController(fileLogger);
-
-  // 自定义无边框窗口控制
-  ipcMain.handle(IPC.WIN_MINIMIZE, (e) => winOf(e)?.minimize());
-  ipcMain.handle(IPC.WIN_MAXIMIZE, (e) => {
-    const w = winOf(e);
-    if (!w) return;
-    // Transparent player windows can report false from isFullScreen() on Windows;
-    // use the event-backed player state so a maximize click always exits player fullscreen.
-    if (isPlayerWindow(w) && playerIsFullscreen()) { void playerSetFullscreen(false); return; }
-    if (w.isMaximized()) w.unmaximize();
-    else w.maximize();
-  });
-  ipcMain.handle(IPC.WIN_CLOSE, (e) => winOf(e)?.close());
-  ipcMain.handle(IPC.WIN_IS_MAXIMIZED, (e) => !!winOf(e)?.isMaximized());
-  /**
-   * ★ 2026-09-30（用户要求）：播放器「置顶」按钮 —— 把**发起窗口**设为始终置顶。
-   *   level 用 'floating'（HWND_TOPMOST 语义：压过所有普通窗口，但不与任务栏/系统 UI 抢层级）。
-   *   ★ 必须走 registerHandler（IpcResult 信封）—— 渲染层 client 的 unwrap 只认 {ok,data}。
-   */
-  registerHandler(IPC.WIN_SET_ALWAYS_ON_TOP, (e: IpcMainInvokeEvent, on: unknown) => {
-    const w = winOf(e);
-    if (!w) return false;
-    const flag = !!on;
+class StreamDetector {
+  static async detect(url: string): Promise<'hls' | 'flv' | 'ts' | 'native' | 'unknown'> {
+    const lower = url.toLowerCase();
+    if (lower.includes('.m3u8')) return 'hls';
+    if (lower.includes('.flv')) return 'flv';
+    if (/\.ts(\?|#|$)/.test(lower)) return 'ts';
+    if (/\.(mp4|mkv|mov|webm|m4v|avi)(\?|#|$)/.test(lower)) return 'native';
     try {
-      w.setAlwaysOnTop(flag, 'floating');
+      const res = await fetch(url, { method: 'HEAD', mode: 'cors' });
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('mpegurl') || ct.includes('m3u8')) return 'hls';
+      if (ct.includes('flv')) return 'flv';
+      if (ct.includes('mp2t') || ct.includes('mpegts')) return 'ts';
+      if (ct.includes('video/') || ct.includes('audio/')) return 'native';
     } catch {
-      w.setAlwaysOnTop(flag);
-    }
-    return w.isAlwaysOnTop();
-  }, log);
-  registerHandler(IPC.WIN_IS_ALWAYS_ON_TOP, (e: IpcMainInvokeEvent) => !!winOf(e)?.isAlwaysOnTop(), log);
-
-  registerHandler(IPC.SYSTEM_PING, () => 'pong', log);
-  /**
-   * ★ 2026-09-30（用户要求「软件关闭后，所有的墓碑机制都应该脱钩」）：
-   *   本次**主进程启动**的唯一会话标识（每次启动必变）——渲染层用它判定「新一次启动」，
-   *   决定是否丢弃页面状态类记忆（搜索态/浏览态/详情态）。见 renderer/lib/uiMemory.ts。
-   */
-  registerHandler(IPC.SYSTEM_SESSION_ID, () => SESSION_ID, log);
-  // 退出整个应用（免责声明「拒绝」等场景）
-  registerHandler(IPC.APP_QUIT, () => {
-    app.quit();
-    return { ok: true };
-  }, log);
-  // 亮/深色模式：同步到原生主题（影响 Mica 背景与窗口底色），并更新当前窗口背景色
-  registerHandler(IPC.THEME_SET, (_e: any, theme: string) => {
-    nativeTheme.themeSource = theme === 'light' ? 'light' : theme === 'dark' ? 'dark' : 'system';
-    const w = winOf(_e as IpcMainInvokeEvent);
-    // ★ 不透明底色：对齐主窗口 createWindow 的修复（透明背景在放大/最大化时残影异形）
-    // ★★ 2026-10-08（用户报「b蓝光 / 自建 4K-2 有声音无图像」根因修复）★★：
-    //   **播放器窗口是透明窗**（mpv 画面从播放区透明处透出），它自己也跑主题引导 → 会走到这里；
-    //   一旦给它设不透明底色，mpv 画面被整块盖住（实测复现 + `setBackgroundColor` 最小复现）。
-    //   该窗口的底色必须保持 `#00000000`（构造项），其「最大化残影」由 PlayerWindow 自身的
-    //   maximize/unmaximize → invalidate + 圆角处理兜底。
-    const dark = nativeTheme.shouldUseDarkColors;
-    if (w && !isPlayerWindow(w)) w.setBackgroundColor(dark ? '#0a0c10' : '#dce4ec');
-  }, log);
-  // 应用图标 dataURL（标题栏/窗口内展示与进程图标一致）
-  registerHandler(IPC.APP_ICON, () => {
-    const p = join(resourcesDir(), 'ui', 'icon32.png');
-    if (!existsSync(p)) return '';
-    return 'data:image/png;base64,' + readFileSync(p).toString('base64');
-  }, log);
-  // ★ 2026-09-30（用户要求）：数据目录信息（安装目录/data；老用户迁移结果 / 回退原因）——配置页展示 + 排障
-  registerHandler(IPC.SYSTEM_DATA_DIR, () => ({
-    path: userDataDir(),
-    mode: dataDirReport.mode,
-    planned: dataDirReport.planned,
-    reason: dataDirReport.reason,
-    migration: dataDirReport.migration,
-  }), log);
-
-  registerHandler(IPC.CONFIG_IMPORT, async (e: any, args: { url?: string; json?: string; name?: string }) => {
-    const r = await host.importConfig(args || {});
-    return { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls };
-  }, log);
-
-  registerHandler(IPC.CONFIG_LIST_SITES, () => host.sites, log);
-  registerHandler(IPC.CONFIG_DIAGNOSE, () => host.importReport, log);
-
-  // 用户配置持久化 + 源管理（任务 B）
-  registerHandler(IPC.CFG_GET, () => host.cfgSnapshot(), log);
-  // ★ 2026-09-27：已学到的「需要网盘绑定」源 key（学习点 = play() 命中网盘直链，见 SpiderHost.markDriveBindNeeded）
-  registerHandler(IPC.DRIVE_BIND_KEYS, () => host.driveBindLearned(), log);
-  registerHandler(IPC.CFG_ADD_SOURCE, (_e: any, bean: SourceBean) => host.cfgAddSource(bean), log);
-  registerHandler(IPC.CFG_UPDATE_SOURCE, (_e: any, a: { key: string; patch: SourceUpdatePatch }) =>
-    host.cfgUpdateSource(a.key, a.patch || {}), log);
-  registerHandler(IPC.CFG_DELETE_SOURCE, (_e: any, key: string) => host.cfgDeleteSource(key), log);
-  registerHandler(IPC.CFG_MOVE_SOURCE, (_e: any, a: { key: string; direction: SourceMoveDirection }) =>
-    host.cfgMoveSource(a.key, a.direction), log);
-  registerHandler(IPC.CFG_SET_ACTIVE_SOURCE, (_e: any, key: string) => host.cfgSetActiveSource(key), log);
-  registerHandler(IPC.CFG_SET_ACTIVE_LIVE, (_e: any, index: number) => host.cfgSetActiveLive(index), log);
-  registerHandler(IPC.CFG_IMPORT_URL, async (_e: any, a: { url: string; name?: string }) => {
-    const r = await host.importConfig({ url: a.url, name: a.name });
-    return { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls };
-  }, log);
-  registerHandler(IPC.CFG_PROFILES, () => host.cfgProfiles(), log);
-  registerHandler(IPC.CFG_PROFILE_SAVE, (_e: any, name: string) => host.cfgSaveAsProfile(name), log);
-  registerHandler(IPC.CFG_PROFILE_ACTIVATE, (_e: any, id: string) => host.cfgActivateProfile(id), log);
-  registerHandler(IPC.CFG_PROFILE_DELETE, (_e: any, id: string) => host.cfgDeleteProfile(id), log);
-  registerHandler(IPC.CFG_PROFILE_UPDATE_NAME, (_e: any, a: { id: string; name: string }) => host.cfgUpdateProfileName(a.id, a.name), log);
-  /**
-   * ★ 2026-09-30（用户要求）：换源弹层「左订阅 / 右源」视图 —— 每份档案的源 key/name 清单。
-   * 当前生效档案取运行期真实源列表；其余档案解析其存档 JSON（坏档给空清单，不阻塞弹层）。
-   */
-  registerHandler(IPC.CFG_PROFILE_SITES, () => host.cfgProfileSites(), log);
-  /** ★ 2026-09-30（用户要求）：一步完成「切换档案 + 选中该档案下的源」（单次 apply，避免两轮宿主重活） */
-  registerHandler(IPC.CFG_SWITCH_PROFILE_SOURCE, (_e: any, a: { profileId: string; key: string }) =>
-    host.cfgSwitchProfileSource(String(a?.profileId || ''), String(a?.key || '')), log);
-  // 清理缓存：只删可重建的纯缓存（Chromium 缓存 / jar 转换缓存），绝不动配置/历史/绑定
-  //   ★ 2026-09-24：清完立刻在后台重建蜘蛛运行时（重新转换 jar + 重启热进程），
-  //     否则用户下一次进源要在请求里现付 30~40s 的「下载 + dex2jar」并被超时打断。
-  registerHandler(IPC.CACHE_CLEAR, async () => {
-    const r = clearAppCache(userDataDir(), spiderCacheDir());
-    try { host.rewarmAfterCacheClear(); } catch { /* 预热失败不影响清理结果 */ }
-    return r;
-  }, log);
-  registerHandler(IPC.VOD_DEBUG, (_e: any, key: string) => host.debug(key), log);
-  registerHandler(IPC.VOD_AUDIT, () => host.auditAll(), log);
-  registerHandler(IPC.DRIVE_GET, () => host.driveList(), log);
-  registerHandler(IPC.DRIVE_SET, (_e: any, a: { provider: string; token: string }) => host.driveSet(a.provider, a.token), log);
-  registerHandler(IPC.DRIVE_REMOVE, (_e: any, provider: string) => host.driveRemove(provider), log);
-  registerHandler(IPC.DRIVE_QR_CREATE, (_e: any, provider?: string) => host.driveQrCreate(provider), log);
-  registerHandler(IPC.DRIVE_QR_POLL, (_e: any, provider: string, sid: string) => host.driveQrPoll(provider, sid), log);
-  registerHandler(IPC.DRIVE_WEB_LOGIN, (_e: any, provider: string) => host.driveWebLogin(provider), log);
-
-  // 外挂字幕（多源：assrt（需 token）/ SubtitleCat（免 token））
-  registerHandler(IPC.SUBTITLE_GET, () => host.subtitleGetSettings(), log);
-  registerHandler(IPC.SUBTITLE_SET, (_e: any, patch: any) => host.subtitleSetSettings(patch || {}), log);
-  registerHandler(IPC.SUBTITLE_PROVIDERS, () => host.subtitleProviderView(), log);
-  registerHandler(IPC.SUBTITLE_SEARCH, (_e: any, name: string) => host.subtitleSearch(String(name)), log);
-  registerHandler(IPC.SUBTITLE_FETCH, (_e: any, cand: any) => host.subtitleFetch(cand), log);
-  // 弹幕（外部接口清单）
-  registerHandler(IPC.DANMAKU_GET, () => host.danmakuGetSettings(), log);
-  registerHandler(IPC.DANMAKU_SET, (_e: any, patch: any) => host.danmakuSetSettings(patch || {}), log);
-  // ★ 2026-09-26：season = 资源名提取的季号（同季条目优先）
-  registerHandler(IPC.DANMAKU_SEARCH, (_e: any, name: string, season?: number) =>
-    host.danmakuSearch(String(name), Number.isFinite(Number(season)) && Number(season) > 0 ? Number(season) : undefined), log);
-  // ★ 2026-09-26：source = 接口基础地址（候选项自带来源，透传回来即可）
-  registerHandler(IPC.DANMAKU_EPISODES, (_e: any, bangumiId: number, animeTitle?: string, source?: string) =>
-    host.danmakuEpisodes(Number(bangumiId), animeTitle ? String(animeTitle) : undefined, source ? String(source) : ''), log);
-  registerHandler(IPC.DANMAKU_FETCH, (_e: any, episodeId: number, source?: string) =>
-    host.danmakuFetch(Number(episodeId), source ? String(source) : ''), log);
-  // TMDB 元数据补全（缺封面/缺简介兜底；凭据内置密文，仅查询）
-  registerHandler(IPC.META_SEARCH, (_e: any, name: string, year?: string, provider?: string) => host.metaSearch(String(name || ''), year ? String(year) : undefined, provider === 'tmdb' || provider === 'douban' ? provider : undefined), log);
-  // ★ 2026-09-24：详情页增强（演职员/类型/相关推荐）与发现页榜单（无源默认主页）
-  registerHandler(IPC.META_EXTRA, (_e: any, name: string, year?: string) => host.metaExtra(String(name || ''), year ? String(year) : undefined), log);
-  registerHandler(IPC.META_DISCOVER, (_e: any, refresh?: boolean) => host.metaDiscover(!!refresh), log);
-  registerHandler(IPC.META_MOVIE_HOT, () => host.metaMovieHot(), log);
-  registerHandler(IPC.META_DISCOVER_IMAGES, (_e: any, name: string, mediaType: string, year?: string, kind?: string) =>
-    host.metaDiscoverImages(String(name || ''), mediaType === 'tv' ? 'tv' : 'movie', /^\d{4}$/.test(String(year)) ? String(year) : undefined, kind === 'poster' ? 'poster' : 'backdrop'), log);
-  // ★ 2026-09-24：发现页「分类」（TMDB 类型清单 + 按类型翻页）
-  registerHandler(IPC.META_GENRES, () => host.metaGenres(), log);
-  registerHandler(IPC.META_GENRE_PAGE, (_e: any, mediaType: string, genreId: number, page: number) => host.metaGenrePage(String(mediaType || 'movie'), Number(genreId) || 0, Number(page) || 1), log);
-  // ★ 2026-09-24：元数据来源配置（TMDB Key/代理/镜像 + 策略）与搜索面板联想
-  registerHandler(IPC.META_GET_SETTINGS, () => host.metaGetSettings(), log);
-  registerHandler(IPC.META_SET_SETTINGS, (_e: any, patch: unknown) => host.metaSetSettings((patch || {}) as Partial<MetaSettings>), log);
-  registerHandler(IPC.META_SUGGEST, (_e: any, q: string) => host.metaSuggest(String(q || '')), log);
-  // ★ 发现页 Hero 轮播：取某部片的横版剧照/竖版海报（TMDB images）
-  registerHandler(IPC.META_IMAGES, (_e: any, mediaType: string, tmdbId: number) =>
-    host.metaImages(String(mediaType || 'movie') === 'tv' ? 'tv' : 'movie', Number(tmdbId) || 0), log);
-  registerHandler(IPC.CFG_MERGE_EXPORT, (_e: any, ids: string[]) => host.mergeProfilesExport(ids), log);
-  registerHandler(IPC.CFG_EXPORT_SAVE, async (_e: any, a: { content: string; defaultName?: string }) => {
-    const w = winOf(_e as IpcMainInvokeEvent);
-    const r = await dialog.showSaveDialog(w ?? undefined!, {
-      title: '另存为',
-      defaultPath: a.defaultName || 'merged-subscription.json',
-      filters: [{ name: 'JSON 配置', extensions: ['json'] }],
-    });
-    if (r.canceled || !r.filePath) return { saved: false, path: '' };
-    writeFileSync(r.filePath, a.content, 'utf-8'); // 只写新文件，绝不改动任何原始文件
-    return { saved: true, path: r.filePath };
-  }, log);
-  /**
-   * ★ 2026-09-29 设置备份（导出）：宿主设置与凭据 + 播放偏好 + 代理 + 老板键 + 渲染层 localStorage → 单个 JSON。
-   * ★ 凭据为**明文**（口径见 shared/backup.ts）：换机/重装后也能还原；文件由用户自行保管。
-   */
-  registerHandler(IPC.BACKUP_EXPORT, async (_e: any, renderer: Record<string, string>): Promise<BackupExportResult> => {
-    const w = winOf(_e as IpcMainInvokeEvent);
-    const settings: BackupSettingsState = {
-      ...host.settingsSnapshot(),
-      player: playerSettings.settings,
-      proxy: getProxySettings(),
-      bossKey: bossKey.settings,
-    };
-    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    const file = buildBackupFile(settings, renderer || {}, {
-      exportedAt: new Date().toISOString(),
-      appVersion: app.getVersion(),
-    });
-    const r = await dialog.showSaveDialog(w ?? undefined!, {
-      title: '导出设置备份',
-      defaultPath: `win-box-backup-${stamp}.json`,
-      filters: [{ name: 'Win-Box 备份', extensions: ['json'] }],
-    });
-    if (r.canceled || !r.filePath) return { saved: false, path: '' };
-    writeFileSync(r.filePath, JSON.stringify(file, null, 2), 'utf-8');
-    log.i(`设置备份：已导出（源 ${settings.userConfig.sources.length} / 网盘凭据 ${Object.keys(settings.driveTokens).length} / localStorage ${Object.keys(file.renderer).length} 项）→ ${r.filePath}`);
-    return { saved: true, path: r.filePath };
-  }, log);
-  /** ★ 2026-09-29 设置备份（导入）：校验 → 覆盖各 store → 返回 localStorage 给渲染层写回并刷新 */
-  registerHandler(IPC.BACKUP_IMPORT, async (_e: any): Promise<BackupImportResult> => {
-    const w = winOf(_e as IpcMainInvokeEvent);
-    const picked = await dialog.showOpenDialog(w ?? undefined!, {
-      title: '导入设置备份',
-      properties: ['openFile'],
-      filters: [{ name: 'Win-Box 备份', extensions: ['json'] }],
-    });
-    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false, canceled: true };
-    const path = picked.filePaths[0];
-    let text = '';
-    try {
-      text = readFileSync(path, 'utf-8');
-    } catch (e) {
-      return { ok: false, error: `读取文件失败：${(e as Error).message}` };
-    }
-    const parsed = parseBackupFile(text);
-    if (!parsed.ok) {
-      log.w(`设置备份：导入失败 — ${parsed.error}`);
-      return { ok: false, error: parsed.error };
-    }
-    const s = parsed.file.settings;
-    host.restoreSettings(s);
-    if (s.player) playerSettings.settings = s.player;
-    if (s.proxy) {
-      setProxySettings(s.proxy);
-      host.resetSpidersForProxyChange();
-    }
-    if (s.bossKey) {
-      bossKey.settings = s.bossKey;
-      bossKey.apply();
-    }
-    log.i(`设置备份：已还原（源 ${s.userConfig?.sources?.length ?? 0} / 网盘凭据 ${Object.keys(s.driveTokens || {}).length} / localStorage ${Object.keys(parsed.file.renderer).length} 项）← ${path}`);
-    return { ok: true, path, renderer: parsed.file.renderer };
-  }, log);
-  // ★ 播放网盘资源未绑定 cookie → 从任意窗口请求主窗口跳到「点播页」
-  //   （网盘绑定入口已统一到源内：点播页 → 该源 → 「网盘绑定」按钮；配置页不再放网盘配置）
-  registerHandler(IPC.UI_GOTO_DRIVE_BIND, () => {
-    const pwin = playerWindow();
-    for (const w of BrowserWindow.getAllWindows()) {
-      if (w === pwin || w.isDestroyed()) continue;
       try {
-        if (w.isMinimized()) w.restore();
-        w.show();
-        w.focus();
-        w.webContents.send(IPC.NAV_DRIVE_BIND);
-      } catch { /* ignore */ }
-      break;
-    }
-    return true;
-  }, log);
-  /**
-   * ★ 2026-09-27（用户要求）：导入**本地 .json 订阅文件**（替代原「粘贴 JSON 文本」入口）。
-   *   档案名：自填名优先，否则**取原始文件名**（去扩展名）——不再一律「新订阅 xx」。
-   */
-  registerHandler(IPC.CFG_IMPORT_JSON_LOCAL, async (e: any, customName?: string): Promise<{
-    ok: boolean; file?: string; name?: string; error?: string;
-    result?: { config: SiteConfig; report: ImportReport; warnings: string[]; urls?: MultiConfigEntry[] };
-  }> => {
-    const win = winOf(e);
-    const picked = await dialog.showOpenDialog(win ?? undefined!, {
-      properties: ['openFile'],
-      filters: [{ name: 'JSON 订阅文件', extensions: ['json'] }],
-    });
-    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false }; // 用户取消，不视为错误
-    const filePath = picked.filePaths[0];
-    try {
-      const text = readFileSync(filePath, 'utf-8');
-      if (!text.trim()) return { ok: false, error: '所选 .json 文件为空' };
-      const name = nameFromLocalFile(filePath, customName);
-      const r = await host.importConfig({ json: text, name });
-      return {
-        ok: true,
-        file: basename(filePath),
-        name,
-        result: { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls },
-      };
-    } catch (err) {
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
-    }
-  }, log);
-
-  // 本地 .py：复制到安装目录 imports/py 后入库，不依赖原始文件。
-  //   ★ 2026-09-27（用户要求）：源名/源 key 用**原始文件名**（去扩展名）——与本地 .json 同一命名口径
-  registerHandler(IPC.CFG_IMPORT_PY_LOCAL, async (e: any): Promise<{ ok: boolean; key?: string; error?: string }> => {
-    const win = winOf(e);
-    const picked = await dialog.showOpenDialog(win ?? undefined!, {
-      properties: ['openFile'],
-      filters: [{ name: 'Python 蜘蛛脚本', extensions: ['py'] }],
-    });
-    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false }; // 用户取消，不视为错误
-    const srcPath = picked.filePaths[0];
-    let importedApi = '';
-    try {
-      const name = nameFromLocalFile(srcPath);
-      const api = importedApi = pkgs.importPython(srcPath);
-      const bean = host.cfgAddSource({ key: name, name, type: 3, api, ext: '', jar: '' } as SourceBean);
-      return { ok: true, key: bean.key };
-    } catch (err) {
-      if (importedApi) {
-        try { pkgs.discardImport(importedApi, host.cfgSnapshot()); }
-        catch (cleanup) { log.w(`导入失败副本清理失败：${String(cleanup)}`); }
+        const res = await fetch(url, { method: 'GET', mode: 'cors' });
+        const text = await res.text();
+        if (text.trim().startsWith('#EXTM3U')) return 'hls';
+        if (text.includes('FLV')) return 'flv';
+        return 'hls';
+      } catch {
+        return 'unknown';
       }
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
-  }, log);
+    return 'hls';
+  }
+}
 
-  /**
-   * ★ 2026-09-29（用户要求）：导入**本地包**（影视壳/影视仓 目录包）。
-   *
-   * 链路：选目录 → 在顶层找订阅 JSON → 复制到安装目录 imports/packages 并登记副本
-   *   → rewritePkgPaths 展开副本内相对引用（`./py/x.py` → file://；其余 → /pkg/<i>/…）
-   *   → 走**正常订阅导入**（apiUrl 记 `pkg://<i>/<rel>`：重新导入/刷新同一条链路，见 SpiderHost.fetchConfigText）。
-   *
-   * 包内 html（homePage 网页源）由 /pkg 路由提供，点播页「网页」入口在独立窗口打开（fm 桥，见 WebHomeWindow）。
-   */
-  registerHandler(IPC.CFG_IMPORT_PACKAGE, async (e: any, customName?: string): Promise<{
-    ok: boolean; root?: string; rel?: string; sites?: number; name?: string; error?: string;
-    warnings?: string[];
-    result?: { config: SiteConfig; report: ImportReport; warnings: string[]; urls?: MultiConfigEntry[] };
-  }> => {
-    const win = winOf(e);
-    const picked = await dialog.showOpenDialog(win ?? undefined!, {
-      properties: ['openDirectory'],
-      title: '选择本地包目录（含 影视.json 与 py/js/html/jar 等子目录）',
-    });
-    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false }; // 用户取消，不视为错误
-    const root = picked.filePaths[0];
-    let importedUrl = '';
-    try {
-      const found = pkgs.importSubscription(root);
-      if (!found) {
-        return {
-          ok: false,
-          error: '该目录下没找到可用的订阅 JSON：请选择含 影视.json（或含 sites 的 .json）的包目录',
-        };
-      }
-      const name = nameFromLocalFile(root, customName); // 默认取包目录名
-      const url = importedUrl = pkgSubUrl(found.index, found.rel);
-      const r = await host.importConfig({ url, name });
-      return {
-        ok: true,
-        root: pkgs.rootOf(found.index) || root,
-        rel: found.rel,
-        sites: found.sites,
-        name,
-        warnings: found.warnings,
-        result: { config: r.config, report: r.report, warnings: r.warnings, urls: r.urls },
-      };
-    } catch (err) {
-      if (importedUrl) {
-        try { pkgs.discardImport(importedUrl, host.cfgSnapshot()); }
-        catch (cleanup) { log.w(`导入失败副本清理失败：${String(cleanup)}`); }
-      }
-      return { ok: false, error: err instanceof Error ? err.message : String(err) };
-    }
-  }, log);
+function LiveVideoPlayer({
+  url,
+  onReconnect,
+  onVideoError,
+}: {
+  url: string;
+  onReconnect: () => void;
+  onVideoError: (msg: string) => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<any>(null);
+  const mpegtsRef = useRef<any>(null);
+  const cbRef = useRef({ onReconnect, onVideoError });
+  cbRef.current = { onReconnect, onVideoError };
 
-  /**
-   * ★ 2026-09-30（用户要求）：导入**本地 TXT / M3U 直播源**（配置页按钮）。
-   * ★ 2026-10-13：核心逻辑抽到 `importLiveFileFromPath`（见 src/main/live/importLiveFile.ts），
-   *   这里只负责弹文件选择框 —— 网络订阅源下载完成后走的是**同一个函数**，
-   *   保证两者注册进 lives 的 api 完全一致（`/file/local-live/<文件名>`，直播页唯一认得的形态）。
-   */
-  registerHandler(IPC.CFG_IMPORT_LIVE_LOCAL, async (e: any): Promise<{
-    ok: boolean; name?: string; index?: number; replaced?: boolean; total?: number; error?: string;
-  }> => {
-    const win = winOf(e);
-    const picked = await dialog.showOpenDialog(win ?? undefined!, {
-      properties: ['openFile'],
-      filters: [{ name: '直播源（TXT / M3U）', extensions: ['txt', 'm3u', 'm3u8'] }],
-    });
-    if (picked.canceled || !picked.filePaths?.[0]) return { ok: false }; // 用户取消，不视为错误
-    return importLiveFileFromPath(host, picked.filePaths[0]);
-  }, log);
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || !url) return;
 
-  // ★ 2026-09-29（用户要求）本地包「网页源」：点播页「网页」入口 → 独立窗口打开 homePage（preload 注入 window.fm）
-  registerHandler(IPC.WEBHOME_OPEN, (_e: any, init: WebHomeOpenInit) => openWebHomeWindow(init || { url: '' }), log);
-  // 以下三条是**网页窗口 preload → 主进程**的桥（渲染层不直接调用；见 WebHomeWindow / webhomePreload.ts）
-  registerHandler(IPC.WEBHOME_FM_REQ, (_e: any, payload: FmReqPayload) => webHomeReq(payload || { url: '' }), log);
-  registerHandler(IPC.WEBHOME_FM_PLAY, (_e: any, payload: { url?: string; title?: unknown }) => webHomePlay(payload || {}), log);
-  registerHandler(IPC.WEBHOME_FM_COOKIE, (_e: any, domain: string) => webHomeCookie(domain), log);
+    let destroyed = false;
+    const destroyHls = () => { if (hlsRef.current) { try { hlsRef.current.destroy(); } catch {} hlsRef.current = null; } };
+    const destroyMpegts = () => { if (mpegtsRef.current) { try { mpegtsRef.current.destroy(); } catch {} mpegtsRef.current = null; } };
 
-  registerHandler(IPC.VOD_HOME, (_e: any, key: string) => host.home(key), log);
-  registerHandler(IPC.VOD_CATEGORY, (_e: any, a: { key: string; tid: string; pg: string; extend?: Record<string, string> }) =>
-    host.category(a.key, a.tid, a.pg, a.extend || {}), log);
-  registerHandler(IPC.VOD_DETAIL, (_e: any, a: { key: string; ids: string[] }) => host.detail(a.key, a.ids), log);
-  registerHandler(IPC.VOD_SEARCH, (_e: any, a: { key: string; wd: string }) => host.search(a.key, a.wd), log);
-  // ★ 聚合搜索：逐源进度经 VOD_SEARCH_ALL_PROGRESS 推给发起窗口 → 渲染层边搜边出
-  //   参数 { wd, refresh }：refresh=true 忽略本地缓存强制重搜（「重新搜索」按钮）
-  registerHandler(IPC.VOD_SEARCH_ALL, async (e: any, a: { wd: string; refresh?: boolean } | string) => {
-    const arg = typeof a === 'string' ? { wd: a, refresh: false } : a || { wd: '', refresh: false };
-    const w = winOf(e as IpcMainInvokeEvent);
-    host.onSearchAllProgress = (ev) => {
-      try { w?.webContents.send(IPC.VOD_SEARCH_ALL_PROGRESS, ev); } catch { /* 窗口已关：忽略 */ }
+    const safePlay = () => {
+      const p = v.play();
+      if (p && typeof p.catch === 'function') p.catch(() => undefined);
     };
+
+    const playNative = () => {
+      v.src = url;
+      v.load();
+      safePlay();
+    };
+
+    const playHls = (sourceUrl: string) => {
+      if (!Hls.isSupported()) { playNative(); return; }
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 30,
+        maxBufferLength: 20,
+        manifestLoadingTimeOut: 15000,
+        manifestLoadingMaxRetry: 6,
+        manifestLoadingRetryDelay: 500,
+        levelLoadingTimeOut: 15000,
+        fragLoadingTimeOut: 30000,
+        xhrSetup: (xhr: XMLHttpRequest) => { xhr.withCredentials = false; },
+      });
+      hlsRef.current = hls;
+      hls.loadSource(sourceUrl);
+      hls.attachMedia(v);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        if (destroyed) return;
+        safePlay();
+      });
+
+      hls.on(Hls.Events.ERROR, (_evt: unknown, data: any) => {
+        if (destroyed) return;
+        if (!data?.fatal) return;
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
+          try { hls.startLoad(); } catch {}
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          cbRef.current.onVideoError('HLS 解码错误，尝试恢复…');
+          try { hls.recoverMediaError(); } catch {}
+        } else {
+          cbRef.current.onVideoError(`HLS 失败：${data.details || data.type}`);
+          destroyHls();
+          cbRef.current.onReconnect();
+        }
+      });
+    };
+
+    const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
+      try {
+        // @ts-ignore 动态加载可选依赖
+        const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
+        const mpegts: any = (mod as any)?.default || (mod as any);
+        if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
+          playNative();
+          return;
+        }
+        const player = mpegts.createPlayer(
+          { type, url: sourceUrl, isLive: true },
+          { enableWorker: true, enableStashBuffer: false, stashInitialSize: 128, lazyLoad: false },
+        );
+        mpegtsRef.current = player;
+        player.attachMediaElement(v);
+        player.load();
+        try { player.play(); } catch {}
+        player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
+          cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
+          cbRef.current.onReconnect();
+        });
+      } catch {
+        playNative();
+      }
+    };
+
+    (async () => {
+      const kind = await StreamDetector.detect(url);
+      if (destroyed) return;
+      if (kind === 'hls') playHls(url);
+      else if (kind === 'flv') void playMpegts('flv', url);
+      else if (kind === 'ts') void playMpegts('mpegts', url);
+      else if (kind === 'native') playNative();
+      else playHls(url);
+    })();
+
+    const onEnded = () => cbRef.current.onReconnect();
+    const onErr = () => {
+      const err = v.error;
+      const code = err?.code;
+      const msg = code === 1 ? '用户中止' : code === 2 ? '网络错误' : code === 3 ? '解码错误' : code === 4 ? '源不支持' : `错误(${code ?? '?'})`;
+      cbRef.current.onVideoError(msg);
+      if (code === 2 || code === 4) cbRef.current.onReconnect();
+    };
+    const onPlaying = () => cbRef.current.onVideoError('');
+    v.addEventListener('ended', onEnded);
+    v.addEventListener('error', onErr);
+    v.addEventListener('playing', onPlaying);
+    v.addEventListener('play', onPlaying);
+
+    return () => {
+      destroyed = true;
+      v.removeEventListener('ended', onEnded);
+      v.removeEventListener('error', onErr);
+      v.removeEventListener('playing', onPlaying);
+      v.removeEventListener('play', onPlaying);
+      destroyHls();
+      destroyMpegts();
+      try { v.removeAttribute('src'); v.load(); } catch {}
+    };
+  }, [url]);
+
+  return (
+    <video
+      ref={videoRef}
+      autoPlay
+      playsInline
+      controls
+      style={{ width: '100%', height: '100%', background: '#000', display: 'block' }}
+    />
+  );
+}
+
+export default function LivePage() {
+  const [lives, setLives] = useState<LiveBean[]>([]);
+  const [liveIdx, setLiveIdx] = useState(0);
+  const [groups, setGroups] = useState<LiveGroup[]>([]);
+  const [groupName, setGroupName] = useState('');
+  const [channelName, setChannelName] = useState('');
+  const [lineIdx, setLineIdx] = useState(0);
+  const [playUrl, setPlayUrl] = useState('');
+  const [playbackUrl, setPlaybackUrl] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+  const [epg, setEpg] = useState<Record<string, LiveEpgEntry>>({});
+  const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
+  const epgTimer = useRef<number | null>(null);
+
+  const [subCount, setSubCount] = useState(0);
+  const [subEnabled, setSubEnabled] = useState(0);
+
+  const [reconnectKey, setReconnectKey] = useState(0);
+  const [reconnectMsg, setReconnectMsg] = useState('');
+  const reconnectCountRef = useRef(0);
+  const lastReconnectAtRef = useRef(0);
+  const MAX_RECONNECT = 50;
+
+  useEffect(() => {
+    if (!playUrl) { setPlaybackUrl(''); return; }
+    setPlaybackUrl(playUrl);
+    reconnectCountRef.current = 0;
+    lastReconnectAtRef.current = 0;
+    setReconnectMsg('');
+  }, [playUrl]);
+
+  const doReconnect = useCallback(() => {
+    const now = Date.now();
+    if (now - lastReconnectAtRef.current < 3000) return;
+    lastReconnectAtRef.current = now;
+    reconnectCountRef.current += 1;
+    const n = reconnectCountRef.current;
+    if (n > MAX_RECONNECT) {
+      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请切换线路`);
+      return;
+    }
+    setReconnectMsg(`断线重连中…（第 ${n} 次）`);
+    setReconnectKey((k) => k + 1);
+    window.setTimeout(() => {
+      setReconnectMsg((cur) => (cur.startsWith('断线重连中') ? '' : cur));
+    }, 3000);
+  }, []);
+
+  const handleVideoError = useCallback((msg: string) => {
+    if (msg) setReconnectMsg(msg);
+  }, []);
+
+  const reloadLives = useCallback(async () => {
     try {
-      return await host.searchAll(arg.wd, { refresh: !!arg.refresh });
+      const cfg = await client.cfgGet();
+      const m = await client.liveMeta();
+      setLives(m);
+      const idx = liveIdx < m.length ? liveIdx : 0;
+      setLiveIdx(idx);
+      if (m.length && idx !== liveIdx) {
+        await loadLiveInternal(idx, m);
+      }
+    } catch (e) {
+      console.warn('[Live] reload lives 失败：', e);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveIdx]);
+
+  async function loadLiveInternal(index: number, meta?: LiveBean[]) {
+    const m = meta ?? lives;
+    if (!m.length) return;
+    setLoading(true);
+    setErr('');
+    try {
+      const r = await client.loadLive(index);
+      setGroups(r.groups);
+      if (r.groups.length) {
+        const mem = loadLiveMem();
+        const fromMem = mem.liveIdx === index;
+        const g = fromMem && mem.groupName ? r.groups.find((x) => x.group === mem.groupName) : undefined;
+        const group = g || r.groups[0];
+        setGroupName(group.group);
+        const ch = fromMem && mem.channelName && group.channels.some((c) => c.name === mem.channelName)
+          ? group.channels.find((c) => c.name === mem.channelName)!
+          : group.channels[0];
+        if (group.channels.length && ch) {
+          pickChannelInternal(group, ch.name, fromMem ? (mem.lineIdx || 0) : 0, r.groups, index);
+        }
+      } else {
+        setGroups([]);
+        setGroupName('');
+        setChannelName('');
+        setPlayUrl('');
+      }
+    } catch (e) {
+      setErr((e as Error).message);
     } finally {
-      host.onSearchAllProgress = undefined;
+      setLoading(false);
     }
-  }, log);
-  // ★ 2026-09-24：vipFlags 由主进程按订阅顶层 flags 自行决定（渲染层不再传）
-  // ★ 2026-09-29：磁力/电驴这类「桌面版无载体」的播放链接 → 顺手复制到剪贴板，
-  //   用户看到上屏提示后可直接粘进 qBittorrent / 迅雷等工具（见 engine/vod/playLink.ts）。
-  registerHandler(IPC.VOD_PLAY, async (_e: any, a: { key: string; flag: string; id: string }) => {
-    const r = await host.play(a.key, a.flag, a.id);
-    if (r.externalLink) {
-      try { clipboard.writeText(r.externalLink); } catch { /* 剪贴板不可用不影响播放结果 */ }
+  }
+
+  function pickLive(index: number, meta?: LiveBean[]) {
+    const m = meta ?? lives;
+    if (!m.length) return;
+    setLiveIdx(index);
+    client.cfgSetActiveLive(index).catch(() => undefined);
+    void loadLiveInternal(index, m);
+  }
+
+  function pickChannelInternal(g: LiveGroup, name: string, li: number, all = groups, idx = liveIdx) {
+    setGroupName(g.group);
+    setChannelName(name);
+    setLineIdx(li);
+    saveLiveMem({ liveIdx: idx, groupName: g.group, channelName: name, lineIdx: li });
+    const ch = g.channels.find((c) => c.name === name);
+    if (ch && ch.urls.length) {
+      const line = splitLine(ch.urls[li] || ch.urls[0], li + 1);
+      setPlayUrl(line.url);
     }
-    return r;
-  }, log);
+    if (all !== groups) setGroups(all);
+  }
+  const pickChannel = pickChannelInternal;
 
-  // ---- 独立播放器窗口 ----
-  registerHandler(IPC.PLAYER_OPEN, (_e: any, init: any) => {
-    openPlayerWindow(init);
-    return { ok: true };
-  }, log);
-  registerHandler(IPC.PLAYER_SWITCH_EP, (_e: any, request: number | import('../../shared/playerEpisode').PlayerEpisodeSwitch) => {
-    return { switched: playerSwitchEpisode(request) };
-  }, log);
-  registerHandler(IPC.PLAYER_IS_OPEN, () => ({ open: isPlayerOpen() }), log);
-  registerHandler(IPC.PLAYER_GET_INIT, () => ({ open: isPlayerOpen() }), log);
-  /** ★ 2026-09-30：渲染层订阅就绪 → 重发最新 init（修新窗口「首推早于订阅」的竞态，见 PlayerWindow.playerResendInit） */
-  registerHandler(IPC.PLAYER_READY, () => {
-    playerResendInit();
-    return { ok: true };
-  }, log);
-  registerHandler(IPC.PLAYER_SET_MINI, (_e: any, isMini: boolean) => {
-    playerSetMini(!!isMini);
-    return { mini: playerIsMini() };
-  }, log);
-  registerHandler(IPC.PLAYER_IS_MINI, () => ({ mini: playerIsMini() }), log);
-  registerHandler(IPC.PLAYER_SET_FULLSCREEN, async (_e: any, fullscreen: boolean) => ({ fullscreen: await playerSetFullscreen(!!fullscreen) }), log);
-  registerHandler(IPC.PLAYER_IS_FULLSCREEN, () => ({ fullscreen: playerIsFullscreen() }), log);
-  registerHandler(IPC.PLAYER_SET_RESIZABLE, (_e: any, resizable: boolean) => ({ resizable: playerSetResizable(!!resizable) }), log);
-  registerHandler('player:close', () => {
-    closePlayerWindow();
-    return { ok: true };
-  }, log);
-
-  // ---- 详情/搜索独立窗口（已开则复用：聚焦 + 通知其换路由）----
-  registerHandler(IPC.WIN_OPEN_DETAIL, (_e: any, a: { key?: string; id?: string; query?: string }) =>
-    openDetailWindow(a || {}), log);
-  registerHandler(IPC.WIN_OPEN_SEARCH, (_e: any, term: string) => openSearchWindow(term), log);
-  registerHandler(IPC.WIN_ROUTE_READY, (e: any) => {
-    searchWindowReady(e.sender.id);
-    detailWindowReady(e.sender.id);
-    return { ok: true };
-  }, log);
-  registerHandler(IPC.WIN_REPORT_ERROR, (e: any, message: string) => {
-    // 报告只保留异常/组件栈，移除 URL（源地址可能含凭据）。
-    log.w(`renderer-error wc=${e.sender.id}: ${String(message).replace(/https?:\/\/\S+/gi, '[url]').slice(0, 3000)}`);
-    return { ok: true };
-  }, log);
-
-  // ---- ★ 2026-10-14（用户要求）：导航点击 → 独立窗口（多开）----
-  /**
-   * 打开（或聚焦已开）指定顶层路由的独立窗口。
-   *   - 白名单：/、/home、/history、/live、/storage、/config、/about
-   *   - 已开同路由 → 聚焦（不重载，保留位置/尺寸）
-   */
-  registerHandler(IPC.OPEN_ROUTE_WINDOW, (_e: any, route: string) =>
-    openRouteWindow(String(route || '')), log);
-  /**
-   * 渲染层上报路由变化：更新该窗口在主进程里的「顶层路由」标签。
-   * 用于 openRouteWindow 去重；非顶层路由（/detail/:id、/player 等）自动忽略。
-   */
-  registerHandler(IPC.NOTIFY_ROUTE_CHANGE, (e: any, route: string) => {
-    const w = winOf(e as IpcMainInvokeEvent);
-    if (w && !w.isDestroyed()) setWindowRoute(w, String(route || ''));
-    return { ok: true };
-  }, log);
-
-  // ---- ★ 2026-10-08 MPV 高兼容播放内核（独立播放器窗口内嵌；见 main/player/MpvController）----
-  registerHandler(IPC.MPV_STATUS, () => mpv.status(), log);
-  registerHandler(IPC.MPV_START, (e: any, opts: MpvStartOptions) => {
-    const w = winOf(e as IpcMainInvokeEvent);
-    if (!w) throw new Error('播放器窗口不存在（mpv 无法嵌入）');
-    return mpv.start(w, opts || ({ url: '' } as MpvStartOptions));
-  }, log);
-  registerHandler(IPC.MPV_CMD, (_e: any, cmd: MpvCommand) => ({ ok: mpv.command(cmd) }), log);
-  registerHandler(IPC.MPV_STOP, () => {
-    mpv.stop();
-    return { ok: true };
-  }, log);
-  // 播放器窗口关闭 → 停 mpv（不留孤儿进程）；退出应用再兜一道（will-quit）
-  onPlayerWindowClosed(() => mpv.dispose());
-  app.on('will-quit', () => {
+  const loadSubStatus = useCallback(async () => {
     try {
-      mpv.dispose();
-    } catch {
-      /* ignore */
-    }
-  });
+      const list = await ipcInvoke<LiveSubscription[]>('live:subscription:list');
+      const arr = Array.isArray(list) ? list : [];
+      setSubCount(arr.length);
+      setSubEnabled(arr.filter((s) => s.enabled).length);
+    } catch { /* ignore */ }
+  }, []);
 
-  // ---- 老板键（全局快捷键隐藏/恢复窗口）----
-  registerHandler(IPC.BOSS_GET, () => bossKey.settings, log);
-  registerHandler(IPC.BOSS_SET, (_e: any, patch: Partial<BossKeySettings>) => {
-    const cur = bossKey.settings;
-    bossKey.settings = {
-      enabled: patch?.enabled ?? cur.enabled,
-      accel: (patch?.accel ?? cur.accel).trim() || BOSS_DEFAULT_ACCEL,
-    };
-    const registered = bossKey.apply();
-    return { settings: bossKey.settings, registered: registered || !bossKey.settings.enabled };
-  }, log);
-  // ---- 夸克落盘文件清理（渲染层播放页/播放器页卸载时触发；删除异步执行，失败会持久化重试）----
-  registerHandler(IPC.QUARK_CLEANUP, () => {
-    void host.quarkDeletePending().catch(() => undefined);
-    return true;
-  }, log);
-
-  // ---- ★ 网络代理（DNS 污染 / TLS SNI 阻断站点用；改后即时生效，无需重启）----
-  registerHandler(IPC.PROXY_GET, () => proxySettingsView(), log);
-  registerHandler(IPC.PROXY_SET, (_e: any, patch: Partial<ProxySettings>) => {
-    const next = setProxySettings(patch || {});
-    // 代理变了 → 常驻蜘蛛进程的参数已变（池 key 含代理参数）→ 清一次实例缓存，下一轮按新参数拉起
-    host.resetSpidersForProxyChange();
-    return next;
-  }, log);
-
-  // ---- ★ 播放偏好（m3u8 去广告开关；本地中继 /play 每轮读一次 → 改后即时生效）----
-  registerHandler(IPC.PLAYER_PREFS_GET, () => playerSettings.settings, log);
-  registerHandler(IPC.PLAYER_PREFS_SET, (_e: any, patch: Partial<PlayerSettings>) => playerSettings.update(patch || {}), log);
-  // ---- ★ 2026-09-29 磁力外部播放器探测（MKV/HEVC 接力用；只列本机已安装的，不启动）----
-  registerHandler(
-    IPC.BT_DETECT_PLAYERS,
-    () => detectPlayers(playerSettings.settings.btExternalPlayer).map((p) => ({ id: p.id, name: p.name, path: p.path })),
-    log,
-  );
-  // ---- ★ 2026-09-30（用户要求）：点播外部播放器（绑定值 vodExternalPlayer，与磁力分开）----
-  /** 探测本机已安装的外部播放器（点播用；配置页可指定路径，留空 = 自动探测） */
-  registerHandler(
-    IPC.VOD_DETECT_PLAYERS,
-    () => detectPlayers(playerSettings.settings.vodExternalPlayer).map((p) => ({ id: p.id, name: p.name, path: p.path })),
-    log,
-  );
-  /**
-   * 用本机外部播放器打开当前点播地址（a.path 指定本次用哪个播放器；地址是本机 /play 中继时 header/cookie 已由中继注入）。
-   * ★ 2026-09-30（用户要求）：`a.seek`（秒）= 续播位置 —— 按播放器类型拼成命令行参数传给播放器（见 seekArgs）。
-   */
-  registerHandler(IPC.VOD_OPEN_EXTERNAL, (_e: any, a: { url?: string; path?: string; seek?: number }) => {
-    // ★ 2026-10-08（用户要求「换成勾选项；就算填了路径，不勾选依旧不使用第三方播放器」）：
-    //   总开关在**主进程兜一道** —— 任何调用方都不得绕过：未勾选 = 拒绝拉起（渲染层同判据，见 externalPlay.ts）。
-    if (!playerSettings.settings.vodExternalPlayerEnabled) {
-      return { ok: false, error: '点播外部播放器未启用（请在配置页「播放」中勾选「启用点播外部播放器」）' };
-    }
-    const u = String(a?.url || '').trim();
-    if (!u) return { ok: false, error: '地址为空' };
-    const pick = String(a?.path || '').trim();
-    const players = detectPlayers(pick || playerSettings.settings.vodExternalPlayer);
-    if (!players.length) return { ok: false, error: '未检测到本机播放器（可在配置页「播放」中填写播放器路径）' };
-    const p = players[0];
-    const seek = Math.max(0, Math.floor(Number(a?.seek) || 0));
-    const started = launchPlayer(p.path, u, seekArgs(p.id, seek));
-    log.i(`vod: 外部播放器接力「${p.name}」${seek > 0 ? `（起播 ${seek}s）` : ''}→ ${u.slice(0, 120)}`);
-    return started ? { ok: true, player: p.name } : { ok: false, error: `无法启动「${p.name}」` };
-  }, log);
-
-  // ★ 2026-09-29 WebDAV 存储（只读）：服务器管理 + 目录浏览；取流走 `/play?dav=<id>`（中继注入 Authorization）
-  registerHandler(IPC.DAV_LIST, () => dav.list(), log);
-  registerHandler(IPC.DAV_SET, (_e: any, s: DavServer) => dav.set(s || ({} as DavServer)), log);
-  registerHandler(IPC.DAV_REMOVE, (_e: any, id: string) => {
-    dav.remove(String(id || ''));
-  }, log);
-  registerHandler(
-    IPC.DAV_BROWSE,
-    (_e: any, a: { id: string; path?: string }) => dav.browse(String(a?.id || ''), a?.path || '/'),
-    log,
-  );
-  /** WebDAV 文件用本机外部播放器接力（mkv/HEVC 等 Chromium 播不了的形态；复用磁力的播放器设置） */
-  registerHandler(IPC.DAV_OPEN_EXTERNAL, (_e: any, url: string) => {
-    const u = String(url || '').trim();
-    if (!u) return { ok: false, error: '地址为空' };
-    const players = detectPlayers(playerSettings.settings.btExternalPlayer);
-    if (!players.length) return { ok: false, error: '未检测到本机播放器（可在配置页「播放」中填写播放器路径）' };
-    const p = players[0];
-    const started = launchPlayer(p.path, u);
-    log.i(`webdav: 外部播放器接力「${p.name}」→ ${u.slice(0, 120)}`);
-    return started ? { ok: true, player: p.name } : { ok: false, error: `无法启动「${p.name}」` };
-  }, log);
-
-  // ★ 2026-09-29 DLNA 投屏：SSDP 发现局域网 MediaRenderer + AVTransport 三动作投屏
-  registerHandler(IPC.DLNA_DISCOVER, () => dlna.discover(), log);
-  registerHandler(IPC.DLNA_CAST, (_e: any, a: { device: DlnaDevice; target: DlnaCastTarget }) =>
-    dlna.cast(a?.device, a?.target || ({ url: '', name: '', positionMs: 0 } as DlnaCastTarget)), log);
-
-  // ★ 2026-09-29 启动强制更新：检查（失败不锁死）→ 代理加速下载 Setup（进度推送）→ 拉起安装程序
-  registerHandler(IPC.UPDATE_CHECK, () => updater.check(), log);
-  registerHandler(IPC.UPDATE_DOWNLOAD, async () => {
-    const push = (p: UpdateProgress): void => {
-      for (const w of BrowserWindow.getAllWindows()) {
-        if (!w.isDestroyed()) w.webContents.send(IPC.UPDATE_PROGRESS, p);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const cfg = await client.cfgGet();
+        const m = await client.liveMeta();
+        if (cancelled) return;
+        setLives(m);
+        if (m.length) {
+          const start = cfg.ui.activeLiveIndex < m.length ? cfg.ui.activeLiveIndex : 0;
+          setLiveIdx(start);
+          await loadLiveInternal(start, m);
+        }
+      } catch (e) {
+        if (!cancelled) setErr((e as Error).message);
       }
-    };
-    return updater.download(push);
-  }, log);
-  registerHandler(IPC.UPDATE_INSTALL, async () => {
-    const path = updater.downloadedPath();
-    if (!path) throw new Error('安装包不存在，请重新下载');
-    const r = await updater.launch(path);
-    if (!r.ok) throw new Error(r.error || '无法启动安装程序');
-    // 拉起安装程序后退出本程序，避免占用安装目录文件（NSIS 才能覆盖安装）
-    setTimeout(() => app.quit(), 1500);
-    return { ok: true, path };
-  }, log);
+    })();
+    void loadSubStatus();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  registerHandler(IPC.LIVE_LOAD, (_e: any, index: number) => host.loadLive(index), log);
-  // ★ 2026-09-29 EPG：渲染层把当前分组的频道引用传进来（免再拉一次直播源）
-  registerHandler(
-    IPC.LIVE_EPG,
-    (_e: any, a: { index: number; channels: EpgChannelRef[] }) => host.loadLiveEpg(Number(a?.index) || 0, a?.channels || []),
-    log,
-  );
-  registerHandler(
-    IPC.EPG_PROGRAMS,
-    // ★ 不要 String() —— 渲染层传的是数组（多 key 依次尝试），String() 会拼成 "a,b,c" 变成单 key
-    (_e: any, channelNames: string | string[]) => host.getLiveEpgPrograms(channelNames),
-    log,
-  );
-
-  // =====================================================================
-  // ★ EPG 独立窗口的三条 IPC —— **raw ipcMain.handle**（不走 IpcResult 信封）
-  //
-  //   为什么不用 registerHandler：
-  //     渲染层的 `ipcInvoke`（走 window.winboxIpc.invoke）拿到的是 handler 的**原始返回值**；
-  //     若走 registerHandler 会被包一层 `{ok:true, data:...}`，渲染层 `data.groups` 就取不到
-  //     → 用户报的「左侧无频道」。
-  //     这三条通道的**调用方都是 ipcInvoke**，所以必须 raw。
-  // =====================================================================
+  useEffect(() => {
+    const w = window as any;
+    const off = w?.winboxIpc?.on?.('live:subscriptions-changed', () => {
+      void loadSubStatus();
+      void reloadLives();
+    });
+    return () => { if (typeof off === 'function') off(); };
+  }, [loadSubStatus, reloadLives]);
 
   /**
-   * ★ 2026-10-14（用户要求）：EPG 独立窗口 —— 直播页点「正在播 / 下一档 / 📺」时调用。
-   *   单例复用：切换频道时通知已开窗口换参数（不重载、不丢位置）。
-   *   传 `groups`（直播源**所有分组**的频道列表）+ `currentGroup`（当前分组名）。
+   * ★ 2026-10-14（用户要求）：监听主进程广播的「直播源已变更」→ 自动重新加载。
+   *
+   * 背景：用户导入本地 TXT/M3U 直播源后，主进程只把结果返回给**发起导入的窗口**（配置页），
+   * 直播页窗口收不到通知 → 必须手动切走再切回才加载（用户抱怨「加载慢 + 不能自动刷新」）。
+   *
+   * 现在：主进程 `broadcastLiveChanged` 会把 `live:changed` 推给所有窗口，
+   * 直播页收到后**重新拉取线路列表 + 强制重载当前激活线路**（主进程侧已 preloadLive 预热，
+   * loadLive 命中缓存秒开）。如果新导入的源排在末尾（index 变大），当前 liveIdx 仍在范围内，
+   * 用户需要手动下拉切换 —— 这是预期行为（不抢用户焦点）。
    */
-  ipcMain.handle(IPC.EPG_OPEN_WINDOW, (_e, p: {
-    channelName: string;
-    tvgId?: string;
-    tvgName?: string;
-    groups?: Array<{ group?: string; channels?: Array<{ name?: string; tvgId?: string; tvgName?: string }> }>;
-    currentGroup?: string;
-  }) => {
-    const groups: EpgGroupItem[] = Array.isArray(p?.groups)
-      ? p!.groups!
-          .map((g) => {
-            const channels: EpgChannelItem[] = Array.isArray(g?.channels)
-              ? g!.channels!
-                  .map((c) => ({
-                    name: String(c?.name || '').trim(),
-                    tvgId: c?.tvgId ? String(c.tvgId).trim() : undefined,
-                    tvgName: c?.tvgName ? String(c.tvgName).trim() : undefined,
-                  }))
-                  .filter((c) => !!c.name)
-              : [];
-            return { group: String(g?.group || '').trim(), channels };
-          })
-          .filter((g) => !!g.group && g.channels.length > 0)
-      : [];
-    return openEpgWindow({
-      channelName: String(p?.channelName || ''),
-      tvgId: p?.tvgId ? String(p.tvgId) : undefined,
-      tvgName: p?.tvgName ? String(p.tvgName) : undefined,
-      groups,
-      currentGroup: String(p?.currentGroup || ''),
+  useEffect(() => {
+    const w = window as any;
+    const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
+      console.log('[Live] 收到 live:changed 广播：', payload);
+      void (async () => {
+        try {
+          const m = await client.liveMeta();
+          setLives(m);
+          // 保持当前索引不变；若超出范围则退回 0
+          const idx = liveIdx < m.length ? liveIdx : 0;
+          if (idx !== liveIdx) setLiveIdx(idx);
+          if (m.length) {
+            // 强制重新加载当前激活线路（主进程侧已预热，命中缓存秒开）
+            await loadLiveInternal(idx, m);
+          }
+        } catch (e) {
+          console.warn('[Live] live:changed 处理后失败：', e);
+        }
+      })();
     });
-  });
-  ipcMain.handle(IPC.EPG_WINDOW_READY, (e) => {
-    epgWindowReady(e.sender.id);
-    return { ok: true };
-  });
-  /** ★ 2026-10-14（用户要求）：EPG 窗口渲染层拉取「分组 → 频道」列表 */
-  ipcMain.handle(IPC.EPG_GET_CHANNELS, () => getPendingGroups());
+    return () => { if (typeof off === 'function') off(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveIdx]);
 
-  registerHandler('live:meta', () => host.lives, log);
+  const curGroup = groups.find((g) => g.group === groupName);
+  const curChannel = curGroup?.channels.find((c) => c.name === channelName);
+  const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
+  const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
+
+  async function refreshEpg(index: number, gs: LiveGroup[], currentChannelName: string) {
+    if (!currentChannelName) { setEpg({}); setEpgStatus('empty'); return; }
+    const refs: EpgChannelRef[] = [];
+    outer: for (const g of gs) {
+      for (const c of g.channels) {
+        if (c.name !== currentChannelName) continue;
+        const r: EpgChannelRef = {
+          tvgId: c['tvg-id'],
+          tvgName: c['tvg-name'],
+          name: c.name,
+          epg: c.epg,
+        };
+        if (r.tvgId || r.tvgName || r.name) refs.push(r);
+        break outer;
+      }
+    }
+    if (!refs.length) { setEpg({}); setEpgStatus('empty'); return; }
+    setEpgStatus('loading');
+    try {
+      const r = await client.liveEpg(index, refs);
+      setEpg(r.byKey);
+      setEpgStatus(Object.keys(r.byKey).length ? 'ok' : 'empty');
+    } catch (e) {
+      setEpg({});
+      setEpgStatus('error');
+      console.warn('[EPG] 加载失败：', e);
+    }
+  }
+
+  useEffect(() => {
+    if (!groups.length) return;
+    void refreshEpg(liveIdx, groups, channelName);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveIdx, groups, channelName]);
+
+  useEffect(() => {
+    if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
+    if (!curChannel) return;
+    const e = epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name];
+    const at = e?.current?.endTime ?? e?.next?.startTime;
+    if (!at) return;
+    const delay = Math.max(1000, Math.min(at - Date.now() + 1000, 6 * 3600 * 1000));
+    epgTimer.current = window.setTimeout(() => { void refreshEpg(liveIdx, groups, channelName); }, delay);
+    return () => {
+      if (epgTimer.current != null) { window.clearTimeout(epgTimer.current); epgTimer.current = null; }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [epg, groupName, channelName, liveIdx]);
+
+  /**
+   * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
+   *   - 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`（当前分组名）
+   *     → EPG 窗口左侧渲染「分组 → 频道」列表，点分组展开、点频道加载其节目预告。
+   *   - 传 `channelName / tvgId / tvgName` 作为「初始频道」= 主窗口**当前正在播放的频道**
+   *     → EPG 窗口顶部「↩ 当前」按钮可一键切回。
+   */
+  async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
+    const name = (channel.name || '').trim();
+    if (!name) return;
+    // ★ 传整个直播源的所有分组（不只是当前分组）
+    const groupList = groups
+      .map((g) => ({
+        group: String(g.group || '').trim(),
+        channels: g.channels
+          .map((c) => ({
+            name: String(c.name || '').trim(),
+            tvgId: String(c['tvg-id'] || '').trim(),
+            tvgName: String(c['tvg-name'] || '').trim(),
+          }))
+          .filter((c) => !!c.name),
+      }))
+      .filter((g) => !!g.group && g.channels.length > 0);
+    try {
+      await ipcInvoke('epg:openWindow', {
+        channelName: name,
+        tvgId: (channel['tvg-id'] || '').trim(),
+        tvgName: (channel['tvg-name'] || '').trim(),
+        groups: groupList,
+        currentGroup: groupName,
+      });
+    } catch (e) {
+      console.warn('[EPG] 打开节目单窗口失败', e);
+    }
+  }
+
+  const epgStatusText =
+    epgStatus === 'loading' ? '加载中…'
+      : epgStatus === 'ok' ? `命中 ${Object.keys(epg).length} 键`
+        : epgStatus === 'empty' ? '无节目单'
+          : epgStatus === 'error' ? '失败（看日志）'
+            : '未触发';
+
+  return (
+    <>
+      <div className="topbar">
+        <select value={liveIdx} onChange={(e) => pickLive(Number(e.target.value))} disabled={loading}>
+          {lives.map((l, i) => <option key={i} value={i}>{l.name}</option>)}
+        </select>
+
+        <span className="status" style={{ marginLeft: 'auto' }}>
+          {loading ? '加载中…' : `${groups.length} 组`}
+        </span>
+        <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
+          订阅 {subEnabled}/{subCount}
+        </span>
+        <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
+          EPG：{epgStatusText}
+        </span>
+      </div>
+
+      <div className="layout-2 content" style={{ padding: 12 }}>
+        <div className="left">
+          {groups.map((g) => (
+            <div
+              key={g.group}
+              className={`nav-item ${g.group === groupName ? 'active' : ''}`}
+              onClick={() => {
+                setGroupName(g.group);
+                if (g.channels.length) pickChannel(g, g.channels[0].name, 0, groups);
+              }}
+            >
+              {g.group} <span className="muted">({g.channels.length})</span>
+            </div>
+          ))}
+        </div>
+        <div className="right">
+          {err && <div className="err" style={{ marginBottom: 10 }}>{err}</div>}
+          {curGroup ? (
+            <>
+              <div className="row" style={{ marginBottom: 10, maxHeight: 180, overflow: 'auto' }}>
+                {curGroup.channels.map((c) => (
+                  <span
+                    key={c.name}
+                    className={`tag ${c.name === channelName ? 'active' : ''}`}
+                    onClick={() => pickChannel(curGroup, c.name, 0, groups)}
+                    onDoubleClick={() => openPrograms(c)}
+                    title="双击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
+                  >
+                    {c.name}
+                  </span>
+                ))}
+              </div>
+              {lines.length > 1 && (
+                <div className="row" style={{ marginBottom: 8 }}>
+                  <span className="muted">线路：</span>
+                  {lines.map((l) => (
+                    <span
+                      key={l.index}
+                      className={`tag ${l.index - 1 === lineIdx ? 'active' : ''}`}
+                      onClick={() => {
+                        setLineIdx(l.index - 1);
+                        setPlayUrl(l.url);
+                        saveLiveMem({ liveIdx, groupName, channelName, lineIdx: l.index - 1 });
+                      }}
+                    >
+                      {l.name}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {curEpg && (curEpg.current || curEpg.next) && curChannel && (
+                <div
+                  className="live-epg"
+                  onClick={() => openPrograms(curChannel)}
+                  style={{ cursor: 'pointer' }}
+                  title="点击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
+                >
+                  {curEpg.current && (
+                    <span className="live-epg-now">
+                      <b>正在播</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '（无标题）'}
+                    </span>
+                  )}
+                  {curEpg.next && (
+                    <span className="muted">
+                      <b>下一档</b> {curEpg.next.start} {curEpg.next.title || '（无标题）'}
+                    </span>
+                  )}
+                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>📺</span>
+                </div>
+              )}
+
+              {playUrl ? (
+                <div className="live-player" style={{ position: 'relative' }}>
+                  {playbackUrl ? (
+                    <LiveVideoPlayer
+                      key={`${playbackUrl}__${reconnectKey}`}
+                      url={playbackUrl}
+                      onReconnect={doReconnect}
+                      onVideoError={handleVideoError}
+                    />
+                  ) : (
+                    <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
+                  )}
+                  {reconnectMsg && (
+                    <div
+                      style={{
+                        position: 'absolute', top: 12, left: 12,
+                        padding: '6px 12px', borderRadius: 6,
+                        background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13,
+                        pointerEvents: 'none', zIndex: 20,
+                      }}
+                    >{reconnectMsg}</div>
+                  )}
+                </div>
+              ) : (
+                <div className="empty">无播放地址</div>
+              )}
+            </>
+          ) : (
+            <div className="empty">{groups.length ? '选择左侧分组' : '无直播（请先导入含 lives 的配置）'}</div>
+          )}
+        </div>
+      </div>
+      {/* ★ 2026-10-14：节目单弹窗已改为独立窗口（见 main/player/EpgWindow.ts + pages/EpgWinPage.tsx）*/}
+    </>
+  );
 }

@@ -12,7 +12,6 @@ import type {
 } from '../../shared/types';
 import { splitLine } from '../../engine/live/LiveUtils';
 
-// ---- 频道选择记忆 ----
 const LIVE_MEM_KEY = 'winbox-live-mem';
 interface LiveMem { liveIdx?: number; groupName?: string; channelName?: string; lineIdx?: number }
 function loadLiveMem(): LiveMem {
@@ -114,13 +113,13 @@ function LiveVideoPlayer({
         if (destroyed) return;
         if (!data?.fatal) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          cbRef.current.onVideoError('HLS 网络错误，尝试恢复…');
+          cbRef.current.onVideoError('HLS network error, retrying...');
           try { hls.startLoad(); } catch {}
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          cbRef.current.onVideoError('HLS 解码错误，尝试恢复…');
+          cbRef.current.onVideoError('HLS media error, recovering...');
           try { hls.recoverMediaError(); } catch {}
         } else {
-          cbRef.current.onVideoError(`HLS 失败：${data.details || data.type}`);
+          cbRef.current.onVideoError(`HLS failed: ${data.details || data.type}`);
           destroyHls();
           cbRef.current.onReconnect();
         }
@@ -129,7 +128,7 @@ function LiveVideoPlayer({
 
     const playMpegts = async (type: 'flv' | 'mpegts', sourceUrl: string) => {
       try {
-        // @ts-ignore 动态加载可选依赖
+        // @ts-ignore optional dep loaded dynamically
         const mod = await import(/* @vite-ignore */ 'mpegts.js').catch(() => null);
         const mpegts: any = (mod as any)?.default || (mod as any);
         if (!mpegts || typeof mpegts.isSupported !== 'function' || !mpegts.isSupported()) {
@@ -145,7 +144,7 @@ function LiveVideoPlayer({
         player.load();
         try { player.play(); } catch {}
         player.on(mpegts.Events?.ERROR || 'error', (errType: unknown, errDetail: unknown) => {
-          cbRef.current.onVideoError(`流错误：${errType}/${errDetail}`);
+          cbRef.current.onVideoError(`stream error: ${errType}/${errDetail}`);
           cbRef.current.onReconnect();
         });
       } catch {
@@ -167,7 +166,7 @@ function LiveVideoPlayer({
     const onErr = () => {
       const err = v.error;
       const code = err?.code;
-      const msg = code === 1 ? '用户中止' : code === 2 ? '网络错误' : code === 3 ? '解码错误' : code === 4 ? '源不支持' : `错误(${code ?? '?'})`;
+      const msg = code === 1 ? 'aborted' : code === 2 ? 'network error' : code === 3 ? 'decode error' : code === 4 ? 'unsupported source' : `error(${code ?? '?'})`;
       cbRef.current.onVideoError(msg);
       if (code === 2 || code === 4) cbRef.current.onReconnect();
     };
@@ -239,13 +238,13 @@ export default function LivePage() {
     reconnectCountRef.current += 1;
     const n = reconnectCountRef.current;
     if (n > MAX_RECONNECT) {
-      setReconnectMsg(`已连续重连 ${MAX_RECONNECT} 次仍失败，请切换线路`);
+      setReconnectMsg(`already reconnected ${MAX_RECONNECT} times, still failing, switch line`);
       return;
     }
-    setReconnectMsg(`断线重连中…（第 ${n} 次）`);
+    setReconnectMsg(`reconnecting... (${n})`);
     setReconnectKey((k) => k + 1);
     window.setTimeout(() => {
-      setReconnectMsg((cur) => (cur.startsWith('断线重连中') ? '' : cur));
+      setReconnectMsg((cur) => (cur.startsWith('reconnecting') ? '' : cur));
     }, 3000);
   }, []);
 
@@ -264,7 +263,7 @@ export default function LivePage() {
         await loadLiveInternal(idx, m);
       }
     } catch (e) {
-      console.warn('[Live] reload lives 失败：', e);
+      console.warn('[Live] reload lives failed:', e);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx]);
@@ -364,6 +363,29 @@ export default function LivePage() {
     return () => { if (typeof off === 'function') off(); };
   }, [loadSubStatus, reloadLives]);
 
+  // 2026-10-14: main broadcasts live:changed after import; reload the list and force-reload active line.
+  useEffect(() => {
+    const w = window as any;
+    const off = w?.winboxIpc?.on?.('live:changed', (payload: { index?: number; name?: string; replaced?: boolean }) => {
+      console.log('[Live] received live:changed:', payload);
+      void (async () => {
+        try {
+          const m = await client.liveMeta();
+          setLives(m);
+          const idx = liveIdx < m.length ? liveIdx : 0;
+          if (idx !== liveIdx) setLiveIdx(idx);
+          if (m.length) {
+            await loadLiveInternal(idx, m);
+          }
+        } catch (e) {
+          console.warn('[Live] live:changed handling failed:', e);
+        }
+      })();
+    });
+    return () => { if (typeof off === 'function') off(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveIdx]);
+
   const curGroup = groups.find((g) => g.group === groupName);
   const curChannel = curGroup?.channels.find((c) => c.name === channelName);
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
@@ -394,7 +416,7 @@ export default function LivePage() {
     } catch (e) {
       setEpg({});
       setEpgStatus('error');
-      console.warn('[EPG] 加载失败：', e);
+      console.warn('[EPG] load failed:', e);
     }
   }
 
@@ -418,17 +440,9 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [epg, groupName, channelName, liveIdx]);
 
-  /**
-   * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
-   *   - 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`（当前分组名）
-   *     → EPG 窗口左侧渲染「分组 → 频道」列表，点分组展开、点频道加载其节目预告。
-   *   - 传 `channelName / tvgId / tvgName` 作为「初始频道」= 主窗口**当前正在播放的频道**
-   *     → EPG 窗口顶部「↩ 当前」按钮可一键切回。
-   */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();
     if (!name) return;
-    // ★ 传整个直播源的所有分组（不只是当前分组）
     const groupList = groups
       .map((g) => ({
         group: String(g.group || '').trim(),
@@ -450,16 +464,16 @@ export default function LivePage() {
         currentGroup: groupName,
       });
     } catch (e) {
-      console.warn('[EPG] 打开节目单窗口失败', e);
+      console.warn('[EPG] open programs window failed', e);
     }
   }
 
   const epgStatusText =
-    epgStatus === 'loading' ? '加载中…'
-      : epgStatus === 'ok' ? `命中 ${Object.keys(epg).length} 键`
-        : epgStatus === 'empty' ? '无节目单'
-          : epgStatus === 'error' ? '失败（看日志）'
-            : '未触发';
+    epgStatus === 'loading' ? 'loading...'
+      : epgStatus === 'ok' ? `${Object.keys(epg).length} keys`
+        : epgStatus === 'empty' ? 'no data'
+          : epgStatus === 'error' ? 'failed (see logs)'
+            : 'idle';
 
   return (
     <>
@@ -469,13 +483,13 @@ export default function LivePage() {
         </select>
 
         <span className="status" style={{ marginLeft: 'auto' }}>
-          {loading ? '加载中…' : `${groups.length} 组`}
+          {loading ? 'loading...' : `${groups.length} groups`}
         </span>
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
-          订阅 {subEnabled}/{subCount}
+          subs {subEnabled}/{subCount}
         </span>
         <span className="status" style={{ marginLeft: 12, fontSize: 12, opacity: 0.7 }}>
-          EPG：{epgStatusText}
+          EPG: {epgStatusText}
         </span>
       </div>
 
@@ -505,7 +519,7 @@ export default function LivePage() {
                     className={`tag ${c.name === channelName ? 'active' : ''}`}
                     onClick={() => pickChannel(curGroup, c.name, 0, groups)}
                     onDoubleClick={() => openPrograms(c)}
-                    title="双击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
+                    title="double click for full EPG (standalone window)"
                   >
                     {c.name}
                   </span>
@@ -513,7 +527,7 @@ export default function LivePage() {
               </div>
               {lines.length > 1 && (
                 <div className="row" style={{ marginBottom: 8 }}>
-                  <span className="muted">线路：</span>
+                  <span className="muted">lines:</span>
                   {lines.map((l) => (
                     <span
                       key={l.index}
@@ -534,19 +548,19 @@ export default function LivePage() {
                   className="live-epg"
                   onClick={() => openPrograms(curChannel)}
                   style={{ cursor: 'pointer' }}
-                  title="点击查看完整节目单（独立窗口，可拖到屏幕任意位置）"
+                  title="click for full EPG (standalone window)"
                 >
                   {curEpg.current && (
                     <span className="live-epg-now">
-                      <b>正在播</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '（无标题）'}
+                      <b>now</b> {curEpg.current.start}~{curEpg.current.end} {curEpg.current.title || '(no title)'}
                     </span>
                   )}
                   {curEpg.next && (
                     <span className="muted">
-                      <b>下一档</b> {curEpg.next.start} {curEpg.next.title || '（无标题）'}
+                      <b>next</b> {curEpg.next.start} {curEpg.next.title || '(no title)'}
                     </span>
                   )}
-                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>📺</span>
+                  <span className="muted" style={{ marginLeft: 8, fontSize: 12 }}>TV</span>
                 </div>
               )}
 
@@ -560,7 +574,7 @@ export default function LivePage() {
                       onVideoError={handleVideoError}
                     />
                   ) : (
-                    <div className="empty" style={{ width: '100%', height: '100%' }}>加载中…</div>
+                    <div className="empty" style={{ width: '100%', height: '100%' }}>loading...</div>
                   )}
                   {reconnectMsg && (
                     <div
@@ -570,19 +584,4 @@ export default function LivePage() {
                         background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13,
                         pointerEvents: 'none', zIndex: 20,
                       }}
-                    >{reconnectMsg}</div>
-                  )}
-                </div>
-              ) : (
-                <div className="empty">无播放地址</div>
-              )}
-            </>
-          ) : (
-            <div className="empty">{groups.length ? '选择左侧分组' : '无直播（请先导入含 lives 的配置）'}</div>
-          )}
-        </div>
-      </div>
-      {/* ★ 2026-10-14：节目单弹窗已改为独立窗口（见 main/player/EpgWindow.ts + pages/EpgWinPage.tsx）*/}
-    </>
-  );
-}
+                    >{reconnectMsg

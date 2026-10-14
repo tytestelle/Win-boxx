@@ -373,7 +373,7 @@ jobs:
 
       # ==================================================================
       # 6. 校验 + dex2jar & SpiderRunner 独立验证
-      #    ★ dex2jar 验证：用 -h（--version 不存在），看输出而不是看退出码
+      #    ★ 结尾 exit 0：SpiderRunner 无参数运行会返回非 0，避免污染本步骤退出码
       # ==================================================================
       - name: Verify resources
         if: github.event.inputs.action != 'delete-only'
@@ -397,8 +397,6 @@ jobs:
           $jre = (Resolve-Path "resources/jvm/jre/bin/java.exe").Path
           $d2j = (Resolve-Path "resources/jvm/d2j").Path
 
-          # ---- 验证 dex2jar：用 -h（支持），看输出而不是看退出码 ----
-          #   dex2jar 的 usage 打到 stderr 且退出码非 0；只要出现 usage 关键字即证明类加载成功。
           Write-Host "`n=== 验证 dex2jar 类可加载 ==="
           $d2jOut = (& $jre -cp "$d2j\*" com.googlecode.dex2jar.tools.Dex2jarCmd -h 2>&1 | Out-String)
           if ($d2jOut -match "ClassNotFoundException|找不到或无法加载主类|Could not find or load main class|NoClassDefFoundError") {
@@ -411,7 +409,6 @@ jobs:
           }
           Write-Host "dex2jar OK"
 
-          # ---- 验证 SpiderRunner：看输出是否含「找不到主类」 ----
           Write-Host "`n=== 验证 SpiderRunner 类可加载 ==="
           $stubs = (Resolve-Path "resources/jvm/stubs/stubs.jar").Path
           $libs  = (Resolve-Path "resources/jvm/libs").Path
@@ -421,6 +418,10 @@ jobs:
             throw "SpiderRunner 类加载失败"
           }
           Write-Host "SpiderRunner OK"
+
+          # ★ SpiderRunner 无参数运行退出码非 0，会残留到 $LASTEXITCODE；
+          #   显式 exit 0 让本步骤整体算成功。
+          exit 0
 
       # ==================================================================
       # 7. 测试 & 构建

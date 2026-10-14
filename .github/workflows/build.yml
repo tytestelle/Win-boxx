@@ -34,6 +34,16 @@ on:
 permissions:
   contents: write
 
+# ==================================================================
+# 全局镜像加速配置（国内网络环境必需）
+# ==================================================================
+env:
+  GH_PROXY: "https://gh-proxy.com/"
+  GH_RAW: "https://gh-proxy.com/https://raw.githubusercontent.com"
+  # 备选镜像（若主镜像失效可切换）：
+  # GH_PROXY: "https://ghproxy.net/"
+  # GH_PROXY: "https://ghproxy.homeboyc.cn/"
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -138,7 +148,7 @@ jobs:
           }
 
       # ==================================================================
-      # 2. JRE
+      # 2. JRE 21（通过镜像加速下载）
       # ==================================================================
       - name: Prepare JRE
         if: github.event.inputs.action != 'delete-only'
@@ -168,7 +178,8 @@ jobs:
           & "$jreDir/bin/java.exe" -version
 
       # ==================================================================
-      # 3. dex2jar
+      # 3. dex2jar 完整工具链（通过镜像加速下载）
+      #    关键：下载完整 dex-tools 包，包含所有修复工具
       # ==================================================================
       - name: Prepare dex2jar
         if: github.event.inputs.action != 'delete-only'
@@ -180,10 +191,11 @@ jobs:
             Write-Host "✓ dex2jar 已存在：$($mainJar.Name)"
             exit 0
           }
-          Write-Host "⬇  从 GitHub Releases 下载 dex2jar v2.4"
+          Write-Host "⬇  从 GitHub Releases 下载 dex2jar v2.4（经镜像加速）"
           $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
           $extract = Join-Path $env:RUNNER_TEMP "dex-tools"
-          $url = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
+          $rawUrl = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
+          $url = "$env:GH_PROXY$rawUrl"
           $attempts = 0
           while ($attempts -lt 3) {
             $attempts++
@@ -193,19 +205,39 @@ jobs:
           if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
           Expand-Archive -Path $zip -DestinationPath $extract -Force
           $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+
           New-Item -ItemType Directory -Force -Path $d2j | Out-Null
+
+          # ★ 复制所有 jar（包括根目录和 lib 子目录）
           Get-ChildItem "$($inner.FullName)/*.jar" | Copy-Item -Destination $d2j -Force
           if (Test-Path "$($inner.FullName)/lib") {
             Get-ChildItem "$($inner.FullName)/lib/*.jar" | Copy-Item -Destination $d2j -Force
           }
+          # 复制 bat/sh 脚本（Windows 下 bat 是关键）
           Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
           Get-ChildItem "$($inner.FullName)/*.sh"  -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
+
+          # ★ 将 dex2jar 的全部运行时依赖复制到 libs/
+          #    这是修复 "DEX 构造器修复工具缺失" 的关键
           $libs = "resources/jvm/libs"
           New-Item -ItemType Directory -Force -Path $libs | Out-Null
-          Get-ChildItem $d2j -Filter "*.jar" | Copy-Item -Destination $libs -Force
+          $allJars = Get-ChildItem $d2j -Filter "*.jar" -Recurse -File
+          foreach ($jar in $allJars) {
+            Copy-Item $jar.FullName -Destination $libs -Force
+            Write-Host "  → libs/$(Split-Path $jar.FullName -Leaf)"
+          }
+
+          # 验证关键修复工具是否存在
+          $checkJars = @("d2j-dex-recompute-checksum*.jar", "d2j-dex2jar*.jar", "dex-reader*.jar", "dex-ir*.jar")
+          foreach ($pattern in $checkJars) {
+            $found = Get-ChildItem $d2j -Filter $pattern -Recurse -File | Select-Object -First 1
+            if ($found) { Write-Host "  ✓ $($found.Name)" }
+            else { Write-Warning "  ⚠ 未找到 $pattern" }
+          }
+          Write-Host "dex2jar 工具链准备完成"
 
       # ==================================================================
-      # 4. Maven 依赖
+      # 4. Maven 依赖（通过镜像加速下载）
       # ==================================================================
       - name: Prepare Maven deps
         if: github.event.inputs.action != 'delete-only'
@@ -237,8 +269,7 @@ jobs:
           }
 
       # ==================================================================
-      # 5. ★★★ Patch stubs-src：补两个缺失类 ★★★
-      #    （前几版漏了这步，导致 javac 失败）
+      # 5. Patch stubs-src：补两个缺失类
       # ==================================================================
       - name: Patch stubs-src
         if: github.event.inputs.action != 'delete-only'
@@ -372,7 +403,7 @@ jobs:
           Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
 
       # ==================================================================
-      # 7. 校验
+      # 7. 校验 resources 完整性
       # ==================================================================
       - name: Verify resources
         if: github.event.inputs.action != 'delete-only'
@@ -392,8 +423,31 @@ jobs:
           }
           if ($missing.Count -gt 0) { throw "缺失：$($missing -join ', ')" }
 
+          # ★ 额外校验：dex2jar 修复工具是否齐全
+          Write-Host "`n=== 校验 dex2jar 修复工具 ==="
+          $d2jChecks = @(
+            "d2j-dex2jar*.jar",
+            "d2j-dex-recompute-checksum*.jar",
+            "d2j-jar2dex*.jar",
+            "dex-reader*.jar",
+            "dex-ir*.jar",
+            "dex-translator*.jar"
+          )
+          $d2jMissing = @()
+          foreach ($pattern in $d2jChecks) {
+            $found = Get-ChildItem "resources/jvm/d2j" -Filter $pattern -Recurse -File | Select-Object -First 1
+            if ($found) { Write-Host "  ✓ $($found.Name)" }
+            else { $d2jMissing += $pattern; Write-Host "  ❌ 未找到 $pattern" }
+          }
+          if ($d2jMissing.Count -gt 0) {
+            Write-Warning "以下 dex2jar 工具缺失，DEX 修复可能失败：$($d2jMissing -join ', ')"
+          }
+
           Write-Host "`n=== resources/js-lib 内容 ==="
           Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
+
+          Write-Host "`n=== resources/jvm/libs 内容 ==="
+          Get-ChildItem "resources/jvm/libs" -File | Select-Object Name, Length | Format-Table -AutoSize
 
       # ==================================================================
       # 8. 测试 & 构建

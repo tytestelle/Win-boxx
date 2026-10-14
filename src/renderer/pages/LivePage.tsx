@@ -584,4 +584,18 @@ export default function LivePage() {
                         background: 'rgba(0,0,0,0.7)', color: '#ffb74d', fontSize: 13,
                         pointerEvents: 'none', zIndex: 20,
                       }}
-                    >{reconnectMsg
+                    >{reconnectMsg}</div>
+                  )}
+                </div>
+              ) : (
+                <div className="empty">no play url</div>
+              )}
+            </>
+          ) : (
+            <div className="empty">{groups.length ? 'select a group on the left' : 'no live (import a config with lives first)'}</div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}

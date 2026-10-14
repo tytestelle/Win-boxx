@@ -39,38 +39,6 @@ import type { Episode } from '../shared/types';
  */
 if (isDetailWindow() || isSearchWindow()) markHistoryOnlyWriter();
 
-/**
- * ★ 2026-10-14（用户要求）：判断本窗口是否为「子窗口」（非主窗口）。
- *
- * 为什么需要：主窗口点顶栏导航 → **新开独立窗口**；
- *   而独立窗口（详情 / 搜索 / 播放器 / EPG / 路由窗口）里点顶栏导航 → **正常切换自己的路由**（不再堆窗口）。
- *
- * 判定方式：
- *   1. hash 里有 `rw=1`（路由窗口）/ `dw=1`（详情）/ `sw=1`（搜索）/ `#/player` / `#/epg-window` → 子窗口；
- *   2. 首次判定结果写入 **sessionStorage**（每个 BrowserWindow 独立），
- *      防止用户在子窗口里切路由后 hash 里的标记丢失（如从 `#/home?rw=1` 切到 `#/history`）。
- */
-const IS_CHILD_WINDOW = (() => {
-  try {
-    const stored = sessionStorage.getItem('winbox-child-window');
-    if (stored === '1') return true;
-    if (stored === '0') return false;
-  } catch { /* ignore */ }
-  try {
-    const h = window.location.hash || '';
-    const child =
-      /[?&]rw=1\b/.test(h) ||
-      /[?&]dw=1\b/.test(h) ||
-      /[?&]sw=1\b/.test(h) ||
-      h.startsWith('#/player') ||
-      h.startsWith('#/epg-window');
-    sessionStorage.setItem('winbox-child-window', child ? '1' : '0');
-    return child;
-  } catch {
-    return false;
-  }
-})();
-
 const NAV = [
   // ★ 2026-09-24（用户定稿）：**发现放第一位，且打开软件默认进发现页**；「点播」= 源主页，移到 /home
   { to: '/', label: '发现', ico: '🧭', end: true },
@@ -172,12 +140,18 @@ function AppShell() {
   /**
    * ★ 2026-10-14（用户要求）：导航点击 → **独立新窗口**（多开），不影响当前窗口。
    *
-   *   · **主窗口**：新开 / 聚焦已开的目标路由窗口
-   *   · **独立窗口**（含详情 / 搜索 / 播放器 / EPG / 路由窗口）：正常路由切换，不再新开
-   *     （否则在独立窗口里点导航会无限堆窗口）
+   * ★★ 2026-10-14 修正（用户报「直播时点播，直播被干掉」）★★
+   *   上一版用 IS_CHILD_WINDOW + sessionStorage 判定「主窗口/子窗口」——
+   *   Electron 多窗口环境下 sessionStorage 疑似共享，导致主窗口被误判为子窗口
+   *   → handleNavClick 直接 return → NavLink 走默认行为 → **当前窗口路由被切换**
+   *   （表现就是：直播时点「点播」，直播被替换成 /home）。
+   *
+   *   现改为**所有窗口行为一致**：
+   *     · 点导航 → 主进程按路由去重（同路由已开则聚焦，未开则新建独立窗口）
+   *     · 当前窗口**始终不动**（直播继续播放）
+   *     · 当前路由 == 目标路由 → 忽略（避免无意义的聚焦）
    */
   const handleNavClick = (e: React.MouseEvent, route: string) => {
-    if (IS_CHILD_WINDOW) return; // 子窗口：交给 NavLink 自己走正常路由切换
     e.preventDefault();
     if (loc.pathname === route) return;
     void ipcInvoke('win:openRouteWindow', route).catch(() => undefined);

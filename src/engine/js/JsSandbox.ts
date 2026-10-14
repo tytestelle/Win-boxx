@@ -238,11 +238,25 @@ export class JsSandbox implements JsSandboxLike {
     this.ctx = vm.createContext(this.globals);
   }
 
-  /** 调用超时（任务书：首页/分类 20s，其它 15s；超时该次失败返回空，不销毁上下文） */
+  /**
+   * 调用超时（任务书：首页/分类 20s，其它 15s；超时该次失败返回空，不销毁上下文）
+   *
+   * ★ 2026-10-14 修复（腾讯源在 Win-Box 无法播放的根因）：
+   *   `hajim-腾讯备` 等 drpy 源的 `play` 方法需要**依次尝试 10 个第三方解析接口**（`parse_url`），
+   *   每个接口 `fetch(timeout: 10000)`。默认 15s 在第二个接口就超时 →
+   *   日志出现 `JS 蜘蛛调用超时（>15s）` → 整个 worker 被摘除 → 腾讯系源无法播放。
+   *   OK影视/安卓端能播，是因为它的 JS 引擎超时更宽松（通常 30-60s），能试到后面可用的接口。
+   *
+   *   修复策略：**只对 play/playerContent 方法**设 180s 下限，其它方法（home/category/detail/search）
+   *   保持原超时值不变 —— 避免影响首页/搜索的响应速度（健康调度仍按原有语义工作）。
+   */
   async callMethod(names: string[], args: unknown[], timeoutMs: number): Promise<unknown> {
     if (this.destroyed) return undefined;
     await this.ensureLoaded();
     if (!this.spider) return undefined;
+    // ★ play 类方法需要更长超时（见上方方法注释）
+    const isPlayMethod = names.some((n) => n === 'play' || n === 'playerContent');
+    const effectiveTimeoutMs = isPlayMethod ? Math.max(timeoutMs, 180_000) : timeoutMs;
     let fn: ((...a: unknown[]) => unknown) | null = null;
     let usedName = '';
     for (const n of names) {
@@ -264,7 +278,7 @@ export class JsSandbox implements JsSandboxLike {
       return await Promise.race([
         task,
         new Promise<never>((_, reject) => {
-          const t = setTimeout(() => reject(new Error(`调用超时(${timeoutMs}ms)`)), timeoutMs);
+          const t = setTimeout(() => reject(new Error(`调用超时(${effectiveTimeoutMs}ms)`)), effectiveTimeoutMs);
           (t as { unref?: () => void }).unref?.();
         }),
       ]);
@@ -347,7 +361,9 @@ export class JsSandbox implements JsSandboxLike {
     }
     const moduleObj = { exports: {} as Record<string, unknown> };
     const wrapper = `(function(module, exports, require, __filename){\n${cjs}\n})`;
-    const fn = vm.runInContext(wrapper, this.ctx as vm.Context, { filename: url, timeout: 15000 });
+    // ★ 2026-10-14：同步执行超时从 15s 放宽到 60s。drpy2 引擎在模块顶层做大量 eval/反射初始化，
+    //   大脚本在慢机器上 15s 可能不够；放宽后只影响「脚本首次加载」的失败判定，不影响调用超时。
+    const fn = vm.runInContext(wrapper, this.ctx as vm.Context, { filename: url, timeout: 60000 });
     (fn as (m: unknown, e: unknown, r: (p: string) => unknown, f: string) => void)(
       moduleObj,
       moduleObj.exports,
@@ -512,7 +528,8 @@ export class JsSandbox implements JsSandboxLike {
     }
     const moduleObj = { exports: {} as Record<string, unknown> };
     const wrapper = `(function(module, exports, require, __filename){\n${cjs}\n})`;
-    const fn = vm.runInContext(wrapper, this.ctx as vm.Context, { filename: url, timeout: 15000 });
+    // ★ 2026-10-14：同步执行超时同步放宽到 60s（与 runModule 一致）
+    const fn = vm.runInContext(wrapper, this.ctx as vm.Context, { filename: url, timeout: 60000 });
     (fn as (m: unknown, e: unknown, r: (p: string) => unknown, f: string) => void)(
       moduleObj,
       moduleObj.exports,

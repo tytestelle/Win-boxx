@@ -7,6 +7,9 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write   # ★ 发布 Release 需要写权限
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -143,7 +146,6 @@ jobs:
 
       # ==================================================================
       # 4. Patch stubs-src missing classes
-      #    （Mem 类型 = Map<String, SharedPreferences>）
       # ==================================================================
       - name: Patch stubs-src missing classes
         shell: bash
@@ -305,11 +307,65 @@ jobs:
       - name: Package with electron-builder
         run: npx electron-builder --win --publish never
 
+      # ==================================================================
+      # 8. ★ 从 package.json 读版本，生成 tag
+      # ==================================================================
+      - name: Get package version
+        id: pkg
+        shell: pwsh
+        run: |
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $v = $pkg.version
+          $tag = "v$v"
+          Write-Host "version = $v"
+          Write-Host "tag = $tag"
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "output_dir=release$v" >> $env:GITHUB_OUTPUT
+
+      # ==================================================================
+      # 9. 上传到 GitHub Actions Artifacts（临时，90 天有效）
+      # ==================================================================
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: win-box-installer
           path: |
-            release1.21.2/*.exe
-            release1.21.2/*.blockmap
-            release1.21.2/latest.yml
+            release${{ steps.pkg.outputs.version }}/*.exe
+            release${{ steps.pkg.outputs.version }}/*.blockmap
+            release${{ steps.pkg.outputs.version }}/latest.yml
+
+      # ==================================================================
+      # 10. ★ 上传到 GitHub Release 页面（长期可用，下载不走 Actions 中转，不易断流）
+      #     · 只在 push 到 main 分支时触发（PR / 手动运行不发 Release）
+      #     · 同 tag 已存在的 Release 会更新 assets（不会重复创建）
+      #     · 首次运行会自动创建 tag（用当前 commit）
+      # ==================================================================
+      - name: Upload to GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          name: Win-Box ${{ steps.pkg.outputs.tag }}
+          body: |
+            ## Win-Box ${{ steps.pkg.outputs.version }}
+
+            自动构建于 ${{ github.sha }}
+
+            ### 下载
+            - `Win-Box Setup ${{ steps.pkg.outputs.version }}.exe` —— Windows 安装包
+            - `latest.yml` / `*.blockmap` —— 自动更新清单
+
+            ### 构建来源
+            - 仓库：${{ github.repository }}
+            - 提交：${{ github.sha }}
+            - 工作流：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: |
+            release${{ steps.pkg.outputs.version }}/*.exe
+            release${{ steps.pkg.outputs.version }}/*.blockmap
+            release${{ steps.pkg.outputs.version }}/latest.yml
+          draft: false
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

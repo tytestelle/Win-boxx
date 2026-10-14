@@ -1,4 +1,4 @@
-// src/main/spider/SpiderHost.ts — engine host
+// src/main/spider/SpiderHost.ts — 引擎宿主：装配 EngineHost + 持有 SourceViewModel + 配置导入 + 直播加载 + 用户配置持久化
 import { HttpClient } from '../net/HttpClient';
 import { request as undiciRequest } from 'undici';
 import { JsonStore } from '../store/JsonStore';
@@ -16,6 +16,7 @@ import { parseSiteConfig, parseSiteConfigWithBase, looksLikeSubscribeJson, type 
 import { parseMultiRepo, isFetchedRepoUrl, repoDisplayName, pickRepoLine, splitRepoLine, type MultiRepo } from '../../engine/config/multiRepo';
 import { SourceViewModel } from '../../engine/vod/SourceViewModel';
 import { parseToJsonArray, toLiveGroups } from '../../engine/live/TxtSubscribe';
+// ★ 2026-10-13 EPG：改用 TVBox 风格 EpgManager（替代原 epg.ts + EpgStore）
 import { EpgManager, type EpgProgram } from '../live/EpgManager';
 import type { BackupSettingsState } from '../../shared/backup';
 import type {
@@ -132,6 +133,7 @@ import { ParseService } from '../parse/ParseService';
 import { sniffMediaUrl } from '../parse/PageSniffer';
 import { getProxySettings, jvmProxyArgs, childProxyEnv } from '../net/proxy';
 
+/** 豆瓣兜底最多尝试的名称变体数 */
 const DOUBAN_MAX_VARIANTS = 2;
 
 const SEARCH_ALL_WORKERS = 10;
@@ -140,7 +142,7 @@ const SEARCH_ALL_BUDGET_MS = 40_000;
 const SEARCH_ALL_SOURCE_MAX_MS = 10_000;
 const SEARCH_ALL_JS_MAX_MS = 5_000;
 const SEARCH_ALL_QUICK_MS = 3_000;
-const UNSUPPORTED_ERR = /UNSUPPORTED_|SCRIPT_ERROR|PY_UNSUPPORTED|desktop unsupported|unsupported|not implemented/i;
+const UNSUPPORTED_ERR = /UNSUPPORTED_|SCRIPT_ERROR|PY_UNSUPPORTED|桌面版无法|不支持|未实现/i;
 const SEARCH_ALL_PREPARE_MS = 12_000;
 
 const DEFAULT_EPG_URL =
@@ -231,11 +233,15 @@ export class SpiderHost {
   private config: SiteConfig | null = null;
   private report: ImportReport | null = null;
   private sourceMap = new Map<string, SourceBean>();
-  // 2026-10-14: live source load cache (URL -> parsed groups + timestamp).
-  // Avoids re-fetching local /file/local-live/ URLs and re-parsing on every page entry.
+  // ★ 2026-10-14：直播源加载缓存（URL → 分组结果 + 时间戳）
+  //   用户反馈「导入本地直播源后，进直播页加载慢」：旧 loadLive 每次都走
+  //   this.http.request(本机 127.0.0.1:9978/file/local-live/xxx) 付一遍本机 HTTP 往返，
+  //   再重新解析（大 IPTV 源几万频道解析 2-5s）。现在：本机路由直接 readFileSync 绕过 HTTP；
+  //   5 分钟内存缓存；导入后由 IPC 层预热（host.preloadLive）→ 用户切到直播页时缓存已就绪，秒开。
   private liveCache = new Map<string, { at: number; result: LiveLoadResult }>();
   private static readonly LIVE_CACHE_TTL_MS = 5 * 60_000;
   private lastSpiderJar = '';
+  /** ★ 2026-10-13 EPG：TVBox 风格 EpgManager（懒创建；含 epg_data.json 变体名映射 + XMLTV 按需解析） */
   private epgMgr: EpgManager | null = null;
   private sourceHealth = new Map<string, SourceStat>();
   private unsupportedSources = new Set<string>();
@@ -321,7 +327,7 @@ export class SpiderHost {
       this.driveBindStore.setObject('list', [...this.driveBindKeys]);
       this.driveBindStore.flush();
     } catch (e) {
-      this.logger.w(`drive-bind persist failed: ${(e as Error).message}`);
+      this.logger.w(`drive-bind 学习结果落盘失败: ${(e as Error).message}`);
     }
   }
 
@@ -363,6 +369,7 @@ export class SpiderHost {
     return this.engineHost;
   }
 
+  // ---------------------------- 用户配置管理 ----------------------------
   cfgSnapshot(): UserConfig {
     return this.manager.snapshot();
   }
@@ -373,13 +380,13 @@ export class SpiderHost {
       const after = this.localPkgs?.migrateConfig?.(before, message => this.logger.w(message));
       if (after && JSON.stringify(after) !== JSON.stringify(before)) this.manager.restore(after);
     } catch (e) {
-      this.logger.w(`local imports migration failed (original preserved): ${(e as Error).message}`);
+      this.logger.w(`本地导入副本迁移失败（原文件保留）：${(e as Error).message}`);
     }
   }
 
   private cleanupLocalImports(before: UserConfig): void {
     try { this.localPkgs?.cleanupRemoved?.(before, this.manager.snapshot()); }
-    catch (e) { this.logger.w(`local imports cleanup failed: ${(e as Error).message}`); }
+    catch (e) { this.logger.w(`本地导入副本清理失败：${(e as Error).message}`); }
   }
 
   cfgAddSource(raw: SourceBean): SourceBean {
@@ -463,7 +470,7 @@ export class SpiderHost {
         const t0 = Date.now();
         const kind = kindOf(b);
         try {
-          const r = await raceTimeout(this.vm.home(b), 30000, 'home timeout (>30s)');
+          const r = await raceTimeout(this.vm.home(b), 30000, '主页加载超时（>30s）');
           const h = classifyHealth({ kind, items: r.items.length, classes: r.sortClasses.length, extEmpty: !String(b.ext || '').trim() });
           out.push({
             key: b.key, name: b.name || b.key, type: b.type, kind,
@@ -494,8 +501,9 @@ export class SpiderHost {
       .map((p) => ({ name: p.name, json: p.json || '' }));
     const out = buildMergedSubscription(chosen);
     this.logger.i(
-      `merge export: profiles=${out.summary.length} sites=${out.summary.reduce((n, s) => n + s.sites.length, 0)} ` +
-        `spiders=${out.spiders.length ? out.spiders.length : 0} flags=${out.flags.length} parses=${out.parseCount}`,
+      `合并导出：档案 ${out.summary.length} 份 / 源 ${out.summary.reduce((n, s) => n + s.sites.length, 0)} 条；` +
+        `spider ${out.spiders.length ? out.spiders.length + ' 只（多 jar 源已按源回填）' : '无'}；` +
+        `flags ${out.flags.length}；parses ${out.parseCount}`,
     );
     return { content: out.content, summary: out.summary };
   }
@@ -533,17 +541,17 @@ export class SpiderHost {
   }
   async subtitleSearch(resourceName: string): Promise<SubtitleSearchReport> {
     const ctx = this.subtitleContext(resourceName);
-    if (!ctx.keywords.length) throw new Error('cannot extract title from resource name');
+    if (!ctx.keywords.length) throw new Error('无法从该资源名提取剧名');
     const report = await searchSubtitles(ctx);
     for (const p of report.providers) {
       this.logger.w(
-        `subtitle ${p.id}: ${p.ok ? `hit ${p.count}` : p.skipped ? 'skipped' : 'failed'}${p.reason ? ' - ' + p.reason : ''}`,
+        `字幕源 ${p.id}：${p.ok ? `命中 ${p.count}` : p.skipped ? '跳过' : '失败'}${p.reason ? ' — ' + p.reason : ''}`,
       );
     }
     return report;
   }
   async subtitleFetch(candidate: SubtitleCandidate): Promise<SubtitleFetchResult> {
-    if (!candidate || !candidate.file) return { text: '', fileName: '', reason: 'subtitle candidate missing download id' };
+    if (!candidate || !candidate.file) return { text: '', fileName: '', reason: '字幕候选缺少下载标识' };
     return fetchSubtitle(candidate, this.subtitleContext(candidate.subname || ''));
   }
 
@@ -558,7 +566,7 @@ export class SpiderHost {
   }
   private danmakuEndpointName(url: string): string {
     const hit = (this.danmakuStore.settings.endpoints || []).find((e) => e.url === url);
-    return (hit?.name || '').trim() || endpointLabel(url) || 'external';
+    return (hit?.name || '').trim() || endpointLabel(url) || '外部接口';
   }
 
   async danmakuSearch(keyword: string, season?: number): Promise<DanmakuAnime[]> {
@@ -574,7 +582,7 @@ export class SpiderHost {
         return list;
       } catch (err) {
         this.danmakuHealth.markFail(e.url);
-        this.logger.w(`danmaku endpoint failed "${e.name}": ${(err as Error).message}`);
+        this.logger.w(`danmaku:接口失败「${e.name}」${(err as Error).message}`);
         return [];
       }
     });
@@ -588,7 +596,7 @@ export class SpiderHost {
       return true;
     });
     this.logger.i(
-      `danmaku search "${kw}": ${live.length} endpoints (${all.length - live.length} cooling); ${limited.length} hits / ${perSource.size} sources; ${Date.now() - t0}ms`,
+      `弹幕搜索「${kw}」：外部${live.length}源（跳过冷却${all.length - live.length}）；命中${limited.length}部/来自${perSource.size}个来源；${Date.now() - t0}ms`,
     );
     return limited.slice(0, 60);
   }
@@ -600,7 +608,7 @@ export class SpiderHost {
       return list;
     } catch (e) {
       this.danmakuHealth.markFail(source);
-      this.logger.w(`danmaku episodes failed "${this.danmakuEndpointName(source)}": ${(e as Error).message}`);
+      this.logger.w(`danmaku:剧集失败「${this.danmakuEndpointName(source)}」${(e as Error).message}`);
       return [];
     }
   }
@@ -615,7 +623,7 @@ export class SpiderHost {
       this.danmakuHealth.markOk(source);
     } catch (e) {
       this.danmakuHealth.markFail(source);
-      this.logger.w(`danmaku fetch failed "${this.danmakuEndpointName(source)}": ${(e as Error).message}`);
+      this.logger.w(`danmaku:弹幕失败「${this.danmakuEndpointName(source)}」${(e as Error).message}`);
       return '';
     }
     if (xml) {
@@ -642,7 +650,7 @@ export class SpiderHost {
     const next = normalizeMetaSettings({ ...this.metaSettings.settings, ...patch });
     this.metaSettings.settings = next;
     this.applyMetaRuntime();
-    this.logger.i(`meta: source=${next.metaSource}; user key=${next.tmdbApiKey ? 'set' : 'unset'}; proxy=${next.tmdbApiBase || 'default'}; image=${next.tmdbImageBase || 'default'}`);
+    this.logger.i(`meta: 来源策略=${next.metaSource}；用户 Key=${next.tmdbApiKey ? '已配置' : '未配置'}；代理=${next.tmdbApiBase || '默认'}；图床=${next.tmdbImageBase || '默认'}`);
     return this.metaGetSettings();
   }
 
@@ -650,7 +658,7 @@ export class SpiderHost {
     try {
       return await tmdbImages(this.logger, mediaType, tmdbId);
     } catch (e) {
-      this.logger.w(`meta images failed: ${(e as Error).message}`);
+      this.logger.w(`meta:剧照查询失败: ${(e as Error).message}`);
       return { backdrops: [], posters: [] };
     }
   }
@@ -690,12 +698,12 @@ export class SpiderHost {
         try {
           const hit = await tmdbSearchTitle(this.metaStore, this.logger, n, year || undefined);
           if (hit) return hit;
-        } catch { /* fall through to douban */ }
+        } catch { /* TMDB 不可用仍允许回退到豆瓣 */ }
       }
       if (provider === 'tmdb') return null;
       return await this.doubanLookup(n, year);
     } catch (e) {
-      this.logger.e('meta search failed', e);
+      this.logger.e('meta:搜索失败', e);
       return null;
     }
   }
@@ -707,7 +715,7 @@ export class SpiderHost {
     try {
       return await tmdbExtras(this.metaStore, this.logger, n, year || undefined);
     } catch (e) {
-      this.logger.w(`meta extras failed: ${(e as Error).message}`);
+      this.logger.w(`meta:详情增强查询失败: ${(e as Error).message}`);
       return null;
     }
   }
@@ -716,7 +724,7 @@ export class SpiderHost {
     try {
       return hasUserTmdbKey() ? await tmdbDiscover(this.logger, !!refresh) : await this.domesticDiscover.discover(!!refresh);
     } catch (e) {
-      this.logger.w(`meta discover failed: ${(e as Error).message}`);
+      this.logger.w(`meta:发现页查询失败: ${(e as Error).message}`);
       return [];
     }
   }
@@ -725,7 +733,7 @@ export class SpiderHost {
     try {
       return hasUserTmdbKey() ? await tmdbGenres(this.logger) : this.domesticDiscover.genres();
     } catch (e) {
-      this.logger.w(`meta genres failed: ${(e as Error).message}`);
+      this.logger.w(`meta:类型清单查询失败: ${(e as Error).message}`);
       return { movie: [], tv: [] };
     }
   }
@@ -737,7 +745,7 @@ export class SpiderHost {
         ? await tmdbGenrePage(this.logger, t, Number(genreId) || 0, Number(page) || 1)
         : await this.domesticDiscover.genrePage(t, Number(genreId) || 0, Number(page) || 1);
     } catch (e) {
-      this.logger.w(`meta genre page failed: ${(e as Error).message}`);
+      this.logger.w(`meta:分类查询失败: ${(e as Error).message}`);
       return { items: [], page: 1, totalPages: 1 };
     }
   }
@@ -763,7 +771,7 @@ export class SpiderHost {
           const images = await tmdbImages(this.logger, hit.type, hit.tmdbId);
           if (images.backdrops.length) return images;
         }
-      } catch { /* fall through */ }
+      } catch { /* 背景图仍可独立使用横版图片搜索 */ }
     }
     return this.discoverArtwork.images(name, mediaType, year, kind);
   }
@@ -783,7 +791,7 @@ export class SpiderHost {
           if (!ok) ok = await del(item.cookie, item.pdirFid, item.fid, this.logger);
         }
         if (ok) {
-          this.logger.i(`quark delete ok fid=${item.fid.slice(0, 8)}...` + (item.dirFid ? ` dir=${item.dirFid.slice(0, 8)}...` : '') + (item.path ? ` path=${item.path}` : ''));
+          this.logger.i(`quark 已删除落盘文件 fid=${item.fid.slice(0, 8)}...` + (item.dirFid ? ` dir=${item.dirFid.slice(0, 8)}...` : '') + (item.path ? ` path=${item.path}` : ''));
         } else {
           remain.push(item);
         }
@@ -800,7 +808,7 @@ export class SpiderHost {
       this.pendingQuarkStore.setObject('list', this.pendingQuarkDeletes);
       this.pendingQuarkStore.flush();
     } catch {
-      /* ignore */
+      /* 落盘失败不影响播放 */
     }
   }
 
@@ -825,7 +833,7 @@ export class SpiderHost {
       (jvmPort && String(pan.site || '').toLowerCase().startsWith('baidu') && /^\d+$/.test(fid)
         ? await this.baiduContextFromJvm(jvmPort, fid) : null);
     if (sharedFile) {
-      if (!cookie) { miss?.push('baidu: share file detected but no cookie'); return null; }
+      if (!cookie) { miss?.push('百度：已识别分享文件但未绑定百度网盘 Cookie'); return null; }
       try {
         const t = await baiduResolveSharedFile(sharedFile, cookie, fileLogger);
         if (t.path) {
@@ -833,9 +841,9 @@ export class SpiderHost {
           if (this.pendingQuarkDeletes.length > 200) this.pendingQuarkDeletes.shift();
           this.persistPendingQuark();
         }
-        if (!t.ok || !t.url) { miss?.push(`baidu: resolve failed (${t.reason || 'unknown'})`); return null; }
+        if (!t.ok || !t.url) { miss?.push(`百度：解链失败(${t.reason || '未知原因'})`); return null; }
         return { parse: 0, url: wrapPlayUrlWithHeaders(t.url, t.header), playUrl: '', flag, header: t.header, jx: 0 };
-      } catch (e) { miss?.push(`baidu: exception (${(e as Error).message.slice(0, 80)})`); return null; }
+      } catch (e) { miss?.push(`百度：异常(${(e as Error).message.slice(0, 80)})`); return null; }
     }
     if (!share) {
       const site = String(pan.site || '').toLowerCase();
@@ -843,17 +851,17 @@ export class SpiderHost {
         return null;
       }
       if (!cookie) {
-        miss?.push('baidu: fs_id detected but no cookie');
+        miss?.push('百度：已识别文件 ID（fs_id）但未绑定百度网盘 Cookie');
         return null;
       }
       try {
         const d = await baiduDirectLinkByFsid(fid, cookie, fileLogger);
         if (!d.ok || !d.url) {
-          fileLogger.w(`baiduTransfer(fs_id) failed (${d.reason || 'unknown'})`);
-          miss?.push(`baidu: resolve failed (${d.reason || 'unknown'})`);
+          fileLogger.w(`baiduTransfer(fs_id) 未成功(${d.reason || '未知原因'})`);
+          miss?.push(`百度：解链失败(${d.reason || '未知原因'})`);
           return null;
         }
-        fileLogger.i('baiduTransfer(fs_id) direct link ok');
+        fileLogger.i('baiduTransfer(fs_id) 直链 ok');
         return {
           parse: 0,
           url: wrapPlayUrlWithHeaders(d.url, d.header || {}),
@@ -863,13 +871,13 @@ export class SpiderHost {
           jx: 0,
         };
       } catch (e) {
-        fileLogger.w(`baiduTransfer(fs_id) exception: ${(e as Error).message}`);
-        miss?.push(`baidu: exception (${(e as Error).message.slice(0, 80)})`);
+        fileLogger.w(`baiduTransfer(fs_id) 异常: ${(e as Error).message}`);
+        miss?.push(`百度：异常(${(e as Error).message.slice(0, 80)})`);
         return null;
       }
     }
     if (!cookie) {
-      miss?.push('baidu: share detected but no cookie');
+      miss?.push('百度：已识别分享但未绑定百度网盘 Cookie');
       return null;
     }
     try {
@@ -884,11 +892,11 @@ export class SpiderHost {
         this.persistPendingQuark();
       }
       if (!t.ok || !t.url) {
-        fileLogger.w(`baiduTransfer(do=pan) failed (${t.reason || 'unknown'})`);
-        miss?.push(`baidu: resolve failed (${t.reason || 'unknown'})`);
+        fileLogger.w(`baiduTransfer(do=pan) 未成功(${t.reason || '未知原因'})`);
+        miss?.push(`百度：解链失败(${t.reason || '未知原因'})`);
         return null;
       }
-      fileLogger.i(`baiduTransfer(do=pan) direct link ok (${t.path || ''})`);
+      fileLogger.i(`baiduTransfer(do=pan) 直链 ok（${t.path || ''}）`);
       return {
         parse: 0,
         url: wrapPlayUrlWithHeaders(t.url, t.header || {}),
@@ -898,8 +906,8 @@ export class SpiderHost {
         jx: 0,
       };
     } catch (e) {
-      fileLogger.w(`baiduTransfer(do=pan) exception: ${(e as Error).message}`);
-      miss?.push(`baidu: exception (${(e as Error).message.slice(0, 80)})`);
+      fileLogger.w(`baiduTransfer(do=pan) 异常: ${(e as Error).message}`);
+      miss?.push(`百度：异常(${(e as Error).message.slice(0, 80)})`);
       return null;
     }
   }
@@ -914,7 +922,7 @@ export class SpiderHost {
     }
     const cookie = (this.driveList() as Record<string, string>)['uc'] || '';
     if (!cookie) {
-      miss?.push('uc: share detected but no cookie');
+      miss?.push('UC：已识别分享但未绑定 UC 网盘 Cookie');
       return null;
     }
     try {
@@ -925,8 +933,8 @@ export class SpiderHost {
         logger: fileLogger,
       });
       if (!t.ok || !t.url) {
-        fileLogger.w(`ucTransfer(do=pan) failed (${t.reason || 'unknown'})`);
-        miss?.push(`uc: resolve failed (${t.reason || 'unknown'})`);
+        fileLogger.w(`ucTransfer(do=pan) 未成功(${t.reason || '未知原因'})`);
+        miss?.push(`UC：解链失败(${t.reason || '未知原因'})`);
         return null;
       }
       if (t.fid) {
@@ -934,7 +942,7 @@ export class SpiderHost {
         if (this.pendingQuarkDeletes.length > 200) this.pendingQuarkDeletes.shift();
         this.persistPendingQuark();
       }
-      fileLogger.i('ucTransfer(do=pan) ok');
+      fileLogger.i('ucTransfer(do=pan) 取链成功');
       return {
         parse: 0,
         url: wrapPlayUrlWithHeaders(t.url, t.header || {}),
@@ -944,8 +952,8 @@ export class SpiderHost {
         jx: 0,
       };
     } catch (e) {
-      fileLogger.w(`ucTransfer(do=pan) exception: ${(e as Error).message}`);
-      miss?.push(`uc: exception (${(e as Error).message.slice(0, 80)})`);
+      fileLogger.w(`ucTransfer(do=pan) 异常: ${(e as Error).message}`);
+      miss?.push(`UC：异常(${(e as Error).message.slice(0, 80)})`);
       return null;
     }
   }
@@ -968,7 +976,7 @@ export class SpiderHost {
     }
     const cookie = (this.driveList() as Record<string, string>)['quark'] || '';
     if (!cookie) {
-      miss?.push('quark: share detected but no cookie');
+      miss?.push('夸克：已识别分享但未绑定夸克网盘 Cookie');
       return null;
     }
     try {
@@ -979,8 +987,8 @@ export class SpiderHost {
         logger: fileLogger,
       });
       if (!t.ok || !t.url) {
-        fileLogger.w(`quarkTransfer(do=pan) failed (${t.reason || 'unknown'})`);
-        miss?.push(`quark: resolve failed (${t.reason || 'unknown'})`);
+        fileLogger.w(`quarkTransfer(do=pan) 未成功(${t.reason || '未知原因'})`);
+        miss?.push(`夸克：解链失败(${t.reason || '未知原因'})`);
         return null;
       }
       if (t.fid) {
@@ -988,7 +996,7 @@ export class SpiderHost {
         if (this.pendingQuarkDeletes.length > 200) this.pendingQuarkDeletes.shift();
         this.persistPendingQuark();
       }
-      fileLogger.i(`quarkTransfer(do=pan) direct link ok: ${t.url.slice(0, 90)}...`);
+      fileLogger.i(`quarkTransfer(do=pan) 直链 ok: ${t.url.slice(0, 90)}...`);
       return {
         parse: 0,
         url: wrapPlayUrlWithHeaders(t.url, t.header || {}),
@@ -998,8 +1006,8 @@ export class SpiderHost {
         jx: 0,
       };
     } catch (e) {
-      fileLogger.w(`quarkTransfer(do=pan) exception: ${(e as Error).message}`);
-      miss?.push(`quark: exception (${(e as Error).message.slice(0, 80)})`);
+      fileLogger.w(`quarkTransfer(do=pan) 异常: ${(e as Error).message}`);
+      miss?.push(`夸克：异常(${(e as Error).message.slice(0, 80)})`);
       return null;
     }
   }
@@ -1015,10 +1023,10 @@ export class SpiderHost {
     const p = (provider || 'quark').trim().toLowerCase();
     const r = await runDriveWebLogin(p, this.logger);
     if (!r.done) {
-      throw new Error(`${p}: login not detected (complete the QR authorization and keep the window open); no changes saved`);
+      throw new Error(`${p}: 未检测到登录完成（请完成扫码授权，期间勿关闭登录窗口）；未保存任何变更`);
     }
     if (!r.cookie.trim()) {
-      throw new Error(`${p}: login detected but cookie not captured, retry`);
+      throw new Error(`${p}: 已检测到登录，但未抓到 Cookie，请重试`);
     }
     this.drives.set(p, r.cookie);
     this.syncDriveFiles();
@@ -1029,15 +1037,15 @@ export class SpiderHost {
     const tokens = this.drives.list();
     this.syncCloudDriveConfig(tokens);
     const written = syncPizazzCookieFiles(tokens);
-    if (written.length) this.logger.i(`pizazz cookie files synced: ${written.join(', ')}`);
+    if (written.length) this.logger.i(`已同步 Pizazz 系网盘 cookie 文件：${written.join(', ')}`);
     const sandbox = spiderSandboxDir(spiderCacheDir());
     const wexWritten = syncWexCookieFiles(tokens, sandbox);
     if (wexWritten.length) {
       const ucPath = wexWritten.find((p) => p.endsWith('.ucpancookie'));
       const ucLen = ucPath ? readFileSync(ucPath, 'utf-8').trim().length : 0;
-      this.logger.i(`wex cookie files synced: ${wexWritten.join(', ')} (sandbox=${sandbox}, ucLen=${ucLen})`);
+      this.logger.i(`已同步 wex 系网盘 cookie 文件：${wexWritten.join(', ')}（sandbox=${sandbox}, ucLen=${ucLen}）`);
     } else if (tokens.uc) {
-      this.logger.w(`wex UC cookie not written (sandbox=${sandbox}, ucLen=${tokens.uc.trim().length})`);
+      this.logger.w(`wex UC cookie 未写入（sandbox=${sandbox}, ucLen=${tokens.uc.trim().length}）`);
     }
   }
 
@@ -1049,14 +1057,14 @@ export class SpiderHost {
         const parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown;
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) obj = parsed as Record<string, unknown>;
       }
-    } catch { /* ignore */ }
+    } catch { /* 首次/损坏 → 重建 */ }
     obj = mergeCloudDriveTokens(obj, tokens);
     try {
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, JSON.stringify(obj), 'utf-8');
-      this.logger.i(`Cloud-drive config synced -> ${path}`);
+      this.logger.i(`已同步 Cloud-drive 配置 -> ${path}`);
     } catch (e) {
-      this.logger.w(`Cloud-drive config write failed: ${(e as Error).message}`);
+      this.logger.w(`写入 Cloud-drive 配置失败: ${(e as Error).message}`);
     }
   }
 
@@ -1070,18 +1078,18 @@ export class SpiderHost {
           try {
             const parsed = new URL(rel);
             if (parsed.pathname.startsWith('/file/')) rel = decodeURIComponent(parsed.pathname.slice('/file/'.length));
-          } catch { /* ignore */ }
+          } catch { /* Relative Cloud-drive paths are the normal configuration form. */ }
           rel = rel.replace(/^\/+/, '');
           return join(userDataDir(), rel);
         }
-      } catch { /* ignore */ }
+      } catch { /* ext 非 JSON，跳过 */ }
     }
     return join(userDataDir(), 'tvfan', 'Cloud-drive.txt');
   }
 
   async debug(key: string) {
     const b = this.getSource(key);
-    if (!b) throw new Error(`source missing: ${key}`);
+    if (!b) throw new Error(`源不存在: ${key}`);
     const { sourceDebug } = await import('./SourceDebugger');
     const runHome = async (k: string) => {
       const t0 = Date.now();
@@ -1114,7 +1122,7 @@ export class SpiderHost {
     if (source.url) {
       text = await this.fetchConfigText(fetchUrl);
     }
-    const hint = (): string => (this.lastConfigFetchHint ? ` | diagnose: ${this.lastConfigFetchHint}` : '');
+    const hint = (): string => (this.lastConfigFetchHint ? `｜诊断：${this.lastConfigFetchHint}` : '');
     const multi = parseMultiRepo(text);
     if (multi) {
       return this.importMultiRepo(multi, snapshot, source.name, sub.line);
@@ -1126,7 +1134,7 @@ export class SpiderHost {
       throw new Error(`${(e as Error).message}${hint()}`);
     }
     if (!result.config.sites.length && !result.config.lives.length && !result.config.parses.length) {
-      throw new Error('no usable source in this subscription (maybe unrecognized multi-repo format, or expired); original config preserved' + hint());
+      throw new Error('该订阅里没有任何可用的源（可能是未识别的「多仓」格式，或订阅本身已失效）；已保留原配置不变' + hint());
     }
     this.report = result.report;
     this.config = result.config;
@@ -1143,8 +1151,8 @@ export class SpiderHost {
       const sameRemote = !!apiUrl && snap.apiUrl === apiUrl;
       if (hasOld && !sameRemote) {
         const stamp = subscriptionStamp();
-        this.manager.renameActiveProfileAsOld(`old subscription ${stamp}`);
-        this.manager.saveAsProfile(custom || `new subscription ${stamp}`, { parsed, apiUrl });
+        this.manager.renameActiveProfileAsOld(`旧订阅 ${stamp}`);
+        this.manager.saveAsProfile(custom || `新订阅 ${stamp}`, { parsed, apiUrl });
         return;
       }
     }
@@ -1162,11 +1170,11 @@ export class SpiderHost {
       const got = this.localPkgs?.readSubscription(pkgRef.index, pkgRef.rel);
       if (!got) {
         this.lastConfigFetchHint =
-          'local package not registered or subscription file missing (package moved/deleted?) - re-import the local package from the config page.';
+          '本地包未登记或包内订阅文件已不存在（包目录被移动/删除？）—— 请在配置页重新「导入本地包」。';
         return '';
       }
-      for (const w of got.warnings) this.logger.w(`local package: ${w}`);
-      this.logger.i(`local package subscription read: ${url} -> ${got.text.length}B`);
+      for (const w of got.warnings) this.logger.w(`本地包：${w}`);
+      this.logger.i(`本地包订阅读取：${url} → ${got.text.length}B`);
       return got.text;
     }
     const timeoutMs = quick ? 12_000 : 30_000;
@@ -1179,18 +1187,18 @@ export class SpiderHost {
       onTry: (t) => {
         const feat = [t.status ? `HTTP ${t.status}` : '', t.sniff ? `${t.sniff.kind} ${t.sniff.size}B` : '', t.reason || '']
           .filter(Boolean)
-          .join(' . ');
-        this.logger.i(`subscription try "${t.label}" ${t.ok ? 'hit' : 'miss'}: ${feat} <- ${t.url}`);
+          .join(' · ');
+        this.logger.i(`订阅尝试「${t.label}」${t.ok ? '命中' : '未命中'}：${feat} ← ${t.url}`);
       },
     });
     if (res.buf) {
-      if (res.used && res.used.label !== 'default UA') this.logger.i(`subscription via "${res.used.label}": ${url}`);
-      if (res.altUrl) this.logger.i(`subscription via alt url (${res.altUrl}): ${url}`);
+      if (res.used && res.used.label !== '默认 UA') this.logger.i(`订阅按「${res.used.label}」取到内容：${url}`);
+      if (res.altUrl) this.logger.i(`订阅换协议后取到内容（${res.altUrl}）：${url}`);
       return res.buf.toString('utf-8');
     }
     const stego = res.last ? extractStegoConfig(res.last) : null;
     if (stego) {
-      this.logger.i(`subscription stego config extracted (${stego.kind}, tail ${stego.offset}, ${stego.text.length}B): ${url}`);
+      this.logger.i(`订阅图片尾部隐写：已提取配置（${stego.kind}，尾段 ${stego.offset} 起，${stego.text.length}B）：${url}`);
       return stego.text;
     }
     const raw = res.last ? res.last.toString('utf-8') : '';
@@ -1200,10 +1208,10 @@ export class SpiderHost {
     const image = res.last ? looksLikeImage(res.last) : false;
     const sn = res.last ? sniffBody(res.last) : null;
     this.lastConfigFetchHint =
-      (encrypted ? 'response looks encrypted. ' : '') +
-      (image ? 'response is an image (stego config not extracted). ' : '') +
-      (sn ? `last response ${sn.kind} (${sn.size}B)${sn.head ? `, head="${sn.head.slice(0, 60)}"` : ''}. ` : 'no response body. ') +
-      `tried: ${describeFailures(res.tries)}`;
+      (encrypted ? '该地址返回的内容疑似**加密配置**（普通客户端无法直接使用）。' : '') +
+      (image ? '该地址返回的是**图片**（疑似图片尾部隐写，但未从中提取到配置）。' : '') +
+      (sn ? `最后响应为 ${sn.kind}（${sn.size}B）${sn.head ? `，开头是「${sn.head.slice(0, 60)}」` : ''}。` : '所有尝试都没有拿到响应体。') +
+      `已尝试：${describeFailures(res.tries)}`;
     return raw;
   }
 
@@ -1214,38 +1222,38 @@ export class SpiderHost {
       const picked = pickRepoLine(multi.items, preferLine)!;
       const label = repoDisplayName(picked.item.url, picked.item.name);
       const lineNo = picked.index + 1;
-      const clampedNote = picked.index !== preferLine ? ` (#line=${preferLine} out of range, total ${total}, used last)` : '';
+      const clampedNote = picked.index !== preferLine ? `（#line=${preferLine} 超出范围，共 ${total} 条，已取末条）` : '';
       if (!isFetchedRepoUrl(picked.item.url)) {
-        const why = /^clan:/i.test(picked.item.url) ? 'local directory repo (clan://) not supported on desktop' : 'unsupported protocol';
-        throw new Error(`multi-repo line ${lineNo} "${label}" unavailable: ${why}${clampedNote}`);
+        const why = /^clan:/i.test(picked.item.url) ? '本地目录仓（clan://）桌面版不可用' : '不支持的协议';
+        throw new Error(`多仓第 ${lineNo} 条线路「${label}」不可用：${why}${clampedNote}`);
       }
       try {
         const text = await this.fetchConfigText(picked.item.url);
         const result = parseSiteConfigWithBase(text, picked.item.url);
-        if (!result.config.sites.length && !result.config.lives.length) throw new Error('empty/not a subscription');
+        if (!result.config.sites.length && !result.config.lives.length) throw new Error('内容为空/非订阅配置');
         this.report = result.report;
         this.config = result.config;
         this.applyConfig(result.config);
         this.applyImportedConfig(result.config, picked.item.url, snapshot, name);
-        const note = `imported multi-repo line ${lineNo}/${total} "${label}" per #line=${preferLine}${clampedNote}${this.lastConfigFetchHint ? ` | diagnose: ${this.lastConfigFetchHint}` : ''}`;
+        const note = `已按地址指定的 #line=${preferLine} 导入多仓第 ${lineNo}/${total} 条线路「${label}」${clampedNote}${this.lastConfigFetchHint ? `｜诊断：${this.lastConfigFetchHint}` : ''}`;
         this.logger.i('multi-repo(line): ' + note);
         return { ...result, warnings: [...(result.warnings || []), note] };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        throw new Error(`multi-repo line ${lineNo} (#line=${preferLine}) "${label}" import failed: ${msg}`);
+        throw new Error(`多仓第 ${lineNo} 条线路（#line=${preferLine}）「${label}」导入失败：${msg}`);
       }
     }
     const started = Date.now();
     let tried = 0;
     for (const item of multi.items) {
       if (tried >= SpiderHost.MULTI_REPO_MAX_TRY || (tried > 0 && Date.now() - started > SpiderHost.MULTI_REPO_BUDGET_MS)) {
-        skipped.push(`remaining ${total - tried} not tried (multi-repo too large, budget ${Math.round(SpiderHost.MULTI_REPO_BUDGET_MS / 1000)}s cut off)`);
+        skipped.push(`其余 ${total - tried} 项未尝试（多仓过大，已按 ${Math.round(SpiderHost.MULTI_REPO_BUDGET_MS / 1000)}s 预算截断）`);
         break;
       }
       const label = repoDisplayName(item.url, item.name);
       if (!isFetchedRepoUrl(item.url)) {
-        const why = /^clan:/i.test(item.url) ? 'local directory repo (clan://) not supported on desktop' : 'unsupported protocol';
-        skipped.push(`"${label}" ${why}`);
+        const why = /^clan:/i.test(item.url) ? '本地目录仓（clan://）桌面版不可用' : '不支持的协议';
+        skipped.push(`「${label}」${why}`);
         continue;
       }
       tried += 1;
@@ -1253,22 +1261,22 @@ export class SpiderHost {
         const text = await this.fetchConfigText(item.url, true);
         const result = parseSiteConfigWithBase(text, item.url);
         if (!result.config.sites.length && !result.config.lives.length) {
-          skipped.push(`"${label}" empty/not a subscription`);
+          skipped.push(`「${label}」内容为空/非订阅配置`);
           continue;
         }
         this.report = result.report;
         this.config = result.config;
         this.applyConfig(result.config);
         this.applyImportedConfig(result.config, item.url, snapshot, name);
-        const note = `multi-repo has ${total} items, imported first usable "${label}"${total > 1 ? `; rest ${total - 1}: ${skipped.join('; ') || 'all usable (import individually)'}; use #line=N (0-based) to pick a specific line` : ''}`;
+        const note = `多仓共 ${total} 项，已导入首个可用子仓「${label}」${total > 1 ? `；其余 ${total - 1} 项：${skipped.join('；') || '均可用（可另行单独导入）'}；如需指定线路，在订阅地址尾加 #line=N（N 从 0 起）` : ''}`;
         this.logger.i('multi-repo: ' + note);
         return { ...result, warnings: [...(result.warnings || []), note] };
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        skipped.push(`"${label}" ${msg}`);
+        skipped.push(`「${label}」${msg}`);
       }
     }
-    throw new Error(`multi-repo ${total} items, none usable (tried ${tried}): ${skipped.join('; ') || 'no valid item'}`);
+    throw new Error(`多仓订阅 ${total} 个子仓里没有可用的（已尝试 ${tried} 项）：${skipped.join('；') || '无有效子仓'}`);
   }
 
   private static readonly MULTI_REPO_BUDGET_MS = 60_000;
@@ -1285,10 +1293,10 @@ export class SpiderHost {
       const r = await this.importConfig({ url }, { snapshot: false });
       this.autoRefreshStore.setObject('lastAt', Date.now());
       this.autoRefreshStore.flush();
-      this.logger.i(`auto refresh ok: ${url} (ok=${r.report.ok} skipped=${r.report.skipped} degraded=${r.report.degraded})`);
+      this.logger.i(`自动订阅刷新完成：${url}（${r.report.ok} 源 OK / 跳过 ${r.report.skipped} / 降级 ${r.report.degraded}）`);
       return true;
     } catch (e) {
-      this.logger.w('auto refresh failed: ' + (e instanceof Error ? e.message : String(e)));
+      this.logger.w('自动订阅刷新失败：' + (e instanceof Error ? e.message : String(e)));
       return false;
     }
   }
@@ -1314,32 +1322,33 @@ export class SpiderHost {
     }
   }
 
+  // --- 点播主链路 ---
   home(key: string) {
     const b = this.getSource(key);
-    if (!b) throw new Error(`source missing: ${key}`);
+    if (!b) throw new Error(`源不存在: ${key}`);
     return this.vm.home(b);
   }
   async pythonProxy(key: string, params: Record<string, string>): Promise<unknown[]> {
     const source = this.getSource(key);
-    if (!source || !/\.py(?:[?#]|$)/i.test(source.api || '')) throw new Error('python proxy source not found');
+    if (!source || !/\.py(?:[?#]|$)/i.test(source.api || '')) throw new Error('Python 代理源不存在');
     const spider = this.vm.spiderFactory.getCSP(source, this.host);
     const raw = await spider.proxy(params);
     const result: unknown = JSON.parse(raw);
-    if (!Array.isArray(result)) throw new Error('python source returned invalid proxy response');
+    if (!Array.isArray(result)) throw new Error('Python 源未返回有效代理响应');
     return result;
   }
   category(key: string, tid: string, pg: string, extend: Record<string, string>) {
     const b = this.getSource(key);
-    if (!b) throw new Error(`source missing: ${key}`);
+    if (!b) throw new Error(`源不存在: ${key}`);
     return this.vm.category(b, tid, pg, extend);
   }
   detail(key: string, ids: string[]) {
     const b = this.getSource(key);
-    if (!b) throw new Error(`source missing: ${key}`);
+    if (!b) throw new Error(`源不存在: ${key}`);
     return this.vm.detail(b, ids).then((d) => {
       const hit = driveBindHintFromPlaySources(d?.flags, d ? Object.values(d.episodes || {}).flat().map((e) => e.url) : null);
       if (hit) {
-        this.logger.i(`detect: play source contains cloud drive (${hit}) -> mark bind list: ${key}`);
+        this.logger.i(`detect 详情播放源含网盘（${hit}）→ 记入绑定清单: ${key}`);
         this.markDriveBindNeeded(key);
       }
       return d;
@@ -1347,16 +1356,16 @@ export class SpiderHost {
   }
   search(key: string, wd: string) {
     const b = this.getSource(key);
-    if (!b) throw new Error(`source missing: ${key}`);
+    if (!b) throw new Error(`源不存在: ${key}`);
     return this.vm.search(b, wd);
   }
   async searchAll(wd: string, opts?: { refresh?: boolean }): Promise<SearchAllReport> {
     const term = (wd || '').trim();
-    if (!term) throw new Error('please enter a search keyword');
+    if (!term) throw new Error('请输入搜索关键词');
     if (!opts?.refresh) {
       const hit = this.searchCache.getEntry(term);
       if (hit) {
-        this.logger.i(`search all cache hit "${term}" (${Math.round((Date.now() - hit.at) / 1000)}s ago) -> instant`);
+        this.logger.i(`全源搜索命中本地缓存「${term}」（${Math.round((Date.now() - hit.at) / 1000)}s 前）→ 秒回`);
         return { ...hit.value, cachedAt: hit.at };
       }
     } else {
@@ -1387,20 +1396,20 @@ export class SpiderHost {
         if (state === 'unavailable') {
           skipped[i] = {
             key: b.key, name: b.name || b.key, status: 'error',
-            error: sp.lastReason || 'runtime unavailable: check jar url or runtime config', ms: 0,
+            error: sp.lastReason || '运行时不可用：请检查该源的 jar 地址或运行时配置', ms: 0,
           };
           continue;
         }
         notReadyYet.add(i);
         const w = sp.pendingRuntime?.();
         if (w) prepWaiters.push(w);
-      } catch { /* ignore */ }
+      } catch { /* 判定失败 → 交给正常调用路径 */ }
     }
     if (notReadyYet.size > 0) {
-      this.logger.i(`search all: ${notReadyYet.size} sources preparing runtime (first-time download/convert jar) -> wait up to ${Math.round(SEARCH_ALL_PREPARE_MS / 1000)}s`);
+      this.logger.i(`全源搜索：${notReadyYet.size} 个源的运行时正在准备（首次下载/转换 jar）→ 最多等 ${Math.round(SEARCH_ALL_PREPARE_MS / 1000)}s`);
       try {
         this.onSearchAllProgress?.({ wd: term, done: 0, total: pool.length, pending: pool.length });
-      } catch { /* ignore */ }
+      } catch { /* 忽略 */ }
       if (prepWaiters.length > 0) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
@@ -1420,7 +1429,7 @@ export class SpiderHost {
           key: b.key,
           name: b.name || b.key,
           status: 'error',
-          error: 'skipped: source not supported on desktop (per session; single-source search still available)',
+          error: '已跳过：该源在桌面端不支持（本会话已判定，单源搜索仍可单独尝试）',
           ms: 0,
         };
         continue;
@@ -1439,8 +1448,8 @@ export class SpiderHost {
             name: b.name || b.key,
             status: 'error',
             error: state === 'unavailable'
-              ? reason || 'runtime unavailable: check jar url or runtime config'
-              : `runtime preparing: ${reason || 'background downloading/converting jar'}; not part of this round, re-search when ready`,
+              ? reason || '运行时不可用：请检查该源的 jar 地址或运行时配置'
+              : `运行时就绪中：${reason || '正在后台下载/转换 jar'}；本次未参与，完成后可重搜`,
             ms: 0,
           };
           continue;
@@ -1469,13 +1478,13 @@ export class SpiderHost {
         try {
           cb({ wd: term, source: input, done, total, pending: Math.max(0, total - done) });
           pushed++;
-        } catch { /* ignore */ }
+        } catch { /* 进度推送失败不影响搜索本身 */ }
       }
     };
     const quickTimer = setTimeout(() => {
       try {
         this.onSearchAllProgress?.({ wd: term, done, total, pending: Math.max(0, total - done) });
-      } catch { /* ignore */ }
+      } catch { /* 忽略 */ }
     }, SEARCH_ALL_QUICK_MS);
     const run = async (): Promise<void> => {
       for (;;) {
@@ -1489,7 +1498,7 @@ export class SpiderHost {
             key: b.key,
             name: b.name || b.key,
             status: 'error',
-            error: `overall search timeout (>${Math.round(SEARCH_ALL_BUDGET_MS / 1000)}s), source skipped`,
+            error: `总体搜索已超时（>${Math.round(SEARCH_ALL_BUDGET_MS / 1000)}s），该源未执行`,
             ms: 0,
           });
           continue;
@@ -1497,7 +1506,7 @@ export class SpiderHost {
         const maxMs = /\.js(\?|$)/i.test(b.api || '') ? SEARCH_ALL_JS_MAX_MS : SEARCH_ALL_SOURCE_MAX_MS;
         const toMs = Math.min(sourceBudgetMs(this.sourceHealth.get(b.key), sourceTimeoutMs(b), maxMs), budget);
         try {
-          const items = await raceTimeout(this.vm.search(b, term, false, toMs), toMs + 500, `source search timeout (>${Math.round(toMs / 1000)}s)`);
+          const items = await raceTimeout(this.vm.search(b, term, false, toMs), toMs + 500, `单源搜索超时（>${Math.round(toMs / 1000)}s）`);
           const ms = Date.now() - t0;
           noteSourceOk(this.statOf(b.key), ms, { empty: items.length === 0 });
           finish(i, {
@@ -1513,7 +1522,7 @@ export class SpiderHost {
           if (UNSUPPORTED_ERR.test(msg)) {
             if (!this.unsupportedSources.has(b.key)) {
               this.unsupportedSources.add(b.key);
-              this.logger.w(`search all: source "${b.name || b.key}" not supported on desktop (${msg.slice(0, 60)}) -> future searches will skip`);
+              this.logger.w(`全源搜索：源「${b.name || b.key}」在桌面端不支持（${msg.slice(0, 60)}）→ 后续全源搜索将跳过`);
             }
           }
           noteSourceFail(this.statOf(b.key));
@@ -1525,13 +1534,13 @@ export class SpiderHost {
     clearTimeout(quickTimer);
     const all = pool.map((_, i) => results[i] ?? skipped[i]).filter((r): r is AggSearchInput => r !== null);
     const report = mergeSearchResults(all);
-    const pendingSources = all.filter((r) => r.status === 'error' && (r.error || '').startsWith('runtime preparing')).length;
+    const pendingSources = all.filter((r) => r.status === 'error' && (r.error || '').startsWith('运行时就绪中')).length;
     if (pendingSources > 0) report.pendingSources = pendingSources;
     this.searchCache.set(term, report);
     this.logger.i(
-      `search all "${term}": pool ${pool.length} (ran ${total} / skipped ${pool.length - total}); ` +
-        `first hit ${firstHitAt || '-'}ms; done in ${Date.now() - searchT0}ms; hit ${report.hitSources} sources ${report.items.length} items; ` +
-        `pushed ${pushed} progress events`,
+      `全源搜索「${term}」：可搜 ${pool.length} 源（本次执行 ${total} / 跳过 ${pool.length - total}）；` +
+        `首结果 ${firstHitAt || '-'}ms；完成 ${Date.now() - searchT0}ms；命中 ${report.hitSources} 源 ${report.items.length} 条；` +
+        `推送进度 ${pushed} 条`,
     );
     return report;
   }
@@ -1547,9 +1556,9 @@ export class SpiderHost {
           sp.warmup();
           n++;
         }
-      } catch { /* ignore */ }
+      } catch { /* 源不可用/类型不支持：静默 */ }
     }
-    if (n > 0) this.logger.i(`python: scheduled ${n} .py source warmups, first access ready`);
+    if (n > 0) this.logger.i(`python: 已调度 ${n} 个 .py 源的后台预热（脚本 + 嵌入式运行时），首次进源直接可用`);
   }
 
   poolAliveCount(): number {
@@ -1562,8 +1571,8 @@ export class SpiderHost {
       this.bridge.warmup(this.lastSpiderJar).catch(() => undefined);
     }
     setTimeout(() => {
-      try { this.prewarmSpiders(3, 1); } catch { /* ignore */ }
-      try { this.prewarmPythonSources(); } catch { /* ignore */ }
+      try { this.prewarmSpiders(3, 1); } catch { /* 静默 */ }
+      try { this.prewarmPythonSources(); } catch { /* 静默 */ }
     }, 500).unref?.();
   }
 
@@ -1593,11 +1602,11 @@ export class SpiderHost {
         const sp = this.vm.spiderFactory.getCSP(b, this.host) as { prewarm?: (n?: number) => number };
         if (typeof sp.prewarm !== 'function') continue;
         started += sp.prewarm(perKey);
-      } catch { /* ignore */ }
+      } catch { /* 预热失败静默（源不可用/类型不支持） */ }
     }
     if (started > 0) {
       this.lastPrewarmAt = Date.now();
-      this.logger.i(`spider prewarm: started ${started} resident processes (first search avoids cold start)`);
+      this.logger.i(`蜘蛛预热：已提前拉起 ${started} 个常驻进程（首次搜索免冷启动）`);
     }
     return started;
   }
@@ -1667,24 +1676,24 @@ export class SpiderHost {
       if (status >= 200 && status <= 299 && /video|audio|octet-stream|mpegurl|mp2t|dash/i.test(ct)) {
         return true;
       }
-      this.logger.w(`play: self-resolve probe failed status=${status} ct=${ct}: ${url.slice(0, 90)}`);
+      this.logger.w(`play: 自解链预检失败 status=${status} ct=${ct}: ${url.slice(0, 90)}`);
       return false;
     } catch (e) {
-      this.logger.w(`play: self-resolve probe exception: ${(e as Error).message}`);
+      this.logger.w(`play: 自解链预检异常: ${(e as Error).message}`);
       return false;
     }
   }
 
   private async playInner(key: string, flag: string, id: string, retried = false): Promise<PlayResult> {
     const b = this.getSource(key);
-    if (!b) throw new Error(`source missing: ${key}`);
+    if (!b) throw new Error(`源不存在: ${key}`);
     if (extractUcShare(id, flag) && !isUcSharePlay(id)) {
       const miss: string[] = [];
       const got = await this.ucFromPanUrl(id, flag, miss, id);
       if (got) return got;
       return { parse: 1, url: '', playUrl: '', flag, jx: 0,
         ...(!this.driveList()['uc'] ? { needDriveCookieBind: 'uc' } : {}),
-        message: `UC cloud drive play failed (${miss.join('; ') || 'share file resolve failed'})` };
+        message: `UC 网盘取流失败（${miss.join('；') || '分享文件解链失败'}）` };
     }
     if (isQuarkSharePlay(id, flag) || /^quark/i.test(parsePanProxyQuery(id).site || '')) {
       const miss: string[] = [];
@@ -1692,7 +1701,7 @@ export class SpiderHost {
       if (got) return got;
       return { parse: 1, url: '', playUrl: '', flag, jx: 0,
         ...(!this.driveList()['quark'] ? { needDriveCookieBind: 'quark' } : {}),
-        message: `Quark cloud drive play failed (${miss.join('; ') || 'share or file info missing'})` };
+        message: `夸克网盘取流失败（${miss.join('；') || '缺少分享或文件信息'}）` };
     }
     let quarkFail = '';
     if (isQuarkSharePlay(id, flag)) {
@@ -1710,7 +1719,7 @@ export class SpiderHost {
               logger: fileLogger,
             });
             if (t.ok && t.url) {
-              fileLogger.i(`quarkTransfer direct link ok: ${t.url.slice(0, 90)}...`);
+              fileLogger.i(`quarkTransfer 直链 ok: ${t.url.slice(0, 90)}...`);
               if (t.fid) {
                 this.pendingQuarkDeletes.push({ cookie: quarkCookie, pdirFid: t.pdirFid || '', dirFid: t.pdirFid || '', fid: t.fid, at: Date.now() });
                 if (this.pendingQuarkDeletes.length > 200) this.pendingQuarkDeletes.shift();
@@ -1725,15 +1734,15 @@ export class SpiderHost {
                 jx: 0,
               };
             }
-            quarkFail = t.reason || 'unknown';
-            fileLogger.w(`quarkTransfer failed (${quarkFail}), fallback to spider`);
+            quarkFail = t.reason || '未知原因';
+            fileLogger.w(`quarkTransfer 未成功(${quarkFail})，回退蜘蛛`);
           } catch (e) {
             quarkFail = (e as Error).message;
-            fileLogger.w(`quarkTransfer exception, fallback: ${quarkFail}`);
+            fileLogger.w(`quarkTransfer 异常回退: ${quarkFail}`);
           }
         }
       } else {
-        quarkFail = 'no quark cookie';
+        quarkFail = '未绑定夸克账号（Cookie 缺失）';
       }
     }
     let ucFail = '';
@@ -1741,7 +1750,7 @@ export class SpiderHost {
       const ucCookie = (this.driveList() as Record<string, string>)['uc'] || '';
       const share = extractUcShare(id, flag);
       if (!ucCookie) {
-        ucFail = 'no uc cookie';
+        ucFail = '未绑定 UC 账号（Cookie 缺失）';
       } else if (share) {
         try {
           const t = await ucResolveShare(share.pwdId, share.passcode, ucCookie, {
@@ -1750,7 +1759,7 @@ export class SpiderHost {
             logger: fileLogger,
           });
           if (t.ok && t.url) {
-            fileLogger.i(`ucTransfer direct link ok: ${t.url.slice(0, 90)}...`);
+            fileLogger.i(`ucTransfer 直链 ok: ${t.url.slice(0, 90)}...`);
             if (t.fid) {
               this.pendingQuarkDeletes.push({ provider: 'uc', cookie: ucCookie, pdirFid: t.pdirFid || '', fid: t.fid, at: Date.now() });
               if (this.pendingQuarkDeletes.length > 200) this.pendingQuarkDeletes.shift();
@@ -1765,11 +1774,11 @@ export class SpiderHost {
               jx: 0,
             };
           }
-          ucFail = t.reason || 'unknown';
-          fileLogger.w(`ucTransfer failed (${ucFail}), fallback to spider`);
+          ucFail = t.reason || '未知原因';
+          fileLogger.w(`ucTransfer 未成功(${ucFail})，回退蜘蛛`);
         } catch (e) {
           ucFail = (e as Error).message;
-          fileLogger.w(`ucTransfer exception, fallback: ${ucFail}`);
+          fileLogger.w(`ucTransfer 异常回退: ${ucFail}`);
         }
       }
     }
@@ -1781,14 +1790,14 @@ export class SpiderHost {
       return {
         parse: 1, url: '', playUrl: '', flag, jx: 0,
         ...(!this.driveList()['baidu'] ? { needDriveCookieBind: 'baidu' } : {}),
-        message: `Baidu cloud drive play failed (${miss.join('; ') || 'share file resolve failed'})`,
+        message: `百度网盘取流失败（${miss.join('；') || '分享文件解链失败'}）`,
       };
     }
     if (isBaiduSharePlay(id) && !isBaiduPanDescriptor(id)) {
       const bdCookie = (this.driveList() as Record<string, string>)['baidu'] || '';
       const share = extractBaiduShare(id);
       if (!bdCookie) {
-        bdFail = 'no baidu cookie';
+        bdFail = '未绑定百度账号（Cookie 缺失）';
       } else if (share) {
         try {
           const t = await baiduResolveShare(share.short, share.pwd, bdCookie, {
@@ -1801,7 +1810,7 @@ export class SpiderHost {
             this.persistPendingQuark();
           }
           if (t.ok && t.url) {
-            fileLogger.i(`baiduTransfer direct link ok (${t.path || ''})`);
+            fileLogger.i(`baiduTransfer 直链 ok（${t.path || ''}）`);
             return {
               parse: 0,
               url: wrapPlayUrlWithHeaders(t.url, t.header || {}),
@@ -1811,11 +1820,11 @@ export class SpiderHost {
               jx: 0,
             };
           }
-          bdFail = t.reason || 'unknown';
-          fileLogger.w(`baiduTransfer failed (${bdFail}), fallback to spider`);
+          bdFail = t.reason || '未知原因';
+          fileLogger.w(`baiduTransfer 未成功(${bdFail})，回退蜘蛛`);
         } catch (e) {
           bdFail = (e as Error).message;
-          fileLogger.w(`baiduTransfer exception, fallback: ${bdFail}`);
+          fileLogger.w(`baiduTransfer 异常回退: ${bdFail}`);
         }
       }
     }
@@ -1826,11 +1835,11 @@ export class SpiderHost {
         const panKeys = Object.keys(pan).join(',');
         if (panJson) {
           this.logger.w(
-            `play: spider returned baidu descriptor JSON -> native resolve: ${key} | surl=${(extractBaiduShare(r.url)?.short || '-').slice(0, 40)}`,
+            `play: 蜘蛛返回「百度网盘播放描述 JSON」→ 走原生解链: ${key} | surl=${(extractBaiduShare(r.url)?.short || '-').slice(0, 40)}`,
           );
         } else {
           this.logger.w(
-            `play: spider returned desktop-missing pan proxy (do=pan) -> no url: ${key} | keys=${panKeys}` +
+            `play: 蜘蛛返回桌面端无路由的网盘代理地址（do=pan）→ 视为无地址: ${key} | keys=${panKeys}` +
               ` | site=${pan.site || '-'} | shareId=${(pan.shareId || '-').slice(0, 40)} | fileId=${(pan.fileId || '-').slice(0, 140)}`,
           );
         }
@@ -1845,12 +1854,12 @@ export class SpiderHost {
           if (mProxy) {
             const rewritten = r.url.replace(mProxy[0], `http://127.0.0.1:9978/proxy/${jvmPort}?`);
             this.logger.i(
-              `play: pan/proxy url rewritten -> spider jvm self-resolve (/proxy/${jvmPort}) do=${pan.do || '-'} site=${pan.site || '-'}: ${key}`,
+              `play: 网盘/代理地址改写 → 蜘蛛 JVM 自解链(/proxy/${jvmPort}) do=${pan.do || '-'} site=${pan.site || '-'}: ${key}`,
             );
             if (await this.probeSelfResolveUrl(rewritten)) {
               return { ...r, parse: 0, url: rewritten, playUrl: '', jx: 0 };
             }
-            this.logger.w(`play: jar self-resolve probe failed -> native channel fallback: ${key}`);
+            this.logger.w(`play: jar 自解链预检不通过 → 原生通道兜底: ${key}`);
           } else if (panJson) {
             const shareId = /"share_id"\s*:\s*"([0-9a-zA-Z_-]+)"/.exec(r.url)?.[1] || '';
             const fsId = /"fs_id"\s*:\s*"([0-9]+)"/.exec(r.url)?.[1] || '';
@@ -1858,18 +1867,18 @@ export class SpiderHost {
               const q = `do=pan&type=2&site=baidu&shareId=${encodeURIComponent(shareId)}&fileId=${fsId}&fileToken=`;
               const synth = `http://127.0.0.1:9978/proxy/${jvmPort}?${q}`;
               this.logger.i(
-                `play: baidu descriptor JSON -> synth do=pan to jar self-resolve (/proxy/${jvmPort}) share_id=${shareId.slice(0, 24)} fs_id=${fsId.slice(0, 24)}: ${key}`,
+                `play: 百度描述 JSON → 合成 do=pan 交 jar 自解链(/proxy/${jvmPort}) share_id=${shareId.slice(0, 24)} fs_id=${fsId.slice(0, 24)}: ${key}`,
               );
               if (await this.probeSelfResolveUrl(synth)) {
                 return { ...r, parse: 0, url: synth, playUrl: '', jx: 0 };
               }
-              this.logger.w(`play: descriptor JSON synth do=pan probe failed -> native channel fallback: ${key}`);
+              this.logger.w(`play: 描述 JSON 合成 do=pan 预检不通过 → 原生通道兜底: ${key}`);
             }
           } else {
-            this.logger.w(`play: got jvm port but url cannot self-resolve (not proxy/descriptor shape) -> native channel: ${key}`);
+            this.logger.w(`play: 拿到 JVM 端口但该地址无法自解链（非代理/描述形态）→ 原生通道: ${key}`);
           }
         } else if (/[?&]do=pan\b/i.test(r.url) || /127\.0\.0\.1:-1/i.test(r.url) || panJson) {
-          this.logger.w(`play: no jvm port for this source (spider never called / non-jar source) -> native resolve fallback: ${key}`);
+          this.logger.w(`play: 拿不到该源 JVM 端口（蜘蛛未被调用过/非 jar 源）→ 原生解链兜底: ${key}`);
         }
         const site = String(pan.site || '').toLowerCase();
         const miss: string[] = [];
@@ -1889,10 +1898,10 @@ export class SpiderHost {
                 : await this.quarkFromPanUrl(r.url, flag, miss, id);
           if (got) return got;
         }
-        if (!miss.length) miss.push(`share link not recognized (site=${site || 'unknown'})`);
-        const bindMiss = miss.find((m) => m.includes('no cookie')) || '';
-        const prov = bindMiss.startsWith('baidu') ? 'baidu' : bindMiss.startsWith('uc') ? 'uc' : bindMiss.startsWith('quark') ? 'quark' : '';
-        this.logger.w(`play: do=pan native resolve all failed (${miss.join('; ')}): ${key}`);
+        if (!miss.length) miss.push(`未识别分享链接（site=${site || '未知'}）`);
+        const bindMiss = miss.find((m) => m.includes('未绑定')) || '';
+        const prov = bindMiss.startsWith('百度') ? 'baidu' : bindMiss.startsWith('UC') ? 'uc' : bindMiss.startsWith('夸克') ? 'quark' : '';
+        this.logger.w(`play: do=pan 原生解链均未成功（${miss.join('；')}）: ${key}`);
         return {
           ...r,
           url: '',
@@ -1900,18 +1909,18 @@ export class SpiderHost {
           playUrl: '',
           ...(prov ? { needDriveCookieBind: prov } : {}),
           message: prov
-            ? `this line requires binding ${driveProviderLabel(prov)} to play (${miss.join('; ')})`
-            : `this line requires cloud drive resolve but failed (${miss.join('; ')}) - usually expired share or source changed, please switch line/source`,
+            ? `该线路需要在「网盘绑定」绑定${driveProviderLabel(prov)}后才能取流播放（${miss.join('；')}）`
+            : `该线路需要网盘解链但未成功（${miss.join('；')}）—— 多为分享失效或源侧改版，建议换线路或换源`,
         };
       }
       const link = classifyPlayLink(r.url || '');
       if (link.unsupported) {
         if (link.kind === 'magnet') return this.tryMagnetPlay(link.externalLink || r.url || '', link.unsupported, r);
-        this.logger.w(`play: link has no desktop carrier (${link.kind}) -> show guide: ${key}`);
+        this.logger.w(`play: 链接无桌面载体（${link.kind}）→ 上屏引导: ${key}`);
         return { ...r, parse: 1, url: '', playUrl: '', message: link.unsupported, externalLink: link.externalLink };
       }
       if (link.url && link.url !== r.url) {
-        this.logger.i(`play: thunder link resolved inner url (${link.url.slice(0, 60)}...): ${key}`);
+        this.logger.i(`play: thunder 链接解出内层地址（${link.url.slice(0, 60)}…）: ${key}`);
         r = { ...r, url: link.url };
       }
       if (!r.url && r.message) {
@@ -1920,7 +1929,7 @@ export class SpiderHost {
           this.markDriveBindNeeded(key);
           const bound = !!String((this.driveList() as Record<string, string>)[prov] || '').trim();
           if (bound && !retried) {
-            this.logger.w(`play: spider says "need ${prov} login" but already bound -> reset pool and retry: ${key}`);
+            this.logger.w(`play: 蜘蛛称「需登录${prov}」但本地已绑定 → 重置蜘蛛池并重试一次: ${key}`);
             this.syncDriveFiles();
             this.resetSpidersAfterDriveChange();
             return this.playInner(key, flag, id, true);
@@ -1930,22 +1939,22 @@ export class SpiderHost {
               return r;
             }
             this.logger.w(
-              `play: after retry spider still says "need ${prov} login" -> show as is (no bind dialog): ${key} | raw=${String(r.message).slice(0, 300)}`,
+              `play: 重试后蜘蛛仍称需登录「${prov}」→ 如实上屏（不再弹绑定窗）: ${key} | 原文=${String(r.message).slice(0, 300)}`,
             );
             return {
               ...r,
               parse: 1,
               message:
-                `this source failed (${driveProviderLabel(prov)} already bound, no need to re-bind): ` +
-                `${String(r.message).slice(0, 100)}. Usually expired share or episode not in share, switch line/source.`,
+                `该源取流失败（「${driveProviderLabel(prov)}」已绑定，无需重复绑定）：` +
+                `${String(r.message).slice(0, 100)}。多为源侧分享失效/该集已不在分享内，建议换线路或换源。`,
             };
           }
-          this.logger.w(`play: spider returned empty url and says "need ${prov} login" -> show bind prompt: ${key}`);
+          this.logger.w(`play: 蜘蛛返回空地址且提示需登录「${prov}」→ 翻译为绑定提示: ${key}`);
           return {
             ...r,
             parse: 1,
             needDriveCookieBind: prov,
-            message: `this source requires ${driveProviderLabel(prov)}: bind it in the vod page first (source says: ${r.message})`,
+            message: `该源播放需要${driveProviderLabel(prov)}账号：请在点播页点「网盘绑定」绑定后重新播放（源提示：${r.message}）`,
           };
         }
       }
@@ -1955,14 +1964,14 @@ export class SpiderHost {
           const byId = classifyPlayLink(id);
           if (byId.unsupported) {
             if (byId.kind === 'magnet') return this.tryMagnetPlay(byId.externalLink || id, byId.unsupported, r);
-            this.logger.w(`play: episode url has no desktop carrier (${byId.kind}) -> show guide: ${key}`);
+            this.logger.w(`play: 集地址无桌面载体（${byId.kind}）→ 上屏引导: ${key}`);
             return { ...r, parse: 1, url: '', playUrl: '', message: byId.unsupported, externalLink: byId.externalLink };
           }
         }
         if (!r.url && quarkFail) {
-          const needLogin = /401|403|not logged|login/i.test(quarkFail);
+          const needLogin = /401|403|未登录|登录已|login/i.test(quarkFail);
           if (needLogin) this.markDriveBindNeeded(key);
-          this.logger.w(`play: quark transfer failed and spider has no url -> show: ${key} - ${quarkFail}`);
+          this.logger.w(`play: 夸克转存失败且蜘蛛无地址 → 上屏原因: ${key} — ${quarkFail}`);
           return {
             ...r,
             parse: 1,
@@ -1970,14 +1979,14 @@ export class SpiderHost {
             playUrl: '',
             ...(needLogin ? { needDriveCookieBind: 'quark' } : {}),
             message: needLogin
-              ? `quark login expired: re-login "quark" (transfer failed: ${quarkFail.slice(0, 80)})`
-              : `quark transfer failed: ${quarkFail} (share may be expired/updated, or episode not in share - switch line/source)`,
+              ? `夸克登录已失效：请重新登录「夸克」后再播（转存失败原因：${quarkFail.slice(0, 80)}）`
+              : `夸克转存失败：${quarkFail}（分享可能已失效/更新，或该集文件已不在分享内 —— 建议换线路或换源）`,
           };
         }
         if (!r.url && ucFail) {
-          const needLogin = /401|403|not logged|login/i.test(ucFail);
+          const needLogin = /401|403|未登录|登录已|login/i.test(ucFail);
           if (needLogin) this.markDriveBindNeeded(key);
-          this.logger.w(`play: uc resolve failed and spider has no url -> show: ${key} - ${ucFail}`);
+          this.logger.w(`play: UC 解链失败且蜘蛛无地址 → 上屏原因: ${key} — ${ucFail}`);
           return {
             ...r,
             parse: 1,
@@ -1985,14 +1994,14 @@ export class SpiderHost {
             playUrl: '',
             ...(needLogin ? { needDriveCookieBind: 'uc' } : {}),
             message: needLogin
-              ? `uc login expired: re-login "uc" (reason: ${ucFail.slice(0, 80)})`
-              : `uc play failed: ${ucFail} (share may be expired/updated, or drive full - switch line/source)`,
+              ? `UC 登录已失效：请重新登录「UC 网盘」后再播（原因：${ucFail.slice(0, 80)}）`
+              : `UC 网盘取流失败：${ucFail}（分享可能已失效/更新，或网盘空间不足 —— 建议换线路或换源）`,
           };
         }
         if (!r.url && bdFail) {
-          const needLogin = /401|403|not logged|login|bdstoken/i.test(bdFail);
+          const needLogin = /401|403|未登录|登录已|login|bdstoken/i.test(bdFail);
           if (needLogin) this.markDriveBindNeeded(key);
-          this.logger.w(`play: baidu resolve failed and spider has no url -> show: ${key} - ${bdFail}`);
+          this.logger.w(`play: 百度解链失败且蜘蛛无地址 → 上屏原因: ${key} — ${bdFail}`);
           return {
             ...r,
             parse: 1,
@@ -2000,8 +2009,8 @@ export class SpiderHost {
             playUrl: '',
             ...(needLogin ? { needDriveCookieBind: 'baidu' } : {}),
             message: needLogin
-              ? `baidu login expired: re-login "baidu" (reason: ${bdFail.slice(0, 80)})`
-              : `baidu play failed: ${bdFail} (share may be expired/updated, or drive full - switch line/source)`,
+              ? `百度登录已失效：请重新登录「百度网盘」后再播（原因：${bdFail.slice(0, 80)}）`
+              : `百度网盘取流失败：${bdFail}（分享可能已失效/更新，或网盘空间不足 —— 建议换线路或换源）`,
           };
         }
         return r;
@@ -2015,7 +2024,7 @@ export class SpiderHost {
         this.markDriveBindNeeded(key);
         const tokens = this.driveList() as Record<string, string>;
         if (!tokens[prov]) {
-          this.logger.w(`play: cloud drive direct link but "${prov}" not bound -> block and prompt bind: ${key}`);
+          this.logger.w(`play: 网盘直链但未绑定「${prov}」→ 拦下本次播放并提示绑定: ${key}`);
           return {
             url: '',
             parse: 1,
@@ -2023,7 +2032,7 @@ export class SpiderHost {
             flag,
             jx: 0,
             needDriveCookieBind: prov,
-            message: `this resource is a "${driveProviderLabel(prov)}" direct link, bind its cookie first to play`,
+            message: `该资源来自「${driveProviderLabel(prov)}」的专用链接，需要先绑定该网盘 Cookie 才能取流播放`,
           } as PlayResult;
         }
         r.url = wrapPlayUrl(r.url, prov);
@@ -2035,7 +2044,7 @@ export class SpiderHost {
         this.markDriveBindNeeded(key);
         const prov = driveBindProviderFromText(msg) || '';
         const bound = !!String((this.driveList() as Record<string, string>)[prov] || '').trim();
-        this.logger.w(`play needs drive cookie (added to bind list${bound ? '; already bound' : ''}): ${key} - ${msg}`);
+        this.logger.w(`play 判定需要网盘 Cookie（已记入绑定清单${bound ? '；该网盘已绑定' : ''}）: ${key} — ${msg}`);
         return {
           url: '',
           parse: 1,
@@ -2043,8 +2052,8 @@ export class SpiderHost {
           flag,
           jx: 0,
           message: bound
-            ? `source failed (${driveProviderLabel(prov)} already bound, no need to re-bind): ${msg.slice(0, 120)}`
-            : 'this source needs cloud drive cookie: bind in vod page (quark / uc / baidu / 115) and retry',
+            ? `该源取流失败（「${driveProviderLabel(prov)}」已绑定，无需重复绑定）：${msg.slice(0, 120)}`
+            : '该源播放需要网盘 Cookie：请在点播页点「网盘绑定」填写账号（夸克 / UC / 百度 / 115）后重新播放',
         } as PlayResult;
       }
       throw e;
@@ -2054,13 +2063,13 @@ export class SpiderHost {
   private async tryMagnetPlay(magnet: string, reason: string, r: PlayResult): Promise<PlayResult> {
     const engine = this.torrentPlay;
     const fallback = (why: string): PlayResult => {
-      this.logger.w(`play: magnet cannot start (${why}) -> copy link fallback`);
+      this.logger.w(`play: 磁力未能起播（${why}）→ 复制链接兜底`);
       return {
         ...r,
         parse: 1,
         url: '',
         playUrl: '',
-        message: `${why}. magnet link copied to clipboard, use qBittorrent / Thunder / Motrix to download`,
+        message: `${why}。磁力链接已复制到剪贴板，可用 qBittorrent / 迅雷 / Motrix 等工具下载播放`,
         externalLink: magnet,
       };
     };
@@ -2068,22 +2077,22 @@ export class SpiderHost {
     try {
       const out = await engine.open(magnet);
       if (out.kind === 'inline') {
-        this.logger.i(`play: magnet inline (BT) "${out.title}" -> ${out.url}`);
+        this.logger.i(`play: 磁力起播（BT 内联）「${out.title}」→ ${out.url}`);
         return { ...r, parse: 0, url: out.url, playUrl: '', header: undefined };
       }
       if (out.kind === 'external') {
-        this.logger.i(`play: magnet external "${out.player}" "${out.title}"`);
+        this.logger.i(`play: 磁力起播（外部播放器「${out.player}」）「${out.title}」`);
         return {
           ...r,
           parse: 1,
           url: '',
           playUrl: '',
-          message: `opened in "${out.player}" (browser cannot play this format, external player streams it)`,
+          message: `已用「${out.player}」打开播放（该格式浏览器不支持，交给外部播放器边下边播）`,
         };
       }
       return fallback(out.reason);
     } catch (e) {
-      return fallback(`BT engine exception (${(e as Error).message.slice(0, 60)})`);
+      return fallback(`BT 引擎异常（${(e as Error).message.slice(0, 60)}）`);
     }
   }
 
@@ -2093,7 +2102,7 @@ export class SpiderHost {
     try {
       const hit = await this.parseService.resolve(this.config?.parses || [], target);
       if (hit?.url) {
-        this.logger.i(`parse: "${r.flag}" ok (${hit.via}) ${hit.url.slice(0, 100)}`);
+        this.logger.i(`parse: 「${r.flag}」解析成功（${hit.via}）${hit.url.slice(0, 100)}`);
         return {
           ...r,
           parse: 0,
@@ -2102,22 +2111,35 @@ export class SpiderHost {
         };
       }
     } catch (e) {
-      this.logger.w(`parse: exception ${(e as Error).message}`);
+      this.logger.w(`parse: 解析异常 ${(e as Error).message}`);
     }
-    return { ...r, message: 'this play url needs web resolve/sniffing, auto resolve failed (add parse endpoints or switch source)' };
+    return { ...r, message: '该播放地址需要网页解析/嗅探，自动解析未取得直连地址（可在配置里补充解析接口或改选其它源）' };
   }
 
+  /**
+   * ★ 2026-10-14（用户要求）：直播源加载 —— 加缓存 + 本机文件直读
+   *
+   * 旧实现每次都走 `this.http.request({ url: live.url })` —— 即使 live.url 就是本机
+   * `http://127.0.0.1:9978/file/local-live/xxx.txt`，也要付一遍本机 HTTP 往返
+   * （客户端 → 9978 → 读文件 → 响应 → 客户端）+ 重新解析 + IPC 序列化。
+   *
+   * 现在：
+   *   ① 本机 /file/local-live/ 路由特判 → 直接 readFileSync 读 <userData>/local-live/<文件名>，绕过 HTTP；
+   *   ② 5 分钟内存缓存（按 live.url 键）—— 切走再切回、切源再切回、导入后立刻进，直接命中缓存秒开；
+   *   ③ 导入后由 IPC 层预热（host.preloadLive）→ 用户切到直播页时缓存已就绪。
+   */
   async loadLive(index: number, opts: { forceRefresh?: boolean } = {}): Promise<LiveLoadResult> {
-    if (!this.config || !this.config.lives.length) throw new Error('no live config');
+    if (!this.config || !this.config.lives.length) throw new Error('无直播配置');
     const live = this.config.lives[Math.min(index, this.config.lives.length - 1)];
     const cacheKey = live.url || live.api || `idx:${index}`;
 
+    // ★ 命中缓存直接返回（除调用方显式要求 refresh）
     if (!opts.forceRefresh) {
       const hit = this.liveCache.get(cacheKey);
       if (hit && Date.now() - hit.at < SpiderHost.LIVE_CACHE_TTL_MS) {
         this.logger.i(
-          `live source "${live.name}" cache hit (${Math.round((Date.now() - hit.at) / 1000)}s ago, ` +
-            `${hit.result.groups.length} groups / ${hit.result.groups.reduce((n, g) => n + (g.channels?.length || 0), 0)} channels)`,
+          `直播源「${live.name}」命中缓存（${Math.round((Date.now() - hit.at) / 1000)}s 前，` +
+            `${hit.result.groups.length} 分组 / ${hit.result.groups.reduce((n, g) => n + (g.channels?.length || 0), 0)} 频道）`,
         );
         return hit.result;
       }
@@ -2128,17 +2150,18 @@ export class SpiderHost {
     if (live.type === '3') {
       const api = live.api || live.url;
       const source = this.config.sites.find((s) => s.api === api || s.key === api);
-      if (!source) throw new Error(`live spider missing: ${api}`);
+      if (!source) throw new Error(`直播蜘蛛不存在：${api}`);
       const spider = this.vm.spiderFactory.getCSP(source, this.host);
       const json = await Promise.resolve(spider.liveContent(live.api || live.url));
       text = json || '';
     } else {
+      // ★ 本机 /file/local-live/ 路由 → 直接读文件，绕开 HTTP 往返
       const localPath = SpiderHost.localLiveFilePath(live.url);
       if (localPath) {
         try {
           text = readFileSync(localPath, 'utf-8');
         } catch (e) {
-          throw new Error(`local live file read failed: ${localPath} (${(e as Error).message})`);
+          throw new Error(`本地直播源文件读取失败：${localPath}（${(e as Error).message}）`);
         }
       } else {
         const res = await this.http.request({ url: live.url, method: 'get', timeoutMs: 30000 });
@@ -2151,23 +2174,31 @@ export class SpiderHost {
 
     this.liveCache.set(cacheKey, { at: Date.now(), result });
     this.logger.i(
-      `live source "${live.name}" loaded: ${groups.length} groups / ` +
-        `${groups.reduce((n, g) => n + (g.channels?.length || 0), 0)} channels (${Date.now() - t0}ms)`,
+      `直播源「${live.name}」已加载：${groups.length} 分组 / ` +
+        `${groups.reduce((n, g) => n + (g.channels?.length || 0), 0)} 频道（${Date.now() - t0}ms）`,
     );
     return result;
   }
 
+  /** ★ 清空直播加载缓存；传 url 时只清那一条。配置变更 / 导入新源 / 手动刷新都调它 */
   invalidateLiveCache(url?: string): void {
     if (url) this.liveCache.delete(url);
     else this.liveCache.clear();
   }
 
+  /** ★ 后台预热某条直播源（导入成功后由 IPC 层调用；用户切到直播页时命中缓存秒开） */
   preloadLive(index: number): void {
     void this.loadLive(index, { forceRefresh: true }).catch((e) => {
-      this.logger.w(`live source preload failed (index=${index}): ${(e as Error).message}`);
+      this.logger.w(`直播源预热失败（index=${index}）：${(e as Error).message}`);
     });
   }
 
+  /**
+   * ★ 识别本机 `/file/local-live/<文件名>` 路由 → 返回对应的本地文件路径。
+   *   匹配 `http://127.0.0.1:<port>/file/local-live/<文件名>`（与 importLiveFile 写入路径一致）。
+   *   非本机直播源返回 ''（调用方走网络分支）。
+   *   防路径穿越：文件名只允许单段、不含 `/` `\` `..`。
+   */
   private static localLiveFilePath(url: string): string {
     const u = (url || '').trim();
     const m = /^https?:\/\/127\.0\.0\.1:\d+\/file\/local-live\/([^?#]+)/i.exec(u);
@@ -2190,7 +2221,7 @@ export class SpiderHost {
     const live = lives[Math.min(Math.max(index, 0), Math.max(lives.length - 1, 0))];
     const list = Array.isArray(refs) ? refs : [];
     if (!list.length) {
-      this.logger.i(`EPG: live line "${live?.name || index}" channel refs empty, skip`);
+      this.logger.i(`EPG：线路「${live?.name || index}」频道引用为空，跳过`);
       return { byKey: {} };
     }
 
@@ -2198,21 +2229,23 @@ export class SpiderHost {
     if (!urls.length) {
       urls = [DEFAULT_EPG_URL];
       this.logger.i(
-        `EPG: live line "${live?.name || index}" no EPG url configured, using default ${DEFAULT_EPG_URL}`,
+        `EPG：线路「${live?.name || index}」未配置 EPG URL，使用内置默认 ${DEFAULT_EPG_URL}`,
       );
     }
 
     const mgr = this.ensureEpgManager();
     mgr.setEpgUrl(urls[0]);
-    this.logger.i(`EPG: fetch ${urls[0]}`);
+    this.logger.i(`EPG：开始拉取 ${urls[0]}`);
 
     const r = await mgr.refreshEpg();
     if (!r.ok) {
-      this.logger.w(`EPG fetch failed (${urls[0]}): ${r.error || 'unknown'}`);
+      this.logger.w(`EPG 拉取失败（${urls[0]}）：${r.error || '未知原因'}`);
       return { byKey: {} };
     }
-    this.logger.i(`EPG: fetched, resolving ${list.length} channel refs`);
+    this.logger.i(`EPG：拉取完成，开始按需解析 ${list.length} 个频道引用`);
 
+    // ★ 收集**所有变体名**（name / tvgName / tvgId）——之前只用第一个非空值，
+    //   导致 tvg-id / tvg-name 对应的节目永远匹配不上，弹窗查不到。
     const channelNames: string[] = [];
     for (const ref of list) {
       for (const k of [ref.name, ref.tvgName, ref.tvgId]) {
@@ -2221,7 +2254,7 @@ export class SpiderHost {
       }
     }
     if (!channelNames.length) {
-      this.logger.i('EPG: no channel names to match, skip');
+      this.logger.i('EPG：无可匹配的频道名，跳过解析');
       return { byKey: {} };
     }
 
@@ -2239,11 +2272,12 @@ export class SpiderHost {
       }
     }
     this.logger.i(
-      `EPG: url ${urls[0]} / hit ${hitCount} channels (byKey ${Object.keys(byKey).length} keys) (line "${live?.name || index}", requested ${channelNames.length})`,
+      `EPG：地址 ${urls[0]} / 命中 ${hitCount} 个频道（byKey ${Object.keys(byKey).length} 键）（线路「${live?.name || index}」，请求 ${channelNames.length} 个）`,
     );
     return { byKey };
   }
 
+  /** ★ 传 ref（含 tvgId / tvgName / name），内部依次尝试，命中即用 */
   private buildLiveEpgEntry(mgr: EpgManager, ref: EpgChannelRef, now: number): LiveEpgEntry {
     const keys = [ref.tvgId, ref.tvgName, ref.name]
       .map((k) => (k || '').trim())
@@ -2282,6 +2316,7 @@ export class SpiderHost {
     return { current: toEntry(cur), next: toEntry(nxt) };
   }
 
+  /** ★ 懒创建 EpgManager 单例；构造时后台调度一次 epg_data.json 远程刷新 */
   private ensureEpgManager(): EpgManager {
     if (!this.epgMgr) {
       this.epgMgr = new EpgManager(userDataDir(), '');
@@ -2290,9 +2325,12 @@ export class SpiderHost {
     return this.epgMgr;
   }
 
+  /**
+   * ★ EPG 直查：接受单 key / 数组 / 逗号分隔字符串；走 EpgManager 的多 key 联合查询
+   */
   async getLiveEpgPrograms(channelNames: string | string[]): Promise<EpgProgram[]> {
     if (!this.epgMgr) {
-      this.logger.w('[EPG] getLiveEpgPrograms: EpgManager not initialized');
+      this.logger.w('[EPG] getLiveEpgPrograms: EpgManager 未初始化');
       return [];
     }
     let list: string[];
@@ -2300,22 +2338,27 @@ export class SpiderHost {
     else list = String(channelNames || '').split(',');
     list = list.map((s) => String(s || '').trim()).filter((s) => !!s);
     if (!list.length) return [];
+    // ★ 先加载：触发 XML worker 解析该频道的 programme（已缓存过的会秒回）
     try {
       await this.epgMgr.loadChannelGroup(list);
     } catch (e) {
-      this.logger.w(`[EPG] loadChannelGroup failed: ${(e as Error).message}`);
+      this.logger.w(`[EPG] loadChannelGroup 失败: ${(e as Error).message}`);
     }
     return this.epgMgr.getProgramsForChannelMulti(list);
   }
+  /** ★ EPG 直查：某频道当前节目 */
   getLiveEpgCurrent(channelName: string) {
     return this.epgMgr ? this.epgMgr.getCurrentProgram(channelName) : null;
   }
+  /** ★ EPG 直查：某频道下一档 */
   getLiveEpgNext(channelName: string) {
     return this.epgMgr ? this.epgMgr.getNextProgram(channelName) : null;
   }
+  /** ★ EPG 直查：某频道台标 URL */
   getLiveEpgIcon(channelName: string) {
     return this.epgMgr ? this.epgMgr.getChannelIconUrl(channelName) : '';
   }
+  /** ★ EPG 手动刷新：重拉 XMLTV + epg_data.json */
   async refreshEpg() {
     const mgr = this.ensureEpgManager();
     mgr.refreshEpgDataFromRemote().catch(() => undefined);
@@ -2339,6 +2382,7 @@ export class SpiderHost {
 
   private onUserConfigChange(snap: UserConfig, kind: ConfigChangeKind = 'content'): void {
     if (kind === 'ui') return;
+    // ★ 2026-10-14：直播源列表可能变了（新增/删除/重排）→ 清缓存，避免展示旧源的频道
     this.invalidateLiveCache();
     const base = snap.apiUrl || '';
     const cfg: SiteConfig = {
@@ -2362,8 +2406,8 @@ export class SpiderHost {
     this.searchCache.clear();
     this.unsupportedSources.clear();
     setTimeout(() => {
-      try { this.prewarmSpiders(3, 1); } catch { /* ignore */ }
-      try { this.prewarmPythonSources(); } catch { /* ignore */ }
+      try { this.prewarmSpiders(3, 1); } catch { /* 预热失败静默 */ }
+      try { this.prewarmPythonSources(); } catch { /* 预热失败静默 */ }
     }, 1000).unref?.();
   }
 }

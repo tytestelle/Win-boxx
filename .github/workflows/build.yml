@@ -142,7 +142,8 @@ jobs:
           }
 
       # ==================================================================
-      # 4. Patch stubs-src（用 bash heredoc，避免 YAML 缩进陷阱）
+      # 4. Patch stubs-src missing classes
+      #    （Mem 类型 = Map<String, SharedPreferences>）
       # ==================================================================
       - name: Patch stubs-src missing classes
         shell: bash
@@ -151,13 +152,12 @@ jobs:
           mkdir -p resources/jvm/stubs-src/android/content
           mkdir -p resources/jvm/stubs-src/com/github/catvod/net
 
-          # 4.1 SharedPreferences.java（含 Mem 字段）
           cat > resources/jvm/stubs-src/android/content/SharedPreferences.java << 'JAVAEOF'
           package android.content;
           import java.util.Map;
           import java.util.concurrent.ConcurrentHashMap;
           public interface SharedPreferences {
-              Map<String, String> Mem = new ConcurrentHashMap<>();
+              Map<String, SharedPreferences> Mem = new ConcurrentHashMap<>();
               String getString(String key, String defValue);
               int getInt(String key, int defValue);
               long getLong(String key, long defValue);
@@ -176,7 +176,6 @@ jobs:
           }
           JAVAEOF
 
-          # 4.2 OkHttp.java
           cat > resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java << 'JAVAEOF'
           package com.github.catvod.net;
           import okhttp3.Dns;
@@ -219,7 +218,7 @@ jobs:
           cat resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java
 
       # ==================================================================
-      # 5. 编译 stubs.jar
+      # 5. Compile stubs.jar
       # ==================================================================
       - name: Compile stubs.jar
         shell: pwsh

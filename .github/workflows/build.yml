@@ -30,80 +30,228 @@ jobs:
         run: npm install
 
       # ==================================================================
-      # ★ 完全从 yagami-hue/Win-box 拉取 resources/jvm
-      #   替换本地，不合并，不补下载 —— 保证产物与 yagami 的完全一致
+      # 1. JRE —— resources/jvm/jre/bin/java.exe（jar 源运行必需）
       # ==================================================================
-      - name: Fetch complete resources/jvm from yagami-hue/Win-box
+      - name: Prepare JRE
         shell: pwsh
         run: |
-          $tmp = Join-Path $env:RUNNER_TEMP "yagami"
-          if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-
-          Write-Host "⬇  clone yagami-hue/Win-box…"
-          git clone --depth 1 https://github.com/yagami-hue/Win-box.git $tmp
-          if ($LASTEXITCODE -ne 0) { throw "git clone 失败" }
-
-          $src = Join-Path $tmp "resources/jvm"
-          if (-not (Test-Path $src)) { throw "yagami 仓库里没有 resources/jvm" }
-
-          Write-Host "`n=== yagami 的 resources/jvm 顶层 ==="
-          Get-ChildItem $src | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }}
-
-          Write-Host "`n=== yagami 的 tools/dex2jar 内容 ==="
-          if (Test-Path "$src/tools/dex2jar") {
-            Get-ChildItem "$src/tools/dex2jar" -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
-          } else {
-            Write-Host "(不存在)"
+          $jreDir = "resources/jvm/jre"
+          if (Test-Path "$jreDir/bin/java.exe") {
+            Write-Host "✓ JRE 已存在"
+            & "$jreDir/bin/java.exe" -version
+            exit 0
           }
+          New-Item -ItemType Directory -Force -Path $jreDir | Out-Null
+          $url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
+          $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "jre-extract"
+          Write-Host "⬇  下载 JRE：$url"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600; break }
+            catch {
+              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "JRE 下载失败" }
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+          Get-ChildItem -Path $inner.FullName -Force | Move-Item -Destination $jreDir -Force
+          if (-not (Test-Path "$jreDir/bin/java.exe")) { throw "JRE 准备失败" }
+          & "$jreDir/bin/java.exe" -version
+          Write-Host "✓ JRE 就绪"
 
-          Write-Host "`n=== yagami 的 libs 内容 ==="
-          Get-ChildItem "$src/libs" -Filter "*.jar" | Select-Object Name, Length | Format-Table -AutoSize
+      # ==================================================================
+      # 2. dex2jar —— dex-tools v2.4 包（含 lib/ 里 antlr、asm、d2j-* 等）
+      #    解到 3 个位置：tools/dex2jar/（保留原结构）、d2j/（脚本）、libs/（jar 平铺）
+      # ==================================================================
+      - name: Prepare dex2jar
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "dex-tools"
+          $url = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
+          Write-Host "⬇  下载 dex2jar：$url"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 300; break }
+            catch {
+              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "dex2jar 下载失败" }
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+          if (-not $inner) { throw "解压后未找到目录" }
+          Write-Host "=== 解压后内容 ==="
+          Get-ChildItem $inner.FullName | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }} | Format-Table -AutoSize
 
-          # 完全替换本地 resources/jvm
-          $dest = "resources/jvm"
-          Write-Host "`n→ 删除本地 $dest"
-          Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path "resources" | Out-Null
-          Write-Host "→ 复制 yagami 的 resources/jvm 到本地"
-          Copy-Item $src -Destination "resources" -Recurse -Force
+          # 目标 1：tools/dex2jar/（保留完整结构，含 lib/ 和脚本）
+          $dest1 = "resources/jvm/tools/dex2jar"
+          Remove-Item -Recurse -Force $dest1 -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $dest1 | Out-Null
+          Get-ChildItem $inner.FullName -Force | Copy-Item -Destination $dest1 -Recurse -Force
 
-          Write-Host "`n=== 本地 resources/jvm 现在的顶层 ==="
-          Get-ChildItem "resources/jvm" | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }}
+          # 目标 2：d2j/（脚本目录，与 yagami 安装包一致）
+          $dest2 = "resources/jvm/d2j"
+          Remove-Item -Recurse -Force $dest2 -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $dest2 | Out-Null
+          Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest2 -Force
+          Get-ChildItem "$($inner.FullName)/*.sh" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest2 -Force
 
-          Write-Host "`n=== 严格校验关键文件 ==="
+          # 目标 3：libs/（jar 平铺）
+          $dest3 = "resources/jvm/libs"
+          New-Item -ItemType Directory -Force -Path $dest3 | Out-Null
+          Get-ChildItem "$($inner.FullName)/lib/*.jar" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest3 -Force
+          Get-ChildItem "$($inner.FullName)/*.jar" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest3 -Force
+
+          Write-Host "✓ dex2jar 部署完成"
+
+      # ==================================================================
+      # 3. Maven 依赖 jar —— 补齐 yagami 安装包 libs/ 里其它 jar
+      # ==================================================================
+      - name: Prepare Maven deps
+        shell: pwsh
+        run: |
+          $libs = "resources/jvm/libs"
+          New-Item -ItemType Directory -Force -Path $libs | Out-Null
+
+          # maven 坐标 → 文件名 + URL
+          $maven = @(
+            @{ name = "gson-2.10.1.jar";          url = "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar" },
+            @{ name = "okhttp-3.14.9.jar";        url = "https://repo1.maven.org/maven2/com/squareup/okhttp3/okhttp/3.14.9/okhttp-3.14.9.jar" },
+            @{ name = "okio-1.17.5.jar";          url = "https://repo1.maven.org/maven2/com/squareup/okio/okio/1.17.5/okio-1.17.5.jar" },
+            @{ name = "jsoup-1.17.2.jar";         url = "https://repo1.maven.org/maven2/org/jsoup/jsoup/1.17.2/jsoup-1.17.2.jar" },
+            @{ name = "json-20180813.jar";        url = "https://repo1.maven.org/maven2/org/json/json/20180813/json-20180813.jar" },
+            @{ name = "bcprov-jdk18on-1.78.1.jar";url = "https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar" },
+            @{ name = "slf4j-api-2.0.16.jar";     url = "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar" },
+            @{ name = "slf4j-simple-2.0.16.jar";  url = "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/2.0.16/slf4j-simple-2.0.16.jar" },
+            @{ name = "sqlite-jdbc-3.46.1.0.jar"; url = "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.46.1.0/sqlite-jdbc-3.46.1.0.jar" }
+          )
+          foreach ($m in $maven) {
+            $dest = Join-Path $libs $m.name
+            if (Test-Path $dest) { Write-Host "✓ 已存在 $($m.name)"; continue }
+            Write-Host "⬇  $($m.name)"
+            $attempts = 0
+            while ($attempts -lt 3) {
+              $attempts++
+              try { Invoke-WebRequest -Uri $m.url -OutFile $dest -UseBasicParsing -TimeoutSec 120; break }
+              catch {
+                if ($attempts -ge 3) { throw "下载失败: $($m.name)" }
+                Start-Sleep -Seconds 3
+              }
+            }
+          }
+          Write-Host "=== libs 内容 ==="
+          Get-ChildItem $libs -Filter "*.jar" | Select-Object Name, Length | Format-Table -AutoSize
+
+      # ==================================================================
+      # 4. stubs.jar —— 从 stubs-src 编译（classpath 补 Android 类库）
+      # ==================================================================
+      - name: Compile stubs.jar
+        shell: pwsh
+        run: |
+          $stubsSrc = "resources/jvm/stubs-src"
+          $stubsDir = "resources/jvm/stubs"
+          $classes  = Join-Path $stubsDir "classes"
+
+          if (-not (Test-Path $stubsSrc)) { throw "缺 $stubsSrc" }
+          New-Item -ItemType Directory -Force -Path $stubsDir | Out-Null
+          Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $classes | Out-Null
+
+          # Robolectric android-all（提供 android.* 基础类）
+          $androidAll = Join-Path $stubsDir "android-all-base.jar"
+          if (-not (Test-Path $androidAll)) {
+            Write-Host "⬇  下载 android-all（~130MB）…"
+            $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
+            $attempts = 0
+            while ($attempts -lt 3) {
+              $attempts++
+              try { Invoke-WebRequest -Uri $url -OutFile $androidAll -UseBasicParsing -TimeoutSec 900; break }
+              catch {
+                Write-Warning "下载失败（第 $attempts 次）"
+                if ($attempts -ge 3) { throw "android-all 下载失败" }
+                Start-Sleep -Seconds 5
+              }
+            }
+          }
+          Write-Host "✓ android-all: $((Get-Item $androidAll).Length) B"
+
+          # 项目内依赖的 jar（libs 里现成的）
+          $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" | ForEach-Object { $_.FullName }
+          $cp = ($libs + $androidAll) -join ";"
+
+          $files = Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
+          Write-Host "🔨 编译 $($files.Count) 个 .java 文件…"
+          javac -encoding UTF-8 -cp $cp -d $classes $files
+          if ($LASTEXITCODE -ne 0) { throw "javac 编译失败（见上方详细错误）" }
+
+          # 组装 stubs.jar：android-all 作基线 + 编译产物覆盖
+          $stubsJar = Join-Path $stubsDir "stubs.jar"
+          Copy-Item $androidAll $stubsJar -Force
+          Push-Location $classes
+          & jar uf "../stubs.jar" .
+          Pop-Location
+
+          # 追加 libs 里的依赖，让 stubs.jar 自包含
+          Push-Location $stubsDir
+          $tmpLibs = "tmp-libs"
+          Remove-Item -Recurse -Force $tmpLibs -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $tmpLibs | Out-Null
+          foreach ($l in $libs) { & jar xf $l -C $tmpLibs 2>$null }
+          Push-Location $tmpLibs
+          & jar uf "../stubs.jar" . 2>$null
+          Pop-Location
+          Remove-Item -Recurse -Force $tmpLibs -ErrorAction SilentlyContinue
+          Pop-Location
+
+          Write-Host "✓ stubs.jar: $((Get-Item $stubsJar).Length) B"
+
+      # ==================================================================
+      # 5. 校验所有关键文件
+      # ==================================================================
+      - name: Verify resources
+        shell: pwsh
+        run: |
+          Write-Host "=== resources/jvm 顶层 ==="
+          Get-ChildItem "resources/jvm" | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }} | Format-Table -AutoSize
+
           $must = @(
             "resources/jvm/jre/bin/java.exe",
             "resources/jvm/tools/dex2jar",
             "resources/jvm/libs/dex-tools-v2.4.jar",
-            "resources/jvm/libs/dex-translator-v2.4.jar",
-            "resources/jvm/libs/dex-reader-api-v2.4.jar",
-            "resources/jvm/libs/d2j-base-cmd-v2.4.jar",
             "resources/jvm/libs/sqlite-jdbc-3.46.1.0.jar",
             "resources/jvm/libs/gson-2.10.1.jar",
             "resources/jvm/libs/okhttp-3.14.9.jar",
-            "resources/jvm/libs/okio-1.17.5.jar"
+            "resources/jvm/libs/okio-1.17.5.jar",
+            "resources/jvm/libs/jsoup-1.17.2.jar",
+            "resources/jvm/stubs/stubs.jar"
           )
           foreach ($m in $must) {
             if (-not (Test-Path $m)) { throw "❌ 缺失: $m" }
-            Write-Host "  ✓ $m"
+            if (Test-Path $m -PathType Leaf) {
+              Write-Host "  ✓ $m ($((Get-Item $m).Length) B)"
+            } else {
+              Write-Host "  ✓ $m (dir)"
+            }
           }
-          Write-Host "`n✓ resources/jvm 完整同步完成（yagami 提供什么，就用什么）"
+          Write-Host "✓ 全部资源就绪"
 
       # ==================================================================
-      # 测试 & 构建
+      # 6. 测试 & 构建（不跳过任何测试）
       # ==================================================================
       - name: Run typecheck
         run: npm run typecheck
 
-      # JVM 桩测试排除清单（stubs-src 不完整，与程序运行无关）
       - name: Run tests
-        shell: pwsh
-        run: |
-          npx vitest run `
-            --exclude "**/jvmScrollView.spec.ts" `
-            --exclude "**/jvmUri.spec.ts" `
-            --exclude "**/jvmViewTreeObserver.spec.ts" `
-            --exclude "**/jvmSQLite.spec.ts"
+        run: npm run test
 
       - name: Build application
         run: npm run build
@@ -114,17 +262,6 @@ jobs:
           if (-not (Test-Path "LICENSE.txt")) {
             "MIT License`n`nCopyright (c) 2026 Win-Box" | Out-File -Encoding utf8 LICENSE.txt
           }
-
-      # 打包前最后校验（fail-fast）
-      - name: Verify before packaging
-        shell: pwsh
-        run: |
-          $java = "resources/jvm/jre/bin/java.exe"
-          if (-not (Test-Path $java)) { throw "❌ 打包前校验失败：缺 JRE" }
-          $dex  = "resources/jvm/libs/dex-tools-v2.4.jar"
-          if (-not (Test-Path $dex))  { throw "❌ 打包前校验失败：缺 dex-tools-v2.4.jar" }
-          Write-Host "✓ JRE: $((Get-Item $java).Length) B"
-          Write-Host "✓ dex-tools-v2.4.jar: $((Get-Item $dex).Length) B"
 
       - name: Package with electron-builder
         run: npx electron-builder --win --publish never

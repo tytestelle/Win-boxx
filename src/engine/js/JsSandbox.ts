@@ -1,12 +1,18 @@
 // src/engine/js/JsSandbox.ts
 // node:vm 沙箱：脚本加载 / ESM→CJS 转换 / 模块管线 / 蜘蛛对象提取 / 超时调用。
 // 加载流程对齐 ref/.../js__JsSpider.java:308-350（initializeJS）+ createCtx：
-//   1) host.http 拉脚本文本（v1 内存缓存，不做 md5 磁盘缓存）
+//   1) host.http 拉脚本文本（v1 内存缓存 + 磁盘 KV 缓存双兜底）
 //   2) content 以 //bb 开头 → QuickJS 字节码 → UnsupportedSourceError('UNSUPPORTED_BYTECODE') 降级
 //   3) 含 __JS_SPIDER__ → 替换为 export default
 //   4) esmTransform → CJS → 沙箱内 (function(module, exports, require, __filename){...}) 执行
 //   5) require：相对路径按蜘蛛 api URL 解析并走同一加载管线；cheerio/crypto-js 裸名 → 注入全局
 //   6) 蜘蛛对象：__jsEvalReturn() > exports.default > module.exports 本身
+//
+// ★ 2026-10-14 关键修复（对齐 TVBox/OK影视 行为）：
+//   `drpy2.min.js` / 远程 spider 脚本一旦网络抖动（ECONNRESET）或返回 HTML 错误页，
+//   旧实现直接降级整个源。现在：**加载成功即写 KV 缓存；失败则用缓存兜底** ——
+//   首次成功后，之后所有网络波动都不再拖垮源。这正是 TVBox/OK影视 能挺过
+//   `fastlink.cokey.xyz` / `ghfast.top` 偶发故障的原因。
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -111,6 +117,8 @@ export class JsSandbox implements JsSandboxLike {
   private inProgress = new Set<string>();
   private templateCache: unknown;
   private warned = new Set<string>();
+  /** ★ 2026-10-14：本次会话已用缓存兜底过的 URL 集合（只记一次日志，避免刷屏） */
+  private cacheFallbackLogged = new Set<string>();
 
   constructor(options: JsSandboxOptions) {
     this.siteKey = options.siteKey;
@@ -146,23 +154,21 @@ export class JsSandbox implements JsSandboxLike {
   // 主脚本加载
   // ------------------------------------------------------------------
   private async doLoad(): Promise<void> {
-    const res = await this.host.http.request({ url: this.api, method: 'get', timeoutMs: 20000 });
-    let content = Array.isArray(res.content) ? Buffer.from(res.content).toString('utf-8') : String(res.content ?? '');
-    content = content.replace(/^\uFEFF/, '').trim();
-    if (isInvalidModuleContent(content)) {
-      throw new UnsupportedSourceError('FETCH_FAILED', `脚本文本无效（404/HTML）: ${this.api}`);
-    }
+    // ★ 2026-10-14：走「网络优先 + KV 缓存兜底」加载（见 loadScriptWithFallback 头注释）。
+    //   旧实现直接 this.host.http.request —— 一次 ECONNRESET 或返回 HTML 就整个源报废。
+    const content = await this.loadScriptWithFallback(this.api);
     if (content.startsWith('//bb')) {
       // utils.js 同类的 QuickJS 字节码，node:vm 无法执行（JsSpider.java:316 走 ctx.execute(bytecode)）
       throw new UnsupportedSourceError('UNSUPPORTED_BYTECODE', 'QuickJS 字节码脚本（//bb）无法在 node:vm 执行');
     }
-    if (content.includes('__JS_SPIDER__')) {
-      content = content.replace(/__JS_SPIDER__\s*=/, 'export default '); // JsSpider.java:330
+    let finalContent = content;
+    if (finalContent.includes('__JS_SPIDER__')) {
+      finalContent = finalContent.replace(/__JS_SPIDER__\s*=/, 'export default '); // JsSpider.java:330
     }
 
     this.createContext();
     try {
-      const exportsObj = await this.runModule(this.api, content);
+      const exportsObj = await this.runModule(this.api, finalContent);
       const exp = exportsObj as Record<string, unknown>;
       // 蜘蛛对象提取（JsSpider.java:298-307 SPIDER_STRING_CODE 的三分支）
       let spider: unknown = null;
@@ -199,6 +205,64 @@ export class JsSandbox implements JsSandboxLike {
         `脚本执行失败: ${e instanceof Error ? e.message : String(e)}${frame ? ` @ ${frame}` : ''}`,
       );
     }
+  }
+
+  /**
+   * ★ 2026-10-14 新增：脚本加载（**网络优先 + KV 缓存兜底**）。
+   *
+   * 对齐 TVBox/OK影视 的 JS 蜘蛛加载器行为：
+   *   ① 网络下载成功且内容合法 → 写 KV 缓存 → 返回（下次网络抖动可用）
+   *   ② 网络失败（ECONNRESET / 超时 / DNS / 5xx）→ 读 KV 缓存
+   *   ③ 网络成功但内容异常（HTML 错误页 / 404 / 字节码）→ 读 KV 缓存
+   *   ④ 都失败 → 抛 UnsupportedSourceError（上层降级）
+   *
+   * 缓存用 host.kv（JsonStore 落盘在 <cacheDir>/spider-local.json，跨进程持久）；
+   * 缓存键 = `js-script:<完整URL>`，URL 本身唯一无需 md5。
+   *
+   * 为什么这是核心修复：
+   *   日志里 `drpy2.min.js` 一次 ECONNRESET、`腾腾.js` 一次返回 HTML —— 在 TVBox 上都能挺过，
+   *   因为它们**缓存了首次成功的脚本**；Win-Box 缺这一步，一次抖动就废源。
+   */
+  private async loadScriptWithFallback(url: string): Promise<string> {
+    const cacheKey = `js-script:${url}`;
+    let netError = '';
+    try {
+      const res = await this.host.http.request({ url, method: 'get', timeoutMs: 20000 });
+      let content = Array.isArray(res.content)
+        ? Buffer.from(res.content).toString('utf-8')
+        : String(res.content ?? '');
+      content = content.replace(/^\uFEFF/, '').trim();
+      if (content && !isInvalidModuleContent(content)) {
+        // 下载成功 → 写缓存（失败不影响主流程）
+        try {
+          this.host.kv.setObject(cacheKey, content);
+        } catch { /* KV 写失败：仍返回内容，只是下次没缓存兜底 */ }
+        return content;
+      }
+      netError = `内容异常（前 60 字符：${content.slice(0, 60)}）`;
+      this.host.logger.w(`js:${this.siteKey} 脚本响应非预期：${netError} ← ${url}`);
+    } catch (e) {
+      netError = (e as Error).message;
+      this.host.logger.w(`js:${this.siteKey} 脚本下载失败：${netError} ← ${url}`);
+    }
+
+    // 网络失败 / 内容异常 → 读 KV 缓存兜底
+    try {
+      const cached = this.host.kv.getObject<string>(cacheKey, '');
+      if (cached && !isInvalidModuleContent(cached)) {
+        // 只记一次日志，避免整个会话反复刷
+        if (!this.cacheFallbackLogged.has(url)) {
+          this.cacheFallbackLogged.add(url);
+          this.host.logger.i(`js:${this.siteKey} 已用缓存脚本兜底（网络问题：${netError}）← ${url}`);
+        }
+        return cached;
+      }
+    } catch { /* KV 读失败：当作无缓存 */ }
+
+    throw new UnsupportedSourceError(
+      'FETCH_FAILED',
+      `脚本下载失败且无可用缓存：${url}（${netError}）`,
+    );
   }
 
   /** 方法名风格探测（任务书要求：写日志，供后续决定是否适配 drpy） */
@@ -297,6 +361,7 @@ export class JsSandbox implements JsSandboxLike {
     this.globals = null;
     this.moduleCache.clear();
     this.inProgress.clear();
+    this.cacheFallbackLogged.clear();
   }
 
   // ------------------------------------------------------------------
@@ -374,17 +439,24 @@ export class JsSandbox implements JsSandboxLike {
     return moduleObj.exports;
   }
 
-  /** 异步加载远程模块（预取路径） */
+  /** 异步加载远程模块（预取路径）—— ★ 2026-10-14：走「网络优先 + KV 缓存兜底」 */
   private async loadModuleAsync(url: string): Promise<unknown> {
     if (this.moduleCache.has(url)) return this.moduleCache.get(url);
     if (this.inProgress.has(url)) return {}; // 循环依赖兜底
     this.inProgress.add(url);
     try {
-      const res = await this.host.http.request({ url, method: 'get', timeoutMs: 20000 });
-      let content = Array.isArray(res.content) ? Buffer.from(res.content).toString('utf-8') : String(res.content ?? '');
-      content = content.replace(/^\uFEFF/, '').trim();
-      if (isInvalidModuleContent(content) || content.startsWith('//bb')) {
-        // 无效/字节码模块 → 空模块（JsSpider.java:426-429 compileEmptyModule）
+      // ★ 2026-10-14：模块加载同样走「缓存 + 容错」——JS 蜘蛛会 import/require 大量远程模块
+      //   （腾腾.js 就是其一），任一模块的偶发失败都会拖垮整个蜘蛛。
+      let content: string;
+      try {
+        content = await this.loadScriptWithFallback(url);
+      } catch {
+        // 加载失败且无缓存 → 空模块（对齐安卓 EMPTY_MODULE_CODE 语义，JsSpider.java:44-59）
+        this.moduleCache.set(url, {});
+        return {};
+      }
+      if (content.startsWith('//bb')) {
+        // 字节码模块 → 空模块（node:vm 无法执行）
         this.moduleCache.set(url, {});
         return {};
       }

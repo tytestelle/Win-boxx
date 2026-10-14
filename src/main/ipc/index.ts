@@ -37,7 +37,7 @@ import { MpvController } from '../player/MpvController';
 import { openDetailWindow, detailWindowReady } from '../player/DetailWindow';
 import { openSearchWindow, searchWindowReady } from '../player/SearchWindow';
 // ★ 2026-10-14（用户要求）：EPG 节目单独立窗口（可拖到屏幕任意位置、默认置顶）
-import { openEpgWindow, epgWindowReady } from '../player/EpgWindow';
+import { openEpgWindow, epgWindowReady, getPendingChannels, type EpgChannelItem } from '../player/EpgWindow';
 import type { MpvCommand, MpvStartOptions } from '../../shared/player';
 // 老板键
 import { bossKey, BOSS_DEFAULT_ACCEL } from '../bossKey';
@@ -686,18 +686,39 @@ export function registerIpc(host: SpiderHost, dav: DavService, dlna: DlnaService
     log,
   );
 
-  // ★ 2026-10-14（用户要求）：EPG 独立窗口 —— 直播页点「正在播 / 下一档 / 📺」时调用。
-  //   单例复用：切换频道时通知已开窗口换参数（不重载、不丢位置）。
-  registerHandler(IPC.EPG_OPEN_WINDOW, (_e: any, p: { channelName: string; tvgId?: string; tvgName?: string }) =>
-    openEpgWindow({
+  /**
+   * ★ 2026-10-14（用户要求）：EPG 独立窗口 —— 直播页点「正在播 / 下一档 / 📺」时调用。
+   *   单例复用：切换频道时通知已开窗口换参数（不重载、不丢位置）。
+   *   ★ 追加 `channels` 参数：当前分组的全部频道 → EPG 窗口内可下拉切换。
+   */
+  registerHandler(IPC.EPG_OPEN_WINDOW, (_e: any, p: {
+    channelName: string;
+    tvgId?: string;
+    tvgName?: string;
+    channels?: Array<{ name?: string; tvgId?: string; tvgName?: string }>;
+  }) => {
+    const channels: EpgChannelItem[] = Array.isArray(p?.channels)
+      ? p!.channels!
+          .map((c) => ({
+            name: String(c?.name || '').trim(),
+            tvgId: c?.tvgId ? String(c.tvgId).trim() : undefined,
+            tvgName: c?.tvgName ? String(c.tvgName).trim() : undefined,
+          }))
+          .filter((c) => !!c.name)
+      : [];
+    return openEpgWindow({
       channelName: String(p?.channelName || ''),
       tvgId: p?.tvgId ? String(p.tvgId) : undefined,
       tvgName: p?.tvgName ? String(p.tvgName) : undefined,
-    }), log);
+      channels,
+    });
+  }, log);
   registerHandler(IPC.EPG_WINDOW_READY, (e: any) => {
     epgWindowReady(e.sender.id);
     return { ok: true };
   }, log);
+  /** ★ 2026-10-14（用户要求）：EPG 窗口渲染层拉取「当前分组可切换的频道列表」 */
+  registerHandler(IPC.EPG_GET_CHANNELS, () => getPendingChannels(), log);
 
   registerHandler('live:meta', () => host.lives, log);
 }

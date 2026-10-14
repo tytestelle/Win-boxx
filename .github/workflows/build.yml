@@ -66,7 +66,7 @@ jobs:
           echo "Done."
 
       # ==================================================================
-      # 0b. 计算完整版本号
+      # 0b. 计算完整版本号（基础版本 + 北京时间 + 短 sha）
       # ==================================================================
       - name: Resolve full version
         if: github.event.inputs.action != 'delete-only'
@@ -77,10 +77,14 @@ jobs:
           if (-not $base) {
             $pkg = Get-Content package.json -Raw | ConvertFrom-Json
             $base = $pkg.version
+            Write-Host "base version from package.json: $base"
+          } else {
+            Write-Host "base version from input: $base"
           }
           $base = $base -replace '^v', ''
           if ($base -notmatch '^\d+\.\d+\.\d+') { throw "基础版本号格式非法：$base" }
 
+          # 北京时间（UTC+8）
           $bj = (Get-Date).ToUniversalTime().AddHours(8)
           $bjStamp = $bj.ToString('yyyy-MM-dd-HH-mm-ss')
 
@@ -109,6 +113,7 @@ jobs:
             $pkg.build.directories.output = "release$v"
           }
           $pkg | ConvertTo-Json -Depth 32 | Set-Content package.json -Encoding utf8
+          Write-Host "package.json version -> $v"
 
       - name: Setup Node.js
         if: github.event.inputs.action != 'delete-only'
@@ -135,7 +140,11 @@ jobs:
         shell: pwsh
         run: |
           $jreDir = "resources/jvm/jre"
-          if (Test-Path "$jreDir/bin/java.exe") { & "$jreDir/bin/java.exe" -version; exit 0 }
+          if (Test-Path "$jreDir/bin/java.exe") {
+            Write-Host "JRE exists"
+            & "$jreDir/bin/java.exe" -version
+            exit 0
+          }
           New-Item -ItemType Directory -Force -Path $jreDir | Out-Null
           $url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
           $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
@@ -218,7 +227,7 @@ jobs:
           }
 
       # ==================================================================
-      # 4. Patch stubs-src
+      # 4. Patch stubs-src（补 SharedPreferences.Mem + OkHttp）
       # ==================================================================
       - name: Patch stubs-src
         if: github.event.inputs.action != 'delete-only'
@@ -288,12 +297,10 @@ jobs:
           echo "patched"
 
       # ==================================================================
-      # 5. ★ 编译 stubs.jar
-      #
-      #   ★ SpiderRunner.java 必编（JVM 蜘蛛运行必需）
-      #   ★ PythonRunner.java 是 legacy Jython 版：
-      #       - 若 libs/ 里有 jython-standalone-*.jar → 一起编
-      #       - 否则跳过（实际 Python 源走 python-runner/runner.py，嵌入式 CPython）
+      # 5. 编译 stubs.jar
+      #    · stubs-src/**.java 全编
+      #    · SpiderRunner.java 必编（JVM 蜘蛛入口）
+      #    · PythonRunner.java 只有 libs/ 有 jython jar 时才编
       # ==================================================================
       - name: Compile stubs.jar
         if: github.event.inputs.action != 'delete-only'
@@ -321,7 +328,6 @@ jobs:
           # 5.2 收集源码
           $sources = @(Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
 
-          # SpiderRunner.java —— 必编
           $spiderRunner = "resources/jvm/SpiderRunner.java"
           if (Test-Path $spiderRunner) {
             Write-Host "adding SpiderRunner.java (required)"
@@ -330,7 +336,6 @@ jobs:
             throw "resources/jvm/SpiderRunner.java 不存在"
           }
 
-          # PythonRunner.java —— 只有 Jython jar 在时才编
           $pyRunner = "resources/jvm/PythonRunner.java"
           $jythonJar = Get-ChildItem "resources/jvm/libs" -Filter "jython-standalone-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ((Test-Path $pyRunner) -and $jythonJar) {
@@ -365,9 +370,12 @@ jobs:
           & jar uf "../stubs.jar" .
           Pop-Location
 
-          # 5.6 校验 jar 内含 SpiderRunner
+          # 5.6 ★ 校验 jar 内含 SpiderRunner（PowerShell 数组判定修复：用 Where-Object）
           $jarList = & jar tf $stubsJar
-          if ($jarList -notmatch 'SpiderRunner\.class') {
+          $hit = $jarList | Where-Object { $_ -match '^SpiderRunner\.class$' }
+          if (-not $hit) {
+            Write-Host "=== stubs.jar 顶层文件（前 30 项）==="
+            $jarList | Select-Object -First 30 | ForEach-Object { Write-Host "  $_" }
             throw "stubs.jar 中未找到 SpiderRunner.class"
           }
           Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B, SpiderRunner OK"
@@ -410,7 +418,7 @@ jobs:
           if ($out -match "找不到或无法加载主类|Could not find or load main class") {
             throw "SpiderRunner 主类无法加载：$out"
           }
-          Write-Host "SpiderRunner OK (output: $($out.Trim().Substring(0, [Math]::Min(80, $out.Trim().Length)))..."
+          Write-Host "SpiderRunner OK"
 
       # ==================================================================
       # 7. 测试 & 构建
@@ -439,6 +447,9 @@ jobs:
         if: github.event.inputs.action != 'delete-only'
         run: npx electron-builder --win --publish never
 
+      # ==================================================================
+      # 8. 列出产物
+      # ==================================================================
       - name: List release dir
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
@@ -450,6 +461,9 @@ jobs:
             throw "release 目录不存在: $dir"
           }
 
+      # ==================================================================
+      # 9. 上传到 Actions Artifacts
+      # ==================================================================
       - name: Upload build artifacts
         if: github.event.inputs.action != 'delete-only'
         uses: actions/upload-artifact@v4
@@ -460,6 +474,9 @@ jobs:
             ${{ steps.ver.outputs.output_dir }}/*.blockmap
             ${{ steps.ver.outputs.output_dir }}/latest.yml
 
+      # ==================================================================
+      # 10. 发布到 GitHub Release
+      # ==================================================================
       - name: Upload to GitHub Release
         if: github.event_name != 'pull_request' && github.event.inputs.action != 'delete-only'
         uses: softprops/action-gh-release@v2

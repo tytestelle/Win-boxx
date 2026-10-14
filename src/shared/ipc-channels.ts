@@ -152,10 +152,12 @@ export const IPC = {
    *   · EPG_OPEN_WINDOW：渲染层调用 → 主进程创建/复用独立窗口
    *   · EPG_WINDOW_READY：EPG 窗口渲染层就绪通知（主进程据此推最新参数）
    *   · EPG_WINDOW_UPDATE：主进程 → EPG 窗口渲染层，切换频道时推新参数（不重载窗口）
+   *   · EPG_GET_CHANNELS：EPG 窗口渲染层拉取「当前分组可切换的频道列表」
    */
   EPG_OPEN_WINDOW: 'epg:openWindow',
   EPG_WINDOW_READY: 'epg:windowReady',
   EPG_WINDOW_UPDATE: 'epg:windowUpdate',
+  EPG_GET_CHANNELS: 'epg:getChannels',
   /** ★ 2026-09-30（用户要求「软件关闭后，所有的墓碑机制都应该脱钩」）：主进程**本次启动**的唯一标识
    *  （每次启动重新生成）—— 渲染层据此判定「新一次启动」并丢掉页面状态类记忆（见 uiMemory）。 */
   SYSTEM_SESSION_ID: 'system:sessionId',

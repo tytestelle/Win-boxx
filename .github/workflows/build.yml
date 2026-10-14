@@ -66,7 +66,7 @@ jobs:
           echo "Done."
 
       # ==================================================================
-      # 0b. 计算完整版本号（基础版本 + 北京时间 + 短 sha）
+      # 0b. 计算完整版本号
       # ==================================================================
       - name: Resolve full version
         if: github.event.inputs.action != 'delete-only'
@@ -84,7 +84,6 @@ jobs:
           $base = $base -replace '^v', ''
           if ($base -notmatch '^\d+\.\d+\.\d+') { throw "基础版本号格式非法：$base" }
 
-          # 北京时间（UTC+8）
           $bj = (Get-Date).ToUniversalTime().AddHours(8)
           $bjStamp = $bj.ToString('yyyy-MM-dd-HH-mm-ss')
 
@@ -227,7 +226,7 @@ jobs:
           }
 
       # ==================================================================
-      # 4. Patch stubs-src（补 SharedPreferences.Mem + OkHttp）
+      # 4. Patch stubs-src
       # ==================================================================
       - name: Patch stubs-src
         if: github.event.inputs.action != 'delete-only'
@@ -298,9 +297,6 @@ jobs:
 
       # ==================================================================
       # 5. 编译 stubs.jar
-      #    · stubs-src/**.java 全编
-      #    · SpiderRunner.java 必编（JVM 蜘蛛入口）
-      #    · PythonRunner.java 只有 libs/ 有 jython jar 时才编
       # ==================================================================
       - name: Compile stubs.jar
         if: github.event.inputs.action != 'delete-only'
@@ -313,7 +309,6 @@ jobs:
           Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $classes | Out-Null
 
-          # 5.1 下载 android-all
           $androidAll = Join-Path $stubsDir "android-all-base.jar"
           if (-not (Test-Path $androidAll)) {
             $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
@@ -325,7 +320,6 @@ jobs:
             }
           }
 
-          # 5.2 收集源码
           $sources = @(Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
 
           $spiderRunner = "resources/jvm/SpiderRunner.java"
@@ -346,14 +340,11 @@ jobs:
           }
 
           Write-Host "Compiling $($sources.Count) .java files..."
-
-          # 5.3 编译
           $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" | ForEach-Object { $_.FullName }
           $cp = ($libs + $androidAll) -join ";"
           javac -encoding UTF-8 -cp $cp -d $classes $sources
           if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
-          # 5.4 校验 SpiderRunner.class 生成
           $srClass = Join-Path $classes "SpiderRunner.class"
           if (-not (Test-Path $srClass)) {
             $found = Get-ChildItem $classes -Recurse -Filter "SpiderRunner.class" -ErrorAction SilentlyContinue
@@ -363,14 +354,12 @@ jobs:
             Write-Host "SpiderRunner.class at classes root"
           }
 
-          # 5.5 组装 stubs.jar
           $stubsJar = Join-Path $stubsDir "stubs.jar"
           Copy-Item $androidAll $stubsJar -Force
           Push-Location $classes
           & jar uf "../stubs.jar" .
           Pop-Location
 
-          # 5.6 ★ 校验 jar 内含 SpiderRunner（PowerShell 数组判定修复：用 Where-Object）
           $jarList = & jar tf $stubsJar
           $hit = $jarList | Where-Object { $_ -match '^SpiderRunner\.class$' }
           if (-not $hit) {
@@ -384,6 +373,7 @@ jobs:
 
       # ==================================================================
       # 6. 校验 + dex2jar & SpiderRunner 独立验证
+      #    ★ dex2jar 验证：用 -h（--version 不存在），看输出而不是看退出码
       # ==================================================================
       - name: Verify resources
         if: github.event.inputs.action != 'delete-only'
@@ -404,19 +394,31 @@ jobs:
             Write-Host "OK: $m"
           }
 
-          $jre = "resources/jvm/jre/bin/java.exe"
+          $jre = (Resolve-Path "resources/jvm/jre/bin/java.exe").Path
           $d2j = (Resolve-Path "resources/jvm/d2j").Path
 
-          Write-Host "`n=== 验证 dex2jar ==="
-          & $jre -cp "$d2j\*" com.googlecode.dex2jar.tools.Dex2jarCmd --version
-          if ($LASTEXITCODE -ne 0) { throw "dex2jar verification failed" }
+          # ---- 验证 dex2jar：用 -h（支持），看输出而不是看退出码 ----
+          #   dex2jar 的 usage 打到 stderr 且退出码非 0；只要出现 usage 关键字即证明类加载成功。
+          Write-Host "`n=== 验证 dex2jar 类可加载 ==="
+          $d2jOut = (& $jre -cp "$d2j\*" com.googlecode.dex2jar.tools.Dex2jarCmd -h 2>&1 | Out-String)
+          if ($d2jOut -match "ClassNotFoundException|找不到或无法加载主类|Could not find or load main class|NoClassDefFoundError") {
+            Write-Host $d2jOut
+            throw "dex2jar 类加载失败"
+          }
+          if ($d2jOut -notmatch "d2j-dex2jar|usage:|translator-v") {
+            Write-Host $d2jOut
+            throw "dex2jar 输出异常（未识别到 usage）"
+          }
+          Write-Host "dex2jar OK"
 
-          Write-Host "`n=== 验证 SpiderRunner 主类可加载 ==="
+          # ---- 验证 SpiderRunner：看输出是否含「找不到主类」 ----
+          Write-Host "`n=== 验证 SpiderRunner 类可加载 ==="
           $stubs = (Resolve-Path "resources/jvm/stubs/stubs.jar").Path
           $libs  = (Resolve-Path "resources/jvm/libs").Path
-          $out = & $jre -cp "$stubs;$libs\*" SpiderRunner 2>&1 | Out-String
-          if ($out -match "找不到或无法加载主类|Could not find or load main class") {
-            throw "SpiderRunner 主类无法加载：$out"
+          $srOut = (& $jre -cp "$stubs;$libs\*" SpiderRunner 2>&1 | Out-String)
+          if ($srOut -match "找不到或无法加载主类|Could not find or load main class|ClassNotFoundException") {
+            Write-Host $srOut
+            throw "SpiderRunner 类加载失败"
           }
           Write-Host "SpiderRunner OK"
 
@@ -447,9 +449,6 @@ jobs:
         if: github.event.inputs.action != 'delete-only'
         run: npx electron-builder --win --publish never
 
-      # ==================================================================
-      # 8. 列出产物
-      # ==================================================================
       - name: List release dir
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
@@ -461,9 +460,6 @@ jobs:
             throw "release 目录不存在: $dir"
           }
 
-      # ==================================================================
-      # 9. 上传到 Actions Artifacts
-      # ==================================================================
       - name: Upload build artifacts
         if: github.event.inputs.action != 'delete-only'
         uses: actions/upload-artifact@v4
@@ -474,9 +470,6 @@ jobs:
             ${{ steps.ver.outputs.output_dir }}/*.blockmap
             ${{ steps.ver.outputs.output_dir }}/latest.yml
 
-      # ==================================================================
-      # 10. 发布到 GitHub Release
-      # ==================================================================
       - name: Upload to GitHub Release
         if: github.event_name != 'pull_request' && github.event.inputs.action != 'delete-only'
         uses: softprops/action-gh-release@v2

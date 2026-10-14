@@ -1,9 +1,10 @@
 // src/renderer/pages/EpgWinPage.tsx
 // EPG 独立窗口的渲染层页面。
 //   · 路由：`#/epg-window?name=…&tvgId=…&tvgName=…`
-//   · 挂载后：拉节目单 → 自动滚到「正在播」；每 30s 刷一次高亮
+//   · 挂载后：拉频道列表 → 拉当前频道节目单 → 自动滚到「正在播」
+//   · ★ 2026-10-14（用户要求）：顶栏下方加「频道下拉」—— 可在 EPG 窗口内直接切频道
 //   · 标题栏 `-webkit-app-region: drag` → 整窗拖动；📌 切换置顶、× 关闭
-//   · 监听主进程 `epg:windowUpdate` → 换频道时重新拉数据（不重载窗口）
+//   · 监听主进程 `epg:windowUpdate` → 从直播页切频道时同步刷新
 import { useEffect, useRef, useState } from 'react';
 import { client } from '../api/client';
 import { ipcInvoke } from '../api/ipc';
@@ -13,6 +14,12 @@ interface ProgramItem {
   description: string;
   start: Date;
   stop: Date;
+}
+
+interface ChannelItem {
+  name: string;
+  tvgId?: string;
+  tvgName?: string;
 }
 
 function toDate(v: unknown): Date {
@@ -44,6 +51,9 @@ function dateLabel(key: string): string {
 
 export default function EpgWinPage() {
   const [channelName, setChannelName] = useState('');
+  const [tvgId, setTvgId] = useState('');
+  const [tvgName, setTvgName] = useState('');
+  const [channels, setChannels] = useState<ChannelItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [list, setList] = useState<ProgramItem[]>([]);
   const [date, setDate] = useState('');
@@ -57,14 +67,13 @@ export default function EpgWinPage() {
     return () => clearInterval(t);
   }, []);
 
-  const loadFromQuery = async (qs: string) => {
-    const params = new URLSearchParams(qs);
-    const name = (params.get('name') || '').trim();
-    const tvgId = (params.get('tvgId') || '').trim();
-    const tvgName = (params.get('tvgName') || '').trim();
-    setChannelName(name);
-    const keys = [tvgId, tvgName, name].filter((s) => !!s);
-    if (!keys.length) return;
+  /** 按 (name/tvgId/tvgName) 拉节目单 */
+  const loadPrograms = async (name: string, id: string, tn: string) => {
+    const keys = [id, tn, name].map((s) => (s || '').trim()).filter((s) => !!s);
+    if (!keys.length) {
+      setList([]);
+      return;
+    }
     setLoading(true);
     setList([]);
     try {
@@ -89,12 +98,49 @@ export default function EpgWinPage() {
     }
   };
 
-  // 首次挂载：从 hash 解析参数 + 通知主进程就绪 + 读取当前置顶状态
+  /** 从 hash 解析参数并加载 */
+  const loadFromQuery = async (qs: string) => {
+    const params = new URLSearchParams(qs);
+    const name = (params.get('name') || '').trim();
+    const id = (params.get('tvgId') || '').trim();
+    const tn = (params.get('tvgName') || '').trim();
+    setChannelName(name);
+    setTvgId(id);
+    setTvgName(tn);
+    await loadPrograms(name, id, tn);
+  };
+
+  /**
+   * ★ 2026-10-14（用户要求）：EPG 窗口内切换频道。
+   *   切换后：
+   *     · 更新本窗口的 channelName / tvgId / tvgName
+   *     · 重新请求该频道的节目单（只请求这一个频道，与主窗口「只加载当前频道」策略一致）
+   *     · 不通知主进程（主窗口的当前播放频道不跟着变）
+   */
+  const switchChannel = (name: string) => {
+    const hit = channels.find((c) => c.name === name);
+    const id = hit?.tvgId || '';
+    const tn = hit?.tvgName || '';
+    setChannelName(name);
+    setTvgId(id);
+    setTvgName(tn);
+    void loadPrograms(name, id, tn);
+  };
+
+  // 首次挂载：从 hash 解析参数 + 通知主进程就绪 + 拉频道列表 + 读置顶状态
   useEffect(() => {
     const hash = window.location.hash || '';
     const qIndex = hash.indexOf('?');
     void loadFromQuery(qIndex >= 0 ? hash.slice(qIndex + 1) : '');
     void ipcInvoke('epg:windowReady').catch(() => undefined);
+    // ★ 拉频道列表（当前分组的全部频道）
+    void (async () => {
+      try {
+        const list = await ipcInvoke<ChannelItem[]>('epg:getChannels');
+        setChannels(Array.isArray(list) ? list : []);
+      } catch { /* ignore */ }
+    })();
+    // 读当前置顶状态
     void (async () => {
       try {
         const on = await client.winIsAlwaysOnTop();
@@ -104,13 +150,20 @@ export default function EpgWinPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 监听主进程更新参数（切换频道时不重载窗口）
+  // 监听主进程更新参数（从主窗口切频道再点 EPG 时）
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('epg:windowUpdate', (qs: unknown) => {
       if (typeof qs === 'string') void loadFromQuery(qs);
     });
-    return () => { if (typeof off === 'function') off(); };
+    // 主进程推送新的频道列表（切分组后）
+    const off2 = w?.winboxIpc?.on?.('epg:getChannels', (list: unknown) => {
+      if (Array.isArray(list)) setChannels(list as ChannelItem[]);
+    });
+    return () => {
+      if (typeof off === 'function') off();
+      if (typeof off2 === 'function') off2();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -180,6 +233,34 @@ export default function EpgWinPage() {
           >×</button>
         </div>
       </div>
+
+      {/* ★ 2026-10-14：频道切换器（当前分组的全部频道） */}
+      {channels.length > 0 && (
+        <div
+          style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '8px 12px', borderBottom: '1px solid #232833',
+            // @ts-ignore
+            WebkitAppRegion: 'no-drag',
+          }}
+        >
+          <span style={{ fontSize: 12, color: '#8a9099', flexShrink: 0 }}>频道：</span>
+          <select
+            value={channelName}
+            onChange={(e) => switchChannel(e.target.value)}
+            style={{
+              flex: 1, minWidth: 0,
+              background: '#0f1218', color: '#e6e6e6',
+              border: '1px solid #333944', borderRadius: 6,
+              padding: '4px 8px', fontSize: 12, cursor: 'pointer',
+            }}
+          >
+            {channels.map((c) => (
+              <option key={c.name} value={c.name}>{c.name}</option>
+            ))}
+          </select>
+        </div>
+      )}
 
       {/* 日期 tab */}
       {dateTabs.length > 0 && (

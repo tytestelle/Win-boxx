@@ -45,7 +45,7 @@ export interface JarBridgeOptions {
   jvmDir: string;
   /** 转换后的 jar 缓存目录 */
   cacheDir: string;
-  /** 单次调用超时 ms */
+  /** 单次调用超时 ms（默认 60s；★ 2026-10-14 从 20s 提高到 60s：防止大 jar 首调 + 慢源站误超时） */
   callTimeoutMs?: number;
   /**
    * shell-shim（方案 A 影子类）的真实实现路径：一份含真实 Spider 的 jar/目录。
@@ -318,7 +318,9 @@ export class JarSpiderBridge {
   constructor(opts: JarBridgeOptions, private host?: EngineHost) {
     this.jvmDir = opts.jvmDir;
     this.cacheDir = opts.cacheDir;
-    this.callTimeoutMs = opts.callTimeoutMs ?? 20000;
+    // ★ 2026-10-14：默认从 20s 提高到 60s —— 大 jar 首次调用（冷启动 + 蜘蛛 init + 网络）20s 容易误判超时，
+    //   表现为「蜘蛛返回空结果」；且此处会传入 poolSubmit，导致常驻 JVM 被过早放弃。
+    this.callTimeoutMs = opts.callTimeoutMs ?? 60000;
     this.shellShimClasses = opts.shellShimClasses;
     this.pyRuntimeDir = opts.pyRuntimeDir;
     this.nativeRuntimeDir = opts.nativeRuntimeDir;
@@ -1045,13 +1047,28 @@ export class JarSpiderBridge {
     return out;
   }
 
-  /** 修复在副本上异步执行；退出/失败后仍可收编原始 part，不必重跑 dex2jar。 */
+  /**
+   * 修复在副本上异步执行；退出/失败后仍可收编原始 part，不必重跑 dex2jar。
+   *
+   * ★ 2026-10-14 修复「DEX 构造器修复工具缺失」：
+   *   旧实现只在 `resources/jvm/native-bridge/native-bridge.jar` 一处查找 DexJarRepair 类，
+   *   而工作流/安装包未必总把该 jar 打进去（实测多次日志出现 `jvm-bridge DEX 构造器修复工具缺失，跳过修复`）。
+   *   现改为**三处回退**：native-bridge.jar → stubs.jar → libs/native-bridge.jar。
+   *   只要任意一处含 `com.winbox.nativebridge.DexJarRepair` 即可让修复生效。
+   *   （若三处都没有，说明构建流程真的漏了，需要工作流把 DexJarRepair.class 编译进 stubs.jar 或 native-bridge.jar。）
+   */
   private async repairDexConstructors(rawJar: string, part: string): Promise<void> {
     const raw = readFileSync(rawJar);
     if (looksLikeZip(raw) && !listZipEntries(raw).some(n => /^classes\d*\.dex$/i.test(n))) return;
-    const bridgeJar = join(this.jvmDir, 'native-bridge', 'native-bridge.jar');
-    if (!existsSync(bridgeJar)) {
-      this.host?.logger.w('jvm-bridge DEX 构造器修复工具缺失，跳过修复');
+    // ★ 2026-10-14：多路径回退查找 DexJarRepair 所在 jar
+    const candidates = [
+      join(this.jvmDir, 'native-bridge', 'native-bridge.jar'),
+      join(this.jvmDir, 'stubs', 'stubs.jar'),
+      join(this.jvmDir, 'libs', 'native-bridge.jar'),
+    ];
+    const bridgeJar = candidates.find((p) => existsSync(p));
+    if (!bridgeJar) {
+      this.host?.logger.w('jvm-bridge DEX 构造器修复工具缺失，跳过修复（native-bridge.jar / stubs.jar 均未找到）');
       return;
     }
     // Baksmali 的子进程需要完整 classpath；不能把未展开的目录通配符传给它。

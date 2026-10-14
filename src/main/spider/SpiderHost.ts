@@ -233,6 +233,14 @@ export class SpiderHost {
   private config: SiteConfig | null = null;
   private report: ImportReport | null = null;
   private sourceMap = new Map<string, SourceBean>();
+  // ★ 2026-10-14：直播源加载缓存（URL → 分组结果 + 时间戳）
+  //   背景：用户反馈「导入本地直播源后，进直播页加载慢」。
+  //   旧 loadLive 每次都走 http.request(本机 127.0.0.1:9978/file/local-live/...)，付一遍
+  //   本机 HTTP 往返 + 重新解析（大 IPTV 源几万频道解析 2-5s）+ IPC 序列化。
+  //   现在：本机 /file/local-live/ 路由直接 readFileSync 绕过 HTTP；5 分钟内存缓存；
+  //   导入后由 IPC 层预热（host.preloadLive）→ 用户切到直播页时缓存已就绪，秒开。
+  private liveCache = new Map<string, { at: number; result: LiveLoadResult }>();
+  private static readonly LIVE_CACHE_TTL_MS = 5 * 60_000;
   private lastSpiderJar = '';
   /** ★ 2026-10-13 EPG：TVBox 风格 EpgManager（懒创建；含 epg_data.json 变体名映射 + XMLTV 按需解析） */
   private epgMgr: EpgManager | null = null;
@@ -2109,9 +2117,42 @@ export class SpiderHost {
     return { ...r, message: '该播放地址需要网页解析/嗅探，自动解析未取得直连地址（可在配置里补充解析接口或改选其它源）' };
   }
 
-  async loadLive(index: number): Promise<LiveLoadResult> {
+  /**
+   * ★ 直播源加载（2026-10-14 优化）
+   *
+   * 用户反馈：**本地文件导入的直播源，进直播页加载也慢**。
+   *
+   * 旧实现：每次都 `this.http.request({ url: live.url })` —— 即使 live.url 就是本机
+   * `http://127.0.0.1:9978/file/local-live/xxx.txt`，也要付一遍完整 HTTP 往返
+   * （客户端 → 本机 9978 → 读文件 → 响应 → 客户端）+ 重新解析 + IPC 序列化。
+   *
+   * 优化（三层）：
+   *   ① **本机 /file/local-live/ 路由特判** → 直接 readFileSync 读 <userData>/local-live/<文件名>，
+   *      绕过 HTTP 往返（省 50-500ms，与网络无关）；
+   *   ② **5 分钟内存缓存**（按 live.url 键）—— 切走再切回、切源再切回、导入后立刻进，
+   *      直接命中缓存秒开；
+   *   ③ 打印耗时日志（分组数 / 频道数 / ms），便于后续继续定位瓶颈。
+   *
+   * @param opts.forceRefresh 传 true 绕过缓存（预热 / 手动刷新按钮用）
+   */
+  async loadLive(index: number, opts: { forceRefresh?: boolean } = {}): Promise<LiveLoadResult> {
     if (!this.config || !this.config.lives.length) throw new Error('无直播配置');
     const live = this.config.lives[Math.min(index, this.config.lives.length - 1)];
+    const cacheKey = live.url || live.api || `idx:${index}`;
+
+    // ★ 命中缓存直接返回（除调用方显式要求 refresh）
+    if (!opts.forceRefresh) {
+      const hit = this.liveCache.get(cacheKey);
+      if (hit && Date.now() - hit.at < SpiderHost.LIVE_CACHE_TTL_MS) {
+        this.logger.i(
+          `直播源「${live.name}」命中缓存（${Math.round((Date.now() - hit.at) / 1000)}s 前，` +
+            `${hit.result.groups.length} 分组 / ${hit.result.groups.reduce((n, g) => n + (g.channels?.length || 0), 0)} 频道）`,
+        );
+        return hit.result;
+      }
+    }
+
+    const t0 = Date.now();
     let text: string | number[];
     if (live.type === '3') {
       const api = live.api || live.url;
@@ -2121,13 +2162,63 @@ export class SpiderHost {
       const json = await Promise.resolve(spider.liveContent(live.api || live.url));
       text = json || '';
     } else {
-      const res = await this.http.request({ url: live.url, method: 'get', timeoutMs: 30000 });
-      text = res.content;
+      // ★ 本机 /file/local-live/ 路由 → 直接读文件，绕开 HTTP 往返
+      const localPath = SpiderHost.localLiveFilePath(live.url);
+      if (localPath) {
+        try {
+          text = readFileSync(localPath, 'utf-8');
+        } catch (e) {
+          throw new Error(`本地直播源文件读取失败：${localPath}（${(e as Error).message}）`);
+        }
+      } else {
+        const res = await this.http.request({ url: live.url, method: 'get', timeoutMs: 30000 });
+        text = res.content;
+      }
     }
     const raw = Array.isArray(text) ? Buffer.from(text).toString('utf-8') : text;
     const groups = toLiveGroups(parseToJsonArray(raw));
-    return { groups, liveName: live.name };
+    const result: LiveLoadResult = { groups, liveName: live.name };
+
+    this.liveCache.set(cacheKey, { at: Date.now(), result });
+    this.logger.i(
+      `直播源「${live.name}」已加载：${groups.length} 分组 / ` +
+        `${groups.reduce((n, g) => n + (g.channels?.length || 0), 0)} 频道（${Date.now() - t0}ms）`,
+    );
+    return result;
   }
+
+  /** 清空直播加载缓存；传 url 时只清那一条。配置变更 / 导入新源 / 手动刷新都调它 */
+  invalidateLiveCache(url?: string): void {
+    if (url) this.liveCache.delete(url);
+    else this.liveCache.clear();
+  }
+
+  /** ★ 后台预热某条直播源（导入成功后由 IPC 层调用；用户切到直播页时命中缓存秒开） */
+  preloadLive(index: number): void {
+    void this.loadLive(index, { forceRefresh: true }).catch((e) => {
+      this.logger.w(`直播源预热失败（index=${index}）：${(e as Error).message}`);
+    });
+  }
+
+  /**
+   * ★ 识别本机 `/file/local-live/<文件名>` 路由 → 返回本地文件路径。
+   *   匹配 `http://127.0.0.1:<port>/file/local-live/<文件名>`（与 importLiveFile 写入路径一致）。
+   *   非本机直播源返回 ''（调用方走网络分支）。
+   *   防路径穿越：文件名只允许单段、不含 `/` `\` `..`。
+   */
+  private static localLiveFilePath(url: string): string {
+    const u = (url || '').trim();
+    const m = /^https?:\/\/127\.0\.0\.1:\d+\/file\/local-live\/([^?#]+)/i.exec(u);
+    if (!m) return '';
+    try {
+      const fileName = decodeURIComponent(m[1]);
+      if (fileName.includes('/') || fileName.includes('\\') || fileName.includes('..')) return '';
+      return join(userDataDir(), 'local-live', fileName);
+    } catch {
+      return '';
+    }
+  }
+
   get lives() {
     return this.config?.lives ?? [];
   }
@@ -2243,14 +2334,6 @@ export class SpiderHost {
 
   /**
    * ★ EPG 直查：接受单 key / 数组 / 逗号分隔字符串；走 EpgManager 的多 key 联合查询
-   *
-   * ★★ 2026-10-14 修复（用户报「EPG 窗口点频道显示"这一天暂无节目单"」）★★
-   *   旧实现只查缓存 Map，不触发 XML 解析。EpgManager 的 worker 是**按需**解析的：
-   *   只有 `loadChannelGroup([频道名])` 才会让 worker 去扫 XML 提取该频道的 programme。
-   *   用户在 EPG 窗口点一个**未缓存过**的频道时，缓存里没数据 → 必须**先 load 再查**：
-   *     · 已缓存过的频道 → `loadChannelGroup` 内部检查 isSubset 命中 → 秒回
-   *     · 未缓存过的频道 → 触发 XML worker 解析该频道（~300-400ms）→ 返回数据
-   *   这与直播页 `loadLiveEpg` 走的是**同一条链路**，行为一致。
    */
   async getLiveEpgPrograms(channelNames: string | string[]): Promise<EpgProgram[]> {
     if (!this.epgMgr) {
@@ -2306,6 +2389,8 @@ export class SpiderHost {
 
   private onUserConfigChange(snap: UserConfig, kind: ConfigChangeKind = 'content'): void {
     if (kind === 'ui') return;
+    // ★ 2026-10-14：直播源列表可能变了（新增/删除/重排）→ 清缓存，避免展示旧源的频道
+    this.invalidateLiveCache();
     const base = snap.apiUrl || '';
     const cfg: SiteConfig = {
       sites: base ? snap.sources.map((s) => normalizeBeanPaths(s, base)) : snap.sources,

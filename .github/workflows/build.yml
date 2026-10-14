@@ -30,93 +30,176 @@ jobs:
         run: npm install
 
       # ==================================================================
-      # ★ 从 yagami-hue/Win-box 同步完整 resources/jvm
-      #
-      #   你的仓库 resources/jvm 缺少运行时资源（sqlite-jdbc 等）。
-      #   这个步骤会 clone yagami-hue/Win-box 并把它的 resources/jvm
-      #   全部合并进来（本地已有文件保留，缺失的从对方补齐）。
+      # ★ 从 yagami-hue/Win-box 强制同步 resources/jvm（关键改动）
+      #   之前是「合并」，本地旧文件不会被覆盖 → stubs-src 一直是旧的。
+      #   现在改成「强制覆盖」：先删本地同名子目录，再复制对方的。
       # ==================================================================
-      - name: Sync resources/jvm from yagami-hue/Win-box
+      - name: Sync resources/jvm from yagami-hue/Win-box (force overwrite)
         shell: pwsh
         run: |
           $tmp = Join-Path $env:RUNNER_TEMP "yagami-resources"
           $dest = "resources/jvm"
 
           if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-          Write-Host "⬇  Clone yagami-hue/Win-box…"
           git clone --depth 1 https://github.com/yagami-hue/Win-box.git $tmp
 
           $sourceJvm = Join-Path $tmp "resources/jvm"
-          if (-not (Test-Path $sourceJvm)) { throw "yagami-hue/Win-box 里没有 resources/jvm 目录" }
+          if (-not (Test-Path $sourceJvm)) { throw "yagami-hue/Win-box 里没有 resources/jvm" }
 
           Write-Host "📋 yagami 的 resources/jvm 内容："
           Get-ChildItem $sourceJvm | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }}
 
-          # 逐项合并：对方文件覆盖本地同名文件，本地独有的保留
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+          # 逐项：先删本地同名项，再从对方复制 —— 强制覆盖，不做合并
           Get-ChildItem $sourceJvm -Force | ForEach-Object {
             $target = Join-Path $dest $_.Name
-            if ($_.PSIsContainer) {
-              if (Test-Path $target) {
-                Copy-Item "$($_.FullName)/*" -Destination $target -Recurse -Force
-              } else {
-                Copy-Item $_.FullName -Destination $dest -Recurse -Force
-              }
+            if (Test-Path $target) {
+              Write-Host "  [覆盖] $($_.Name)"
+              Remove-Item -Recurse -Force $target
             } else {
-              Copy-Item $_.FullName -Destination $dest -Force
+              Write-Host "  [新增] $($_.Name)"
             }
+            Copy-Item $_.FullName -Destination $dest -Recurse -Force
           }
-          Write-Host "✓ 已从 yagami-hue/Win-box 同步 resources/jvm"
+          Write-Host "✓ 已从 yagami-hue/Win-box 强制同步 resources/jvm"
 
       # ==================================================================
-      # ★ 校验：必须存在 JRE、dex2jar、sqlite-jdbc（afterPack 依赖它）
+      # ★ 如果 yagami 没提供 JRE，从 Adoptium 下
       # ==================================================================
-      - name: Verify JVM resources
+      - name: Ensure JRE
+        shell: pwsh
+        run: |
+          $jreDir = "resources/jvm/jre"
+          if (Test-Path "$jreDir/bin/java.exe") {
+            Write-Host "✓ JRE 已存在（来自 yagami）"
+            & "$jreDir/bin/java.exe" -version
+            exit 0
+          }
+          Write-Host "⬇  从 Adoptium 下载 JRE…"
+          New-Item -ItemType Directory -Force -Path $jreDir | Out-Null
+          $url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
+          $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "jre-extract"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600; break }
+            catch {
+              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "JRE 下载失败" }
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+          Get-ChildItem -Path $inner.FullName -Force | Move-Item -Destination $jreDir -Force
+          & "$jreDir/bin/java.exe" -version
+          Write-Host "✓ JRE 就绪"
+
+      # ==================================================================
+      # ★ 如果 yagami 没提供 dex2jar，从 GitHub Releases 下
+      # ==================================================================
+      - name: Ensure dex2jar
+        shell: pwsh
+        run: |
+          $existing = Get-ChildItem "resources/jvm/tools" -Recurse -Filter "dex-tools-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($existing) {
+            Write-Host "✓ dex2jar 已存在（来自 yagami）：$($existing.FullName)"
+            exit 0
+          }
+          Write-Host "⬇  从 GitHub Releases 下载 dex2jar…"
+          $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "dex-tools"
+          $url = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 300; break }
+            catch {
+              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "dex2jar 下载失败" }
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+
+          $dest1 = "resources/jvm/tools/dex2jar"
+          New-Item -ItemType Directory -Force -Path $dest1 | Out-Null
+          Get-ChildItem $inner.FullName -Force | Copy-Item -Destination $dest1 -Recurse -Force
+
+          $dest2 = "resources/jvm/libs"
+          New-Item -ItemType Directory -Force -Path $dest2 | Out-Null
+          Get-ChildItem $inner.FullName -Filter "*.jar" | Copy-Item -Destination $dest2 -Force
+          if (Test-Path "$($inner.FullName)/lib") {
+            Get-ChildItem "$($inner.FullName)/lib" -Filter "*.jar" | Copy-Item -Destination $dest2 -Force
+          }
+          Write-Host "✓ dex2jar 就绪"
+
+      # ==================================================================
+      # ★ 如果 yagami 没提供 sqlite-jdbc，从 Maven Central 下（afterPack 需要它）
+      # ==================================================================
+      - name: Ensure sqlite-jdbc
+        shell: pwsh
+        run: |
+          $dest = "resources/jvm/libs"
+          $jar  = Join-Path $dest "sqlite-jdbc-3.46.1.0.jar"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          if (Test-Path $jar) {
+            Write-Host "✓ sqlite-jdbc 已存在：$((Get-Item $jar).Length) B"
+            exit 0
+          }
+          Write-Host "⬇  从 Maven Central 下载 sqlite-jdbc…"
+          $url = "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.46.1.0/sqlite-jdbc-3.46.1.0.jar"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $jar -UseBasicParsing -TimeoutSec 300; break }
+            catch {
+              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "sqlite-jdbc 下载失败" }
+              Start-Sleep -Seconds 5
+            }
+          }
+          Write-Host "✓ sqlite-jdbc 就绪：$((Get-Item $jar).Length) B"
+
+      # ==================================================================
+      # ★ 校验 + 打印 stubs-src 目录结构（排障用）
+      # ==================================================================
+      - name: Verify & list JVM resources
         shell: pwsh
         run: |
           Write-Host "=== resources/jvm 顶层 ==="
           Get-ChildItem "resources/jvm" | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }}
 
-          Write-Host "`n=== 关键文件校验 ==="
+          Write-Host "`n=== stubs-src/android/database 目录 ==="
+          if (Test-Path "resources/jvm/stubs-src/android/database") {
+            Get-ChildItem "resources/jvm/stubs-src/android/database" -Recurse -Filter "*.java" | ForEach-Object { Write-Host "  $($_.FullName)" }
+          } else {
+            Write-Host "  (不存在)"
+          }
 
-          # JRE
+          Write-Host "`n=== 关键文件校验 ==="
           $java = "resources/jvm/jre/bin/java.exe"
-          if (-not (Test-Path $java)) { throw "❌ 缺少 JRE: $java" }
+          if (-not (Test-Path $java)) { throw "❌ 缺少 JRE" }
           Write-Host "  ✓ JRE: $((Get-Item $java).Length) B"
 
-          # dex2jar
           $dex = Get-ChildItem "resources/jvm/tools" -Recurse -Filter "dex-tools-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $dex) { throw "❌ 缺少 dex2jar" }
-          Write-Host "  ✓ dex2jar: $($dex.FullName) ($($dex.Length) B)"
+          Write-Host "  ✓ dex2jar: $($dex.Length) B"
 
-          # ★ sqlite-jdbc（after-pack.mjs 会检查它）
           $sqlite = "resources/jvm/libs/sqlite-jdbc-3.46.1.0.jar"
-          if (-not (Test-Path $sqlite)) {
-            # 如果 yagami 没有提供，从 Maven Central 下载
-            Write-Host "  ⚠ sqlite-jdbc 不存在，从 Maven Central 下载…"
-            New-Item -ItemType Directory -Force -Path "resources/jvm/libs" | Out-Null
-            $url = "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.46.1.0/sqlite-jdbc-3.46.1.0.jar"
-            $attempts = 0
-            while ($attempts -lt 3) {
-              $attempts++
-              try { Invoke-WebRequest -Uri $url -OutFile $sqlite -UseBasicParsing -TimeoutSec 300; break }
-              catch {
-                Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
-                if ($attempts -ge 3) { throw "sqlite-jdbc 下载失败" }
-                Start-Sleep -Seconds 5
-              }
-            }
-          }
           if (-not (Test-Path $sqlite)) { throw "❌ 缺少 sqlite-jdbc-3.46.1.0.jar" }
           Write-Host "  ✓ sqlite-jdbc: $((Get-Item $sqlite).Length) B"
 
-          # stubs.jar（可选）
           $stubs = "resources/jvm/stubs/stubs.jar"
           if (Test-Path $stubs) {
             Write-Host "  ✓ stubs.jar: $((Get-Item $stubs).Length) B"
           } else {
-            Write-Warning "  ⚠ 缺 stubs.jar（仅影响 3 个 JVM 桩测试）"
+            Write-Warning "  ⚠ 缺 stubs.jar"
           }
 
       # ==================================================================
@@ -125,6 +208,7 @@ jobs:
       - name: Run typecheck
         run: npm run typecheck
 
+      # 保留原来排除的 3 个测试（stubs-src 不完整导致的）
       - name: Run tests
         shell: pwsh
         run: |

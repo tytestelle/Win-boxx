@@ -164,6 +164,15 @@ export const IPC = {
   VOD_PLAY: 'vod:play',
   VOD_DEBUG: 'vod:debug',
   LIVE_LOAD: 'live:load',
+  /**
+   * ★ 2026-10-14（用户要求）：主进程 → 渲染层：直播源已变更（导入本地 TXT/M3U、
+   *   网络订阅带 lives 更新等）。直播页收到后自动重载线路列表 + 当前激活线路，
+   *   无需用户手动切走再切回。
+   *   触发点见 src/main/ipc/index.ts 的 `broadcastLiveChanged()`：
+   *     · CFG_IMPORT_LIVE_LOCAL 导入本地直播源成功后
+   *     · CFG_IMPORT_URL 导入网络订阅成功后（订阅可能带 lives）
+   */
+  LIVE_CHANGED: 'live:changed',
   LIVE_GROUPS: 'live:groups',
   /** ★ 2026-09-29 EPG 节目单：按线路取各频道「当前 / 下一档」（XMLTV 拉取+缓存+匹配在主进程） */
   LIVE_EPG: 'live:epg',

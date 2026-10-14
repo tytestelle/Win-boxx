@@ -116,7 +116,7 @@ jobs:
         run: npm install
 
       # ==================================================================
-      # 1. ★ 打印本仓库 resources 完整目录树（让用户看清本仓库到底有什么）
+      # 1. 打印本仓库 resources 目录树
       # ==================================================================
       - name: Print repository resources tree
         if: github.event.inputs.action != 'delete-only'
@@ -134,11 +134,11 @@ jobs:
           if (Test-Path "resources/js-lib") {
             Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
           } else {
-            Write-Warning "本仓库 resources/js-lib 目录不存在（可能是缺东西的原因）"
+            Write-Warning "本仓库 resources/js-lib 目录不存在"
           }
 
       # ==================================================================
-      # 2. JRE —— 从 Adoptium 下载到 resources/jvm/jre/
+      # 2. JRE
       # ==================================================================
       - name: Prepare JRE
         if: github.event.inputs.action != 'delete-only'
@@ -146,7 +146,7 @@ jobs:
         run: |
           $jreDir = "resources/jvm/jre"
           if (Test-Path "$jreDir/bin/java.exe") {
-            Write-Host "✓ JRE 已存在（本仓库自带）"
+            Write-Host "✓ JRE 已存在"
             & "$jreDir/bin/java.exe" -version
             exit 0
           }
@@ -168,7 +168,7 @@ jobs:
           & "$jreDir/bin/java.exe" -version
 
       # ==================================================================
-      # 3. dex2jar —— resources/jvm/d2j/（代码唯一读取位置）
+      # 3. dex2jar
       # ==================================================================
       - name: Prepare dex2jar
         if: github.event.inputs.action != 'delete-only'
@@ -177,7 +177,7 @@ jobs:
           $d2j = "resources/jvm/d2j"
           $mainJar = Get-ChildItem $d2j -Filter "dex-tools-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($mainJar) {
-            Write-Host "✓ dex2jar 已存在（本仓库自带）：$($mainJar.Name)"
+            Write-Host "✓ dex2jar 已存在：$($mainJar.Name)"
             exit 0
           }
           Write-Host "⬇  从 GitHub Releases 下载 dex2jar v2.4"
@@ -205,7 +205,7 @@ jobs:
           Get-ChildItem $d2j -Filter "*.jar" | Copy-Item -Destination $libs -Force
 
       # ==================================================================
-      # 4. Maven 依赖 —— resources/jvm/libs/（缺就补，全就跳过）
+      # 4. Maven 依赖
       # ==================================================================
       - name: Prepare Maven deps
         if: github.event.inputs.action != 'delete-only'
@@ -226,7 +226,7 @@ jobs:
           )
           foreach ($m in $maven) {
             $dest = Join-Path $libs $m.n
-            if (Test-Path $dest) { Write-Host "✓ $($m.n)（已有）"; continue }
+            if (Test-Path $dest) { Write-Host "✓ $($m.n)"; continue }
             Write-Host "⬇  $($m.n)"
             $attempts = 0
             while ($attempts -lt 3) {
@@ -237,7 +237,80 @@ jobs:
           }
 
       # ==================================================================
-      # 5. 编译 stubs.jar —— 从本仓库 stubs-src + SpiderRunner.java
+      # 5. ★★★ Patch stubs-src：补两个缺失类 ★★★
+      #    （前几版漏了这步，导致 javac 失败）
+      # ==================================================================
+      - name: Patch stubs-src
+        if: github.event.inputs.action != 'delete-only'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p resources/jvm/stubs-src/android/content
+          mkdir -p resources/jvm/stubs-src/com/github/catvod/net
+
+          cat > resources/jvm/stubs-src/android/content/SharedPreferences.java << 'JAVAEOF'
+          package android.content;
+          import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
+          public interface SharedPreferences {
+              Map<String, SharedPreferences> Mem = new ConcurrentHashMap<>();
+              String getString(String key, String defValue);
+              int getInt(String key, int defValue);
+              long getLong(String key, long defValue);
+              boolean getBoolean(String key, boolean defValue);
+              float getFloat(String key, float defValue);
+              Editor edit();
+              interface Editor {
+                  Editor putString(String key, String value);
+                  Editor putInt(String key, int value);
+                  Editor putLong(String key, long value);
+                  Editor putBoolean(String key, boolean value);
+                  Editor putFloat(String key, float value);
+                  boolean commit();
+                  void apply();
+              }
+          }
+          JAVAEOF
+
+          cat > resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java << 'JAVAEOF'
+          package com.github.catvod.net;
+          import okhttp3.Dns;
+          import okhttp3.OkHttpClient;
+          import okhttp3.Request;
+          import okhttp3.Response;
+          import okhttp3.ResponseBody;
+          import java.util.Map;
+          import java.util.concurrent.TimeUnit;
+          public class OkHttp {
+              private static OkHttpClient client;
+              public static Dns dns() { return Dns.SYSTEM; }
+              public static OkHttpClient client() {
+                  if (client == null) {
+                      client = new OkHttpClient.Builder()
+                              .connectTimeout(30, TimeUnit.SECONDS)
+                              .readTimeout(30, TimeUnit.SECONDS)
+                              .writeTimeout(30, TimeUnit.SECONDS)
+                              .build();
+                  }
+                  return client;
+              }
+              public static String string(String url) throws Exception { return string(url, null); }
+              public static String string(String url, Map<String, String> headers) throws Exception {
+                  Request.Builder b = new Request.Builder().url(url);
+                  if (headers != null) {
+                      for (Map.Entry<String, String> e : headers.entrySet()) b.addHeader(e.getKey(), e.getValue());
+                  }
+                  try (Response resp = client().newCall(b.build()).execute()) {
+                      ResponseBody body = resp.body();
+                      return body == null ? "" : body.string();
+                  }
+              }
+          }
+          JAVAEOF
+          echo "patched stubs-src"
+
+      # ==================================================================
+      # 6. 编译 stubs.jar
       # ==================================================================
       - name: Compile stubs.jar
         if: github.event.inputs.action != 'delete-only'
@@ -246,7 +319,7 @@ jobs:
           $stubsSrc = "resources/jvm/stubs-src"
           if (-not (Test-Path $stubsSrc)) {
             if (Test-Path "resources/jvm/stubs/stubs.jar") {
-              Write-Host "✓ stubs.jar 已存在（本仓库自带），跳过编译"
+              Write-Host "✓ stubs.jar 已存在，跳过编译"
               exit 0
             }
             throw "既没 stubs-src 也没 stubs.jar"
@@ -260,7 +333,7 @@ jobs:
 
           $androidAll = Join-Path $stubsDir "android-all-base.jar"
           if (-not (Test-Path $androidAll)) {
-            Write-Host "⬇  android-all（编译 stubs 用，之后会删）"
+            Write-Host "⬇  android-all（编译用，之后删）"
             $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
             $attempts = 0
             while ($attempts -lt 3) {
@@ -276,7 +349,7 @@ jobs:
             Write-Host "adding SpiderRunner.java"
             $sources += (Resolve-Path $spiderRunner).Path
           } else {
-            throw "resources/jvm/SpiderRunner.java 不存在（本仓库必需）"
+            throw "resources/jvm/SpiderRunner.java 不存在"
           }
 
           Write-Host "Compiling $($sources.Count) .java files..."
@@ -299,7 +372,7 @@ jobs:
           Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
 
       # ==================================================================
-      # 6. 校验 —— 检查关键资源齐全
+      # 7. 校验
       # ==================================================================
       - name: Verify resources
         if: github.event.inputs.action != 'delete-only'
@@ -319,12 +392,11 @@ jobs:
           }
           if ($missing.Count -gt 0) { throw "缺失：$($missing -join ', ')" }
 
-          # 打印 js-lib 内容确认
           Write-Host "`n=== resources/js-lib 内容 ==="
           Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
 
       # ==================================================================
-      # 7. 测试 & 构建
+      # 8. 测试 & 构建
       # ==================================================================
       - name: Run typecheck
         if: github.event.inputs.action != 'delete-only'

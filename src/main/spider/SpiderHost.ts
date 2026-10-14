@@ -2243,8 +2243,16 @@ export class SpiderHost {
 
   /**
    * ★ EPG 直查：接受单 key / 数组 / 逗号分隔字符串；走 EpgManager 的多 key 联合查询
+   *
+   * ★★ 2026-10-14 修复（用户报「EPG 窗口点频道显示"这一天暂无节目单"」）★★
+   *   旧实现只查缓存 Map，不触发 XML 解析。EpgManager 的 worker 是**按需**解析的：
+   *   只有 `loadChannelGroup([频道名])` 才会让 worker 去扫 XML 提取该频道的 programme。
+   *   用户在 EPG 窗口点一个**未缓存过**的频道时，缓存里没数据 → 必须**先 load 再查**：
+   *     · 已缓存过的频道 → `loadChannelGroup` 内部检查 isSubset 命中 → 秒回
+   *     · 未缓存过的频道 → 触发 XML worker 解析该频道（~300-400ms）→ 返回数据
+   *   这与直播页 `loadLiveEpg` 走的是**同一条链路**，行为一致。
    */
-  getLiveEpgPrograms(channelNames: string | string[]) {
+  async getLiveEpgPrograms(channelNames: string | string[]): Promise<EpgProgram[]> {
     if (!this.epgMgr) {
       this.logger.w('[EPG] getLiveEpgPrograms: EpgManager 未初始化');
       return [];
@@ -2254,6 +2262,12 @@ export class SpiderHost {
     else list = String(channelNames || '').split(',');
     list = list.map((s) => String(s || '').trim()).filter((s) => !!s);
     if (!list.length) return [];
+    // ★ 先加载：触发 XML worker 解析该频道的 programme（已缓存过的会秒回）
+    try {
+      await this.epgMgr.loadChannelGroup(list);
+    } catch (e) {
+      this.logger.w(`[EPG] loadChannelGroup 失败: ${(e as Error).message}`);
+    }
     return this.epgMgr.getProgramsForChannelMulti(list);
   }
   /** ★ EPG 直查：某频道当前节目 */

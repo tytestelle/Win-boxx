@@ -45,7 +45,7 @@ export interface JarBridgeOptions {
   jvmDir: string;
   /** 转换后的 jar 缓存目录 */
   cacheDir: string;
-  /** 单次调用超时 ms（默认 60s；★ 2026-10-14 从 20s 提高到 60s：防止大 jar 首调 + 慢源站误超时） */
+  /** 单次调用超时 ms（默认 20s） */
   callTimeoutMs?: number;
   /**
    * shell-shim（方案 A 影子类）的真实实现路径：一份含真实 Spider 的 jar/目录。
@@ -318,9 +318,7 @@ export class JarSpiderBridge {
   constructor(opts: JarBridgeOptions, private host?: EngineHost) {
     this.jvmDir = opts.jvmDir;
     this.cacheDir = opts.cacheDir;
-    // ★ 2026-10-14：默认从 20s 提高到 60s —— 大 jar 首次调用（冷启动 + 蜘蛛 init + 网络）20s 容易误判超时，
-    //   表现为「蜘蛛返回空结果」；且此处会传入 poolSubmit，导致常驻 JVM 被过早放弃。
-    this.callTimeoutMs = opts.callTimeoutMs ?? 60000;
+    this.callTimeoutMs = opts.callTimeoutMs ?? 20000;
     this.shellShimClasses = opts.shellShimClasses;
     this.pyRuntimeDir = opts.pyRuntimeDir;
     this.nativeRuntimeDir = opts.nativeRuntimeDir;
@@ -1050,67 +1048,85 @@ export class JarSpiderBridge {
   /**
    * 修复在副本上异步执行；退出/失败后仍可收编原始 part，不必重跑 dex2jar。
    *
-   * ★ 2026-10-14 修复「DEX 构造器修复工具缺失」：
-   *   旧实现只在 `resources/jvm/native-bridge/native-bridge.jar` 一处查找 DexJarRepair 类，
-   *   而工作流/安装包未必总把该 jar 打进去（实测多次日志出现 `jvm-bridge DEX 构造器修复工具缺失，跳过修复`）。
-   *   现改为**三处回退**：native-bridge.jar → stubs.jar → libs/native-bridge.jar。
-   *   只要任意一处含 `com.winbox.nativebridge.DexJarRepair` 即可让修复生效。
-   *   （若三处都没有，说明构建流程真的漏了，需要工作流把 DexJarRepair.class 编译进 stubs.jar 或 native-bridge.jar。）
+   * ★★ 2026-10-14 事故教训（勿回退）★★
+   *   本方法是**增强步骤，不是必需品** —— 任何失败都必须被吞掉、只记日志。
+   *
+   *   历史事故：曾把查找范围扩到 stubs.jar（它永远存在但不含 DexJarRepair），
+   *   `candidates.find(...)` 命中了 stubs.jar → 子进程启动后
+   *   `ClassNotFoundException: com.winbox.nativebridge.DexJarRepair` →
+   *   异常向上冒泡到 adoptFinishedPart / ensureConverted →
+   *   **整个 jar 加载失败**，用户侧表现「连潮流源都用不了」。
+   *
+   *   现在的策略：
+   *     ① 只在 native-bridge.jar 里找 DexJarRepair（工作流未编译该 jar 时它就是缺失的）；
+   *     ② 找到也要先用 zip 条目确认 `DexJarRepair.class` 真的在里面（防「存在但空」的残骸）；
+   *     ③ 整段逻辑包 try/catch —— 任何失败只 warn，绝不抛。
    */
   private async repairDexConstructors(rawJar: string, part: string): Promise<void> {
-    const raw = readFileSync(rawJar);
-    if (looksLikeZip(raw) && !listZipEntries(raw).some(n => /^classes\d*\.dex$/i.test(n))) return;
-    // ★ 2026-10-14：多路径回退查找 DexJarRepair 所在 jar
-    const candidates = [
-      join(this.jvmDir, 'native-bridge', 'native-bridge.jar'),
-      join(this.jvmDir, 'stubs', 'stubs.jar'),
-      join(this.jvmDir, 'libs', 'native-bridge.jar'),
-    ];
-    const bridgeJar = candidates.find((p) => existsSync(p));
-    if (!bridgeJar) {
-      this.host?.logger.w('jvm-bridge DEX 构造器修复工具缺失，跳过修复（native-bridge.jar / stubs.jar 均未找到）');
-      return;
-    }
-    // Baksmali 的子进程需要完整 classpath；不能把未展开的目录通配符传给它。
-    const d2jCp = this.dirJars(join(this.jvmDir, 'd2j')).map(p => resolve(p)).join(';');
-    const java = resolve(this.javaExe());
-    const work = `${part}.constructors.jar`;
-    copyFileSync(part, work);
     try {
-      const output = await new Promise<string>((resolveOutput, reject) => {
-        const child = spawn(java, [
-          '-Xmx384m', '-XX:+UseSerialGC', '-XX:TieredStopAtLevel=1', '-Dfile.encoding=UTF-8',
-          '-cp', [resolve(bridgeJar), d2jCp].join(';'), 'com.winbox.nativebridge.DexJarRepair',
-          resolve(rawJar), resolve(work), java, d2jCp,
-        ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        this.activeChildren.add(child);
-        let out = '';
-        let settled = false;
-        const finish = (error?: Error) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          this.activeChildren.delete(child);
-          if (error) reject(error);
-          else resolveOutput(out);
-        };
-        const timer = setTimeout(() => {
-          child.kill();
-          finish(new Error('DEX 构造器修复超时'));
-        }, D2J_TIMEOUT_MS);
-        timer.unref?.();
-        const onData = (data: Buffer | string) => { out = (out + String(data)).slice(-8000); };
-        child.stdout?.on('data', onData);
-        child.stderr?.on('data', onData);
-        child.on('error', (error) => finish(error));
-        child.on('close', (code) => finish(code === 0 ? undefined : new Error(`DEX 构造器修复失败（code=${code}）：${out.slice(-400)}`)));
-      });
-      const fixed = /fixed sites = (\d+)/.exec(output);
-      if (!fixed || !isUsableConvertedJar(work)) throw new Error(`DEX 构造器修复未完成：${output.slice(-400)}`);
-      renameSync(work, part);
-      this.host?.logger.i(`jvm-bridge DEX 构造器修复完成：${fixed[1]} 处（${basename(part)}）`);
-    } finally {
-      try { rmSync(work, { force: true }); } catch { /* 下次收编时覆盖副本 */ }
+      const raw = readFileSync(rawJar);
+      if (looksLikeZip(raw) && !listZipEntries(raw).some(n => /^classes\d*\.dex$/i.test(n))) return;
+      // ★ 只找 native-bridge.jar（不扩到 stubs.jar —— 那会让「工具缺失」变成「工具找错→类找不到」）
+      const bridgeJar = join(this.jvmDir, 'native-bridge', 'native-bridge.jar');
+      if (!existsSync(bridgeJar) || !this.jarContainsClass(bridgeJar, 'com/winbox/nativebridge/DexJarRepair.class')) {
+        this.host?.logger.w('jvm-bridge DEX 构造器修复工具缺失，跳过修复');
+        return;
+      }
+      // Baksmali 的子进程需要完整 classpath；不能把未展开的目录通配符传给它。
+      const d2jCp = this.dirJars(join(this.jvmDir, 'd2j')).map(p => resolve(p)).join(';');
+      const java = resolve(this.javaExe());
+      const work = `${part}.constructors.jar`;
+      copyFileSync(part, work);
+      try {
+        const output = await new Promise<string>((resolveOutput, reject) => {
+          const child = spawn(java, [
+            '-Xmx384m', '-XX:+UseSerialGC', '-XX:TieredStopAtLevel=1', '-Dfile.encoding=UTF-8',
+            '-cp', [resolve(bridgeJar), d2jCp].join(';'), 'com.winbox.nativebridge.DexJarRepair',
+            resolve(rawJar), resolve(work), java, d2jCp,
+          ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+          this.activeChildren.add(child);
+          let out = '';
+          let settled = false;
+          const finish = (error?: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            this.activeChildren.delete(child);
+            if (error) reject(error);
+            else resolveOutput(out);
+          };
+          const timer = setTimeout(() => {
+            child.kill();
+            finish(new Error('DEX 构造器修复超时'));
+          }, D2J_TIMEOUT_MS);
+          timer.unref?.();
+          const onData = (data: Buffer | string) => { out = (out + String(data)).slice(-8000); };
+          child.stdout?.on('data', onData);
+          child.stderr?.on('data', onData);
+          child.on('error', (error) => finish(error));
+          child.on('close', (code) => finish(code === 0 ? undefined : new Error(`DEX 构造器修复失败（code=${code}）：${out.slice(-400)}`)));
+        });
+        const fixed = /fixed sites = (\d+)/.exec(output);
+        if (!fixed || !isUsableConvertedJar(work)) throw new Error(`DEX 构造器修复未完成：${output.slice(-400)}`);
+        renameSync(work, part);
+        this.host?.logger.i(`jvm-bridge DEX 构造器修复完成：${fixed[1]} 处（${basename(part)}）`);
+      } finally {
+        try { rmSync(work, { force: true }); } catch { /* 下次收编时覆盖副本 */ }
+      }
+    } catch (e) {
+      // ★ 修复是增强：任何失败都吞掉。原来这里会向上冒泡 → 整个 jar 加载失败（2026-10-14 事故）。
+      this.host?.logger.w(`jvm-bridge DEX 构造器修复失败，跳过（不影响普通 jar）: ${(e as Error).message}`);
+    }
+  }
+
+  /** 检查 jar 里是否真的包含指定 class 条目（防「文件存在但内容为空/不含目标类」的误判） */
+  private jarContainsClass(jarPath: string, classEntry: string): boolean {
+    try {
+      const buf = readFileSync(jarPath);
+      if (!looksLikeZip(buf)) return false;
+      return listZipEntries(buf).includes(classEntry);
+    } catch {
+      return false;
     }
   }
 

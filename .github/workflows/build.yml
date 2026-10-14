@@ -23,6 +23,58 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      # ★ 2026-10-14（新增）：准备 JRE（Windows x64）
+      #   项目用 <resources>/jvm/jre/bin/java.exe 跑 .jar 源（jar-spider），
+      #   之前 workflow 没下载 JRE → 打出来的安装包 jvm/jre 目录为空 → 点播报「JRE 缺失」。
+      #   这里在构建前把 Adoptium Temurin JRE 21（Windows x64）拉到 resources/jvm/jre。
+      - name: Prepare JRE (Windows x64)
+        shell: pwsh
+        run: |
+          $jreDir = "resources/jvm/jre"
+          if (Test-Path "$jreDir/bin/java.exe") {
+            Write-Host "✓ JRE 已存在，跳过下载：$jreDir"
+            & "$jreDir/bin/java.exe" -version
+            exit 0
+          }
+          New-Item -ItemType Directory -Force -Path $jreDir | Out-Null
+
+          # Adoptium 官方 API：最新 JRE 21 GA（Windows x64，Hotspot）
+          $url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
+          $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "jre-extract"
+
+          Write-Host "⬇  下载 JRE：$url"
+          $attempts = 0
+          $maxAttempts = 3
+          while ($attempts -lt $maxAttempts) {
+            $attempts++
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600
+              break
+            } catch {
+              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+              if ($attempts -ge $maxAttempts) { throw "JRE 下载失败，已重试 $maxAttempts 次" }
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          Write-Host "📦 解压中：$zip → $extract"
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          # Adoptium 解压后通常是 jdk-21.0.x+y-jre/ 这样的一层目录
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+          if (-not $inner) { throw "解压后未找到目录" }
+          Write-Host "🚚 移动 $($inner.FullName) 内容 → $jreDir"
+          Get-ChildItem -Path $inner.FullName -Force | Move-Item -Destination $jreDir -Force
+
+          # 校验
+          if (-not (Test-Path "$jreDir/bin/java.exe")) {
+            throw "JRE 准备失败：$jreDir/bin/java.exe 不存在"
+          }
+          & "$jreDir/bin/java.exe" -version
+          Write-Host "✓ JRE 就绪：$jreDir"
+
       - name: Run typecheck
         run: npm run typecheck
 
@@ -38,6 +90,16 @@ jobs:
           if (-not (Test-Path "LICENSE.txt")) {
             "MIT License`n`nCopyright (c) 2026 Win-Box" | Out-File -Encoding utf8 LICENSE.txt
           }
+
+      # ★ 2026-10-14（可选校验）：打包前确认 JRE 会被 electron-builder 收进去
+      - name: Verify JRE before packaging
+        shell: pwsh
+        run: |
+          $java = "resources/jvm/jre/bin/java.exe"
+          if (-not (Test-Path $java)) { throw "打包前校验失败：$java 不存在" }
+          Write-Host "✓ 打包前校验：$java 存在"
+          (Get-Item $java).Length
+          Get-ChildItem "resources/jvm/jre" | Select-Object Name, Length
 
       - name: Package with electron-builder
         run: npx electron-builder --win --publish never

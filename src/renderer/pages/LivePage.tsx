@@ -215,7 +215,6 @@ export default function LivePage() {
   const [epgStatus, setEpgStatus] = useState<EpgStatus>('idle');
   const epgTimer = useRef<number | null>(null);
 
-  // 订阅源状态（仅用于顶栏展示）
   const [subCount, setSubCount] = useState(0);
   const [subEnabled, setSubEnabled] = useState(0);
 
@@ -254,7 +253,6 @@ export default function LivePage() {
     if (msg) setReconnectMsg(msg);
   }, []);
 
-  // ====== 重新加载 lives（顶部下拉） ======
   const reloadLives = useCallback(async () => {
     try {
       const cfg = await client.cfgGet();
@@ -271,7 +269,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveIdx]);
 
-  // ====== 加载某个线路 ======
   async function loadLiveInternal(index: number, meta?: LiveBean[]) {
     const m = meta ?? lives;
     if (!m.length) return;
@@ -327,7 +324,6 @@ export default function LivePage() {
   }
   const pickChannel = pickChannelInternal;
 
-  // ====== 订阅源状态 ======
   const loadSubStatus = useCallback(async () => {
     try {
       const list = await ipcInvoke<LiveSubscription[]>('live:subscription:list');
@@ -337,7 +333,6 @@ export default function LivePage() {
     } catch { /* ignore */ }
   }, []);
 
-  // ====== 初始化 ======
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -360,7 +355,6 @@ export default function LivePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 监听主进程广播（订阅源 CRUD / 刷新后），实时重新拉 lives + 订阅状态
   useEffect(() => {
     const w = window as any;
     const off = w?.winboxIpc?.on?.('live:subscriptions-changed', () => {
@@ -370,20 +364,11 @@ export default function LivePage() {
     return () => { if (typeof off === 'function') off(); };
   }, [loadSubStatus, reloadLives]);
 
-  // ====== EPG（当前/下一档，仅在直播页内显示摘要） ======
   const curGroup = groups.find((g) => g.group === groupName);
   const curChannel = curGroup?.channels.find((c) => c.name === channelName);
   const curEpg = curChannel ? (epg[curChannel['tvg-id']] || epg[curChannel['tvg-name']] || epg[curChannel.name]) : undefined;
   const lines = curChannel ? curChannel.urls.map((u, i) => splitLine(u, i + 1)) : [];
 
-  /**
-   * ★ 2026-10-14（用户要求「只加载当前频道的 EPG」）：
-   *   旧实现把所有分组的**所有频道**都传给主进程 → EpgManager 要为几百个 channelId
-   *   保存 programme → worker 内部内存暴涨、结果传输大 → 主进程被拖慢。
-   *   现改为**只请求当前正在播的频道**：
-   *     · 数据量从「几百个频道 × 几十条节目」降到「1 个频道 × 几十条节目」
-   *     · 切换频道时重新请求（只重新请求这一个频道，不重复整组）
-   */
   async function refreshEpg(index: number, gs: LiveGroup[], currentChannelName: string) {
     if (!currentChannelName) { setEpg({}); setEpgStatus('empty'); return; }
     const refs: EpgChannelRef[] = [];
@@ -435,10 +420,10 @@ export default function LivePage() {
 
   /**
    * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
-   *   - 主进程创建/复用一个无边框独立窗口，**默认置顶**，可拖动到屏幕任意位置
-   *   - 单例：切换频道时通知已开窗口换参数（不重载、不丢位置）
-   *   - ★ 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`：
-   *       EPG 窗口左侧渲染「分组 → 频道」列表，点击可切换到任意分组的任意频道。
+   *   - 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`（当前分组名）
+   *     → EPG 窗口左侧渲染「分组 → 频道」列表，点分组展开、点频道加载其节目预告。
+   *   - 传 `channelName / tvgId / tvgName` 作为「初始频道」= 主窗口**当前正在播放的频道**
+   *     → EPG 窗口顶部「↩ 当前」按钮可一键切回。
    */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();

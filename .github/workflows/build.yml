@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # ★ 发布 Release 需要写权限
+  contents: write
 
 jobs:
   build-windows:
@@ -33,7 +33,7 @@ jobs:
         run: npm install
 
       # ==================================================================
-      # 1. JRE
+      # 1. JRE —— resources/jvm/jre/bin/java.exe
       # ==================================================================
       - name: Prepare JRE
         shell: pwsh
@@ -65,12 +65,15 @@ jobs:
           Get-ChildItem -Path $inner.FullName -Force | Move-Item -Destination $jreDir -Force
           if (-not (Test-Path "$jreDir/bin/java.exe")) { throw "JRE setup failed" }
           & "$jreDir/bin/java.exe" -version
-          Write-Host "JRE ready"
 
       # ==================================================================
-      # 2. dex2jar
+      # 2. ★★★ dex2jar —— 放进 resources/jvm/d2j/（代码唯一读取位置）★★★
+      #   代码：
+      #     const d2jCp = this.dirJars(join(this.jvmDir, 'd2j')).join(';');
+      #     spawn(java, ['-cp', d2jCp, 'com.googlecode.dex2jar.tools.Dex2jarCmd', ...])
+      #   所以 dex-tools-v2.4.jar 与它 lib/ 下所有依赖 jar，都必须落在 jvm/d2j/。
       # ==================================================================
-      - name: Prepare dex2jar
+      - name: Prepare dex2jar (into d2j/)
         shell: pwsh
         run: |
           $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
@@ -92,26 +95,39 @@ jobs:
           $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
           if (-not $inner) { throw "dex-tools extract failed" }
 
-          $dest1 = "resources/jvm/tools/dex2jar"
-          Remove-Item -Recurse -Force $dest1 -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $dest1 | Out-Null
-          Get-ChildItem $inner.FullName -Force | Copy-Item -Destination $dest1 -Recurse -Force
+          Write-Host "=== dex-tools-v2.4 解压后 ==="
+          Get-ChildItem $inner.FullName | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }} | Format-Table -AutoSize
 
-          $dest2 = "resources/jvm/d2j"
-          Remove-Item -Recurse -Force $dest2 -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $dest2 | Out-Null
-          Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest2 -Force
-          Get-ChildItem "$($inner.FullName)/*.sh" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest2 -Force
+          # ★ 目标目录：resources/jvm/d2j/（代码唯一读取位置）
+          $d2j = "resources/jvm/d2j"
+          Remove-Item -Recurse -Force $d2j -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $d2j | Out-Null
 
-          $dest3 = "resources/jvm/libs"
-          New-Item -ItemType Directory -Force -Path $dest3 | Out-Null
-          Get-ChildItem "$($inner.FullName)/lib/*.jar" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest3 -Force
-          Get-ChildItem "$($inner.FullName)/*.jar" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest3 -Force
+          # 主 jar（dex-tools-v2.4.jar）—— 放顶层
+          Get-ChildItem "$($inner.FullName)/*.jar" | Copy-Item -Destination $d2j -Force
 
-          Write-Host "dex2jar ready"
+          # lib/ 下所有依赖 jar（antlr、asm、d2j-*、dex-*、ST4、dx 等）—— 放顶层
+          # 代码是 dirJars() 读 d2j/ 一层（不递归），所以必须平铺在 d2j/ 根
+          if (Test-Path "$($inner.FullName)/lib") {
+            Get-ChildItem "$($inner.FullName)/lib/*.jar" | Copy-Item -Destination $d2j -Force
+          }
+
+          # 脚本也一并放进去（可选，调试方便）
+          Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
+          Get-ChildItem "$($inner.FullName)/*.sh" -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
+
+          Write-Host "=== resources/jvm/d2j 内容 ==="
+          Get-ChildItem $d2j -Filter "*.jar" | Select-Object Name, Length | Format-Table -AutoSize
+
+          if (-not (Test-Path "$d2j/dex-tools-v2.4.jar")) { throw "dex-tools-v2.4.jar 未就位" }
+
+          # 顺手放一份到 libs/（兜底：不保证代码会读，但多一份不亏）
+          $libs = "resources/jvm/libs"
+          New-Item -ItemType Directory -Force -Path $libs | Out-Null
+          Get-ChildItem $d2j -Filter "*.jar" | Copy-Item -Destination $libs -Force
 
       # ==================================================================
-      # 3. Maven deps
+      # 3. Maven 依赖 —— resources/jvm/libs/*.jar（stubs 编译 + 运行时 classpath）
       # ==================================================================
       - name: Prepare Maven deps
         shell: pwsh
@@ -145,7 +161,7 @@ jobs:
           }
 
       # ==================================================================
-      # 4. Patch stubs-src missing classes
+      # 4. Patch stubs-src 缺失类（编译 stubs.jar 需要）
       # ==================================================================
       - name: Patch stubs-src missing classes
         shell: bash
@@ -213,14 +229,10 @@ jobs:
               }
           }
           JAVAEOF
-
-          echo "=== SharedPreferences.java ==="
-          cat resources/jvm/stubs-src/android/content/SharedPreferences.java
-          echo "=== OkHttp.java ==="
-          cat resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java
+          echo "patched stubs-src"
 
       # ==================================================================
-      # 5. Compile stubs.jar
+      # 5. 编译 stubs.jar —— resources/jvm/stubs/stubs.jar
       # ==================================================================
       - name: Compile stubs.jar
         shell: pwsh
@@ -262,28 +274,43 @@ jobs:
           Pop-Location
           Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
 
+          # android-all-base.jar 只是编译时的辅助，绝不进安装包
+          Remove-Item -Force $androidAll -ErrorAction SilentlyContinue
+          Write-Host "removed android-all-base.jar (kept out of package)"
+
       # ==================================================================
-      # 6. 校验
+      # 6. 校验 —— 严格对齐代码期望的路径
       # ==================================================================
-      - name: Verify resources
+      - name: Verify resources (match code paths)
         shell: pwsh
         run: |
-          Get-ChildItem "resources/jvm" | Select-Object Name | Format-Table -AutoSize
           $must = @(
+            # JarSpiderBridge.javaExePath()
             "resources/jvm/jre/bin/java.exe",
-            "resources/jvm/tools/dex2jar",
-            "resources/jvm/libs/dex-tools-v2.4.jar",
-            "resources/jvm/libs/sqlite-jdbc-3.46.1.0.jar",
+            # JarSpiderBridge.runDex2jar 的 -cp（★ 关键）
+            "resources/jvm/d2j/dex-tools-v2.4.jar",
+            # JarSpiderBridge.classpathJars()
+            "resources/jvm/stubs/stubs.jar",
+            # libs（运行时 -cp 由 libJars() 读）
             "resources/jvm/libs/gson-2.10.1.jar",
             "resources/jvm/libs/okhttp-3.14.9.jar",
             "resources/jvm/libs/okio-1.17.5.jar",
             "resources/jvm/libs/jsoup-1.17.2.jar",
-            "resources/jvm/stubs/stubs.jar"
+            "resources/jvm/libs/sqlite-jdbc-3.46.1.0.jar"
           )
           foreach ($m in $must) {
             if (-not (Test-Path $m)) { throw "missing: $m" }
-            Write-Host "OK: $m"
+            $sz = (Get-Item $m).Length
+            Write-Host "OK: $m ($sz B)"
           }
+
+          # 独立验证：用安装目录里会有的东西，跑一次 dex2jar
+          Write-Host "`n=== 独立验证 dex2jar 能否起来 ==="
+          $jre = "resources/jvm/jre/bin/java.exe"
+          $d2j = "resources/jvm/d2j"
+          & $jre -cp "$d2j\*" com.googlecode.dex2jar.tools.Dex2jarCmd --version
+          if ($LASTEXITCODE -ne 0) { throw "dex2jar 独立验证失败：java -cp 'd2j/*' Dex2jarCmd 无法启动" }
+          Write-Host "dex2jar verification OK"
 
       # ==================================================================
       # 7. 测试 & 构建
@@ -308,7 +335,7 @@ jobs:
         run: npx electron-builder --win --publish never
 
       # ==================================================================
-      # 8. ★ 从 package.json 读版本，生成 tag
+      # 8. 发布到 GitHub Release
       # ==================================================================
       - name: Get package version
         id: pkg
@@ -317,15 +344,9 @@ jobs:
           $pkg = Get-Content package.json -Raw | ConvertFrom-Json
           $v = $pkg.version
           $tag = "v$v"
-          Write-Host "version = $v"
-          Write-Host "tag = $tag"
           "version=$v" >> $env:GITHUB_OUTPUT
           "tag=$tag" >> $env:GITHUB_OUTPUT
-          "output_dir=release$v" >> $env:GITHUB_OUTPUT
 
-      # ==================================================================
-      # 9. 上传到 GitHub Actions Artifacts（临时，90 天有效）
-      # ==================================================================
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -335,12 +356,6 @@ jobs:
             release${{ steps.pkg.outputs.version }}/*.blockmap
             release${{ steps.pkg.outputs.version }}/latest.yml
 
-      # ==================================================================
-      # 10. ★ 上传到 GitHub Release 页面（长期可用，下载不走 Actions 中转，不易断流）
-      #     · 只在 push 到 main 分支时触发（PR / 手动运行不发 Release）
-      #     · 同 tag 已存在的 Release 会更新 assets（不会重复创建）
-      #     · 首次运行会自动创建 tag（用当前 commit）
-      # ==================================================================
       - name: Upload to GitHub Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
@@ -355,11 +370,6 @@ jobs:
             ### 下载
             - `Win-Box Setup ${{ steps.pkg.outputs.version }}.exe` —— Windows 安装包
             - `latest.yml` / `*.blockmap` —— 自动更新清单
-
-            ### 构建来源
-            - 仓库：${{ github.repository }}
-            - 提交：${{ github.sha }}
-            - 工作流：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           files: |
             release${{ steps.pkg.outputs.version }}/*.exe
             release${{ steps.pkg.outputs.version }}/*.blockmap

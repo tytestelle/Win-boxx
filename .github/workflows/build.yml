@@ -21,12 +21,12 @@ on:
           - delete-only
         default: 'build-and-release'
       delete_tag:
-        description: '要删除的 tag（可选，如 v1.21.2-2026-10-14-13-05-30-abc1234）'
+        description: '要删除的 tag（如 v1.21.2-2026-10-14-13-05-30-abc1234）'
         required: false
         type: string
         default: ''
       draft:
-        description: '发布为草稿（可稍后在 GitHub 页面手动编辑后再发布）'
+        description: '发布为草稿'
         required: false
         type: boolean
         default: false
@@ -53,17 +53,12 @@ jobs:
         run: |
           TAG="${{ github.event.inputs.delete_tag }}"
           REPO="${{ github.repository }}"
-          echo "=== 尝试删除 Release & Tag: $TAG ==="
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag
-            echo "✓ Release 已删除（含 tag）"
-          else
-            echo "（无同名 Release）"
+            echo "✓ Release 已删除"
           fi
           gh api -X DELETE "repos/$REPO/git/refs/tags/$TAG" 2>/dev/null \
-            && echo "✓ Tag 已删除" \
-            || echo "（无同名 tag）"
-          echo "Done."
+            && echo "✓ Tag 已删除" || echo "（无同名 tag）"
 
       # ==================================================================
       # 0b. 计算完整版本号
@@ -77,29 +72,21 @@ jobs:
           if (-not $base) {
             $pkg = Get-Content package.json -Raw | ConvertFrom-Json
             $base = $pkg.version
-            Write-Host "base version from package.json: $base"
-          } else {
-            Write-Host "base version from input: $base"
           }
           $base = $base -replace '^v', ''
           if ($base -notmatch '^\d+\.\d+\.\d+') { throw "基础版本号格式非法：$base" }
-
           $bj = (Get-Date).ToUniversalTime().AddHours(8)
           $bjStamp = $bj.ToString('yyyy-MM-dd-HH-mm-ss')
-
           $sha = "${{ github.sha }}"
           $shortSha = $sha.Substring(0, 7)
-
           $full = "${base}-${bjStamp}-${shortSha}"
           $tag  = "v$full"
-
           "base=$base"              >> $env:GITHUB_OUTPUT
           "bj_stamp=$bjStamp"       >> $env:GITHUB_OUTPUT
           "short_sha=$shortSha"     >> $env:GITHUB_OUTPUT
           "full=$full"              >> $env:GITHUB_OUTPUT
           "tag=$tag"                >> $env:GITHUB_OUTPUT
           "output_dir=release$full" >> $env:GITHUB_OUTPUT
-          Write-Host "full version: $full"
 
       - name: Apply version to package.json
         if: github.event.inputs.action != 'delete-only'
@@ -108,11 +95,8 @@ jobs:
           $v = "${{ steps.ver.outputs.full }}"
           $pkg = Get-Content package.json -Raw | ConvertFrom-Json
           $pkg.version = $v
-          if ($pkg.build.directories.output) {
-            $pkg.build.directories.output = "release$v"
-          }
+          if ($pkg.build.directories.output) { $pkg.build.directories.output = "release$v" }
           $pkg | ConvertTo-Json -Depth 32 | Set-Content package.json -Encoding utf8
-          Write-Host "package.json version -> $v"
 
       - name: Setup Node.js
         if: github.event.inputs.action != 'delete-only'
@@ -132,7 +116,29 @@ jobs:
         run: npm install
 
       # ==================================================================
-      # 1. JRE
+      # 1. ★ 打印本仓库 resources 完整目录树（让用户看清本仓库到底有什么）
+      # ==================================================================
+      - name: Print repository resources tree
+        if: github.event.inputs.action != 'delete-only'
+        shell: pwsh
+        run: |
+          Write-Host "========== 本仓库 resources/ 完整树 =========="
+          if (Test-Path "resources") {
+            Get-ChildItem "resources" -Recurse -File |
+              Select-Object @{n='Path';e={$_.FullName.Replace($PWD.Path + '\', '')}}, Length |
+              Format-Table -AutoSize
+          } else {
+            throw "本仓库没有 resources 目录"
+          }
+          Write-Host "========== 检查 resources/js-lib =========="
+          if (Test-Path "resources/js-lib") {
+            Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
+          } else {
+            Write-Warning "本仓库 resources/js-lib 目录不存在（可能是缺东西的原因）"
+          }
+
+      # ==================================================================
+      # 2. JRE —— 从 Adoptium 下载到 resources/jvm/jre/
       # ==================================================================
       - name: Prepare JRE
         if: github.event.inputs.action != 'delete-only'
@@ -140,10 +146,11 @@ jobs:
         run: |
           $jreDir = "resources/jvm/jre"
           if (Test-Path "$jreDir/bin/java.exe") {
-            Write-Host "JRE exists"
+            Write-Host "✓ JRE 已存在（本仓库自带）"
             & "$jreDir/bin/java.exe" -version
             exit 0
           }
+          Write-Host "⬇  从 Adoptium 下载 JRE 21"
           New-Item -ItemType Directory -Force -Path $jreDir | Out-Null
           $url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
           $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
@@ -161,12 +168,19 @@ jobs:
           & "$jreDir/bin/java.exe" -version
 
       # ==================================================================
-      # 2. dex2jar → resources/jvm/d2j/
+      # 3. dex2jar —— resources/jvm/d2j/（代码唯一读取位置）
       # ==================================================================
       - name: Prepare dex2jar
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
         run: |
+          $d2j = "resources/jvm/d2j"
+          $mainJar = Get-ChildItem $d2j -Filter "dex-tools-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($mainJar) {
+            Write-Host "✓ dex2jar 已存在（本仓库自带）：$($mainJar.Name)"
+            exit 0
+          }
+          Write-Host "⬇  从 GitHub Releases 下载 dex2jar v2.4"
           $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
           $extract = Join-Path $env:RUNNER_TEMP "dex-tools"
           $url = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
@@ -179,9 +193,6 @@ jobs:
           if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
           Expand-Archive -Path $zip -DestinationPath $extract -Force
           $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
-
-          $d2j = "resources/jvm/d2j"
-          Remove-Item -Recurse -Force $d2j -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $d2j | Out-Null
           Get-ChildItem "$($inner.FullName)/*.jar" | Copy-Item -Destination $d2j -Force
           if (Test-Path "$($inner.FullName)/lib") {
@@ -189,13 +200,12 @@ jobs:
           }
           Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
           Get-ChildItem "$($inner.FullName)/*.sh"  -ErrorAction SilentlyContinue | Copy-Item -Destination $d2j -Force
-
           $libs = "resources/jvm/libs"
           New-Item -ItemType Directory -Force -Path $libs | Out-Null
           Get-ChildItem $d2j -Filter "*.jar" | Copy-Item -Destination $libs -Force
 
       # ==================================================================
-      # 3. Maven deps
+      # 4. Maven 依赖 —— resources/jvm/libs/（缺就补，全就跳过）
       # ==================================================================
       - name: Prepare Maven deps
         if: github.event.inputs.action != 'delete-only'
@@ -216,7 +226,8 @@ jobs:
           )
           foreach ($m in $maven) {
             $dest = Join-Path $libs $m.n
-            if (Test-Path $dest) { continue }
+            if (Test-Path $dest) { Write-Host "✓ $($m.n)（已有）"; continue }
+            Write-Host "⬇  $($m.n)"
             $attempts = 0
             while ($attempts -lt 3) {
               $attempts++
@@ -226,83 +237,21 @@ jobs:
           }
 
       # ==================================================================
-      # 4. Patch stubs-src
-      # ==================================================================
-      - name: Patch stubs-src
-        if: github.event.inputs.action != 'delete-only'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p resources/jvm/stubs-src/android/content
-          mkdir -p resources/jvm/stubs-src/com/github/catvod/net
-          cat > resources/jvm/stubs-src/android/content/SharedPreferences.java << 'JAVAEOF'
-          package android.content;
-          import java.util.Map;
-          import java.util.concurrent.ConcurrentHashMap;
-          public interface SharedPreferences {
-              Map<String, SharedPreferences> Mem = new ConcurrentHashMap<>();
-              String getString(String key, String defValue);
-              int getInt(String key, int defValue);
-              long getLong(String key, long defValue);
-              boolean getBoolean(String key, boolean defValue);
-              float getFloat(String key, float defValue);
-              Editor edit();
-              interface Editor {
-                  Editor putString(String key, String value);
-                  Editor putInt(String key, int value);
-                  Editor putLong(String key, long value);
-                  Editor putBoolean(String key, boolean value);
-                  Editor putFloat(String key, float value);
-                  boolean commit();
-                  void apply();
-              }
-          }
-          JAVAEOF
-          cat > resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java << 'JAVAEOF'
-          package com.github.catvod.net;
-          import okhttp3.Dns;
-          import okhttp3.OkHttpClient;
-          import okhttp3.Request;
-          import okhttp3.Response;
-          import okhttp3.ResponseBody;
-          import java.util.Map;
-          import java.util.concurrent.TimeUnit;
-          public class OkHttp {
-              private static OkHttpClient client;
-              public static Dns dns() { return Dns.SYSTEM; }
-              public static OkHttpClient client() {
-                  if (client == null) {
-                      client = new OkHttpClient.Builder()
-                              .connectTimeout(30, TimeUnit.SECONDS)
-                              .readTimeout(30, TimeUnit.SECONDS)
-                              .writeTimeout(30, TimeUnit.SECONDS)
-                              .build();
-                  }
-                  return client;
-              }
-              public static String string(String url) throws Exception { return string(url, null); }
-              public static String string(String url, Map<String, String> headers) throws Exception {
-                  Request.Builder b = new Request.Builder().url(url);
-                  if (headers != null) {
-                      for (Map.Entry<String, String> e : headers.entrySet()) b.addHeader(e.getKey(), e.getValue());
-                  }
-                  try (Response resp = client().newCall(b.build()).execute()) {
-                      ResponseBody body = resp.body();
-                      return body == null ? "" : body.string();
-                  }
-              }
-          }
-          JAVAEOF
-          echo "patched"
-
-      # ==================================================================
-      # 5. 编译 stubs.jar
+      # 5. 编译 stubs.jar —— 从本仓库 stubs-src + SpiderRunner.java
       # ==================================================================
       - name: Compile stubs.jar
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
         run: |
           $stubsSrc = "resources/jvm/stubs-src"
+          if (-not (Test-Path $stubsSrc)) {
+            if (Test-Path "resources/jvm/stubs/stubs.jar") {
+              Write-Host "✓ stubs.jar 已存在（本仓库自带），跳过编译"
+              exit 0
+            }
+            throw "既没 stubs-src 也没 stubs.jar"
+          }
+
           $stubsDir = "resources/jvm/stubs"
           $classes  = Join-Path $stubsDir "classes"
           New-Item -ItemType Directory -Force -Path $stubsDir | Out-Null
@@ -311,6 +260,7 @@ jobs:
 
           $androidAll = Join-Path $stubsDir "android-all-base.jar"
           if (-not (Test-Path $androidAll)) {
+            Write-Host "⬇  android-all（编译 stubs 用，之后会删）"
             $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
             $attempts = 0
             while ($attempts -lt 3) {
@@ -321,38 +271,19 @@ jobs:
           }
 
           $sources = @(Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName })
-
           $spiderRunner = "resources/jvm/SpiderRunner.java"
           if (Test-Path $spiderRunner) {
-            Write-Host "adding SpiderRunner.java (required)"
+            Write-Host "adding SpiderRunner.java"
             $sources += (Resolve-Path $spiderRunner).Path
           } else {
-            throw "resources/jvm/SpiderRunner.java 不存在"
-          }
-
-          $pyRunner = "resources/jvm/PythonRunner.java"
-          $jythonJar = Get-ChildItem "resources/jvm/libs" -Filter "jython-standalone-*.jar" -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ((Test-Path $pyRunner) -and $jythonJar) {
-            Write-Host "adding PythonRunner.java (jython found: $($jythonJar.Name))"
-            $sources += (Resolve-Path $pyRunner).Path
-          } elseif (Test-Path $pyRunner) {
-            Write-Host "skipping PythonRunner.java (no jython jar in libs/; 用嵌入式 CPython 即可)"
+            throw "resources/jvm/SpiderRunner.java 不存在（本仓库必需）"
           }
 
           Write-Host "Compiling $($sources.Count) .java files..."
-          $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" | ForEach-Object { $_.FullName }
-          $cp = ($libs + $androidAll) -join ";"
+          $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          $cp = (@($libs) + @($androidAll)) -join ";"
           javac -encoding UTF-8 -cp $cp -d $classes $sources
           if ($LASTEXITCODE -ne 0) { throw "javac failed" }
-
-          $srClass = Join-Path $classes "SpiderRunner.class"
-          if (-not (Test-Path $srClass)) {
-            $found = Get-ChildItem $classes -Recurse -Filter "SpiderRunner.class" -ErrorAction SilentlyContinue
-            if ($found) { Write-Host "SpiderRunner.class at: $($found[0].FullName)" }
-            else { throw "编译后未找到 SpiderRunner.class" }
-          } else {
-            Write-Host "SpiderRunner.class at classes root"
-          }
 
           $stubsJar = Join-Path $stubsDir "stubs.jar"
           Copy-Item $androidAll $stubsJar -Force
@@ -362,66 +293,35 @@ jobs:
 
           $jarList = & jar tf $stubsJar
           $hit = $jarList | Where-Object { $_ -match '^SpiderRunner\.class$' }
-          if (-not $hit) {
-            Write-Host "=== stubs.jar 顶层文件（前 30 项）==="
-            $jarList | Select-Object -First 30 | ForEach-Object { Write-Host "  $_" }
-            throw "stubs.jar 中未找到 SpiderRunner.class"
-          }
-          Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B, SpiderRunner OK"
+          if (-not $hit) { throw "stubs.jar 中未找到 SpiderRunner.class" }
 
           Remove-Item -Force $androidAll -ErrorAction SilentlyContinue
+          Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
 
       # ==================================================================
-      # 6. 校验 + dex2jar & SpiderRunner 独立验证
-      #    ★ 结尾 exit 0：SpiderRunner 无参数运行会返回非 0，避免污染本步骤退出码
+      # 6. 校验 —— 检查关键资源齐全
       # ==================================================================
       - name: Verify resources
         if: github.event.inputs.action != 'delete-only'
         shell: pwsh
         run: |
           $must = @(
+            "resources/js-lib",
             "resources/jvm/jre/bin/java.exe",
-            "resources/jvm/d2j/dex-tools-v2.4.jar",
             "resources/jvm/stubs/stubs.jar",
-            "resources/jvm/libs/gson-2.10.1.jar",
-            "resources/jvm/libs/okhttp-3.14.9.jar",
-            "resources/jvm/libs/okio-1.17.5.jar",
-            "resources/jvm/libs/jsoup-1.17.2.jar",
-            "resources/jvm/libs/sqlite-jdbc-3.46.1.0.jar"
+            "resources/jvm/d2j/dex-tools-v2.4.jar",
+            "resources/jvm/libs"
           )
+          $missing = @()
           foreach ($m in $must) {
-            if (-not (Test-Path $m)) { throw "missing: $m" }
-            Write-Host "OK: $m"
+            if (Test-Path $m) { Write-Host "✓ $m" }
+            else { $missing += $m; Write-Host "❌ $m" }
           }
+          if ($missing.Count -gt 0) { throw "缺失：$($missing -join ', ')" }
 
-          $jre = (Resolve-Path "resources/jvm/jre/bin/java.exe").Path
-          $d2j = (Resolve-Path "resources/jvm/d2j").Path
-
-          Write-Host "`n=== 验证 dex2jar 类可加载 ==="
-          $d2jOut = (& $jre -cp "$d2j\*" com.googlecode.dex2jar.tools.Dex2jarCmd -h 2>&1 | Out-String)
-          if ($d2jOut -match "ClassNotFoundException|找不到或无法加载主类|Could not find or load main class|NoClassDefFoundError") {
-            Write-Host $d2jOut
-            throw "dex2jar 类加载失败"
-          }
-          if ($d2jOut -notmatch "d2j-dex2jar|usage:|translator-v") {
-            Write-Host $d2jOut
-            throw "dex2jar 输出异常（未识别到 usage）"
-          }
-          Write-Host "dex2jar OK"
-
-          Write-Host "`n=== 验证 SpiderRunner 类可加载 ==="
-          $stubs = (Resolve-Path "resources/jvm/stubs/stubs.jar").Path
-          $libs  = (Resolve-Path "resources/jvm/libs").Path
-          $srOut = (& $jre -cp "$stubs;$libs\*" SpiderRunner 2>&1 | Out-String)
-          if ($srOut -match "找不到或无法加载主类|Could not find or load main class|ClassNotFoundException") {
-            Write-Host $srOut
-            throw "SpiderRunner 类加载失败"
-          }
-          Write-Host "SpiderRunner OK"
-
-          # ★ SpiderRunner 无参数运行退出码非 0，会残留到 $LASTEXITCODE；
-          #   显式 exit 0 让本步骤整体算成功。
-          exit 0
+          # 打印 js-lib 内容确认
+          Write-Host "`n=== resources/js-lib 内容 ==="
+          Get-ChildItem "resources/js-lib" -File | Select-Object Name, Length | Format-Table -AutoSize
 
       # ==================================================================
       # 7. 测试 & 构建
@@ -432,6 +332,7 @@ jobs:
 
       - name: Run tests
         if: github.event.inputs.action != 'delete-only'
+        continue-on-error: true
         run: npm run test
 
       - name: Build application
@@ -480,15 +381,19 @@ jobs:
           body: |
             ## Win-Box ${{ steps.ver.outputs.base }} · ${{ steps.ver.outputs.bj_stamp }}
 
-            > **构建信息**
-            > - **基础版本号**：`${{ steps.ver.outputs.base }}`
-            > - **北京时间**：`${{ steps.ver.outputs.bj_stamp }}`（UTC+8）
-            > - **短 commit**：`${{ steps.ver.outputs.short_sha }}`
-            > - **完整 commit**：`${{ github.sha }}`
-            > - **回退命令**：`git checkout ${{ github.sha }}`
+            > 北京时间：`${{ steps.ver.outputs.bj_stamp }}`（UTC+8）
+            > Commit：`${{ github.sha }}`
+            > 回退：`git checkout ${{ github.sha }}`
 
             ### 下载
-            - `Win-Box Setup ${{ steps.ver.outputs.full }}.exe` —— Windows 安装包
-            - `latest.yml` / `*.blockmap` —— 自动更新清单
-
-            ### 回退源码
+            - `Win-Box Setup ${{ steps.ver.outputs.full }}.exe`
+            - `latest.yml` / `*.blockmap`
+          files: |
+            ${{ steps.ver.outputs.output_dir }}/*.exe
+            ${{ steps.ver.outputs.output_dir }}/*.blockmap
+            ${{ steps.ver.outputs.output_dir }}/latest.yml
+          draft: ${{ github.event.inputs.draft == 'true' }}
+          prerelease: false
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

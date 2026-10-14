@@ -20,7 +20,6 @@ jobs:
         with:
           node-version: 20
 
-      # JDK 供部分测试（jvmAtomicFile / jvmKeyStore 等）spawn javac/java
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -30,15 +29,63 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      # ★ 2026-10-14：准备 dex2jar（供 jar 源把 .dex 转 .class）
+      #   放到两个位置：
+      #     1. resources/jvm/tools/dex2jar/（代码硬编码路径，package.json 已加例外让它被打包）
+      #     2. resources/jvm/libs/（备用扁平位置，默认会打包）
+      - name: Prepare dex2jar
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
+          $extract = Join-Path $env:RUNNER_TEMP "dex-tools"
+          $url = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
+
+          Write-Host "⬇  下载 dex2jar：$url"
+          $attempts = 0
+          while ($attempts -lt 3) {
+            $attempts++
+            try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 300; break }
+            catch {
+              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "dex2jar 下载失败" }
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
+          if (-not $inner) { throw "解压后未找到目录" }
+          Write-Host "✓ dex2jar 解压到：$($inner.FullName)"
+          Get-ChildItem $inner.FullName | Select-Object Name, Length
+
+          $libDir = Join-Path $inner.FullName "lib"
+          if (-not (Test-Path $libDir)) { throw "dex2jar 解压后缺少 lib 目录" }
+
+          # 目标 1：resources/jvm/tools/dex2jar/（整个包内容都放进去，含 lib/ 和 bat/sh）
+          $dest1 = "resources/jvm/tools/dex2jar"
+          New-Item -ItemType Directory -Force -Path $dest1 | Out-Null
+          Copy-Item "$($inner.FullName)/*" -Destination $dest1 -Recurse -Force
+
+          # 目标 2：resources/jvm/libs/（jar 扁平放一份，保险）
+          $dest2 = "resources/jvm/libs"
+          New-Item -ItemType Directory -Force -Path $dest2 | Out-Null
+          Get-ChildItem $libDir -Filter "*.jar" | ForEach-Object {
+            Copy-Item $_.FullName -Destination $dest2 -Force
+          }
+
+          # 校验主 jar 是否到位
+          $mainJar = Get-ChildItem $dest1 -Recurse -Filter "dex-tools-*.jar" | Select-Object -First 1
+          if (-not $mainJar) { throw "dex-tools-*.jar 未找到" }
+          Write-Host "✓ dex2jar 主 jar：$($mainJar.FullName)（$($mainJar.Length) B）"
+          Write-Host "✓ libs/ 内 dex2jar jar："
+          Get-ChildItem $dest2 -Filter "dex-*.jar" | ForEach-Object { Write-Host "    $($_.Name)" }
+
       - name: Run typecheck
         run: npm run typecheck
 
-      # ★ 2026-10-14（CI 修复）：
-      #   仓库里的 stubs-src 不完整（缺 com.github.catvod.net.OkHttp、
-      #   android.content.SharedPreferences$Mem、外部 okhttp3/gson/jsoup），
-      #   CI 无法独立重建 stubs.jar。这 3 个测试是「JVM 桩源码完整性」单测，
-      #   与程序运行无关 —— 暂时排除。等作者补全 stubs-src 或提交 stubs.jar 后，
-      #   把下面 3 个 --exclude 删掉即可恢复。
+      # ★ 2026-10-14：跳过 stubs.jar 相关的 3 个测试（stubs-src 不完整，CI 无法重建）
       - name: Run tests
         shell: pwsh
         run: |
@@ -57,7 +104,7 @@ jobs:
             "MIT License`n`nCopyright (c) 2026 Win-Box" | Out-File -Encoding utf8 LICENSE.txt
           }
 
-      # ★ 关键：准备 JRE —— 否则打包出来的程序跑不了 jar 源（"JRE 缺失"）
+      # ★ 关键：准备 JRE
       - name: Prepare JRE (Windows x64)
         shell: pwsh
         run: |
@@ -91,12 +138,20 @@ jobs:
           & "$jreDir/bin/java.exe" -version
           Write-Host "✓ JRE 就绪：$jreDir"
 
-      # 打包前校验：JRE 必须在
-      - name: Verify JRE before packaging
+      # 打包前校验：JRE + dex2jar 都要在
+      - name: Verify before packaging
         shell: pwsh
         run: |
-          $java = "resources/jvm/jre/bin/java.exe"
-          if (-not (Test-Path $java)) { throw "打包前校验失败：$java 不存在" }
+          $java   = "resources/jvm/jre/bin/java.exe"
+          $dexjar = "resources/jvm/tools/dex2jar/lib/dex-tools-2.4.jar"
+          if (-not (Test-Path $java))   { throw "缺少 $java" }
+          if (-not (Test-Path $dexjar)) {
+            $alt = Get-ChildItem "resources/jvm/tools/dex2jar" -Recurse -Filter "dex-tools-*.jar" | Select-Object -First 1
+            if (-not $alt) { throw "缺少 dex-tools jar" }
+            Write-Host "✓ dex2jar: $($alt.FullName)（$($alt.Length) B）"
+          } else {
+            Write-Host "✓ dex2jar: $dexjar"
+          }
           Write-Host "✓ java.exe: $((Get-Item $java).Length) B"
 
       - name: Package with electron-builder

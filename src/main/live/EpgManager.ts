@@ -3,19 +3,18 @@
 //
 // ★★ 2026-10-14（用户报「50MB EPG XML 卡死 + 加载不出」根治版）★★
 //
-//   前几版问题：
-//     · 主线程 readFileSync 整个 50MB → 卡
-//     · 主线程流式分块 + 让出 → 仍慢
-//     · 主线程 worker 解析 XML → 好一些，但 JSON 映射表（epg_data_cache.json）依然
-//       用 readFileSync + JSON.parse 在主线程做 → 大文件依然卡
-//
 //   本版**全异步 + 全 worker**：
 //     · XML 解析   → Worker（mode=xml）
 //     · JSON 解析  → Worker（mode=json）
 //     · gunzip     → 异步 gunzip（promisify）
 //     · 所有 fs    → node:fs/promises
 //     · 构造时不阻塞（JSON 加载异步启动，loadChannelGroup 里 await 一次 ready）
-//     · 每一步都打 [EpgManager] 日志，带耗时 → 卡在哪一步一目了然
+//     · 每一步都打 [EpgManager] 日志，带耗时
+//
+// ★★ 2026-10-14 修复（用户报「下载成功但 epg_data.json / XML worker 都挂」）★★
+//   日志报 `SyntaxError: Illegal return statement` —— worker 脚本（eval: true）默认是 CJS
+//   模块，**模块顶层 return 是语法错误**。修复：把整个 worker 脚本包进 IIFE，return 变成
+//   函数内 return，合法。两个 worker（JSON / XML）都在加载阶段就崩了 → 数据没解析 → 命中 0。
 
 import { existsSync, mkdirSync } from 'node:fs';
 import { readFile, writeFile, stat, unlink, rename } from 'node:fs/promises';
@@ -60,256 +59,264 @@ export interface EpgRefreshResult {
 
 // =====================================================================
 // ★ Worker 代码（inline，支持 mode=xml / mode=json）
+//
+//   ★★ 整个脚本包在 IIFE 里 ★★ —— 关键修复：
+//     `new Worker(code, { eval: true })` 的 code 以 CJS 模块加载，
+//     **顶层 `return` 是语法错误**（`SyntaxError: Illegal return statement`）。
+//     包进 IIFE 后，`return` 变成函数内 return，合法。
 // =====================================================================
 const EPG_WORKER_CODE = `
-const { parentPort, workerData } = require('node:worker_threads');
-const fs = require('node:fs');
+(function () {
+  'use strict';
+  const { parentPort, workerData } = require('node:worker_threads');
+  const fs = require('node:fs');
 
-const mode = workerData.mode;
+  const mode = workerData.mode;
 
-function normalizeChannelName(name) {
-  if (!name) return '';
-  let s = name.trim();
-  s = s.replace(/[\\uFF08(][^\\uFF09)]*[\\uFF09)]/g, '');
-  s = s.replace(/\\u8D85\\u6E05|\\u84DD\\u5149|\\u9AD8\\u6E05|\\u6807\\u6E05|\\u539F\\u753B|\\u6D41\\u7545|\\u8D85\\u9AD8\\u6E05|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
-  s = s.replace(/[\\s\\-_.\\u00B7]+/g, '');
-  s = s.replace(/(\\u9891\\u9053|\\u53F0)$/, '');
-  return s.toUpperCase();
-}
+  function normalizeChannelName(name) {
+    if (!name) return '';
+    let s = name.trim();
+    s = s.replace(/[\\uFF08(][^\\uFF09)]*[\\uFF09)]/g, '');
+    s = s.replace(/\\u8D85\\u6E05|\\u84DD\\u5149|\\u9AD8\\u6E05|\\u6807\\u6E05|\\u539F\\u753B|\\u6D41\\u7545|\\u8D85\\u9AD8\\u6E05|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
+    s = s.replace(/[\\s\\-_.\\u00B7]+/g, '');
+    s = s.replace(/(\\u9891\\u9053|\\u53F0)$/, '');
+    return s.toUpperCase();
+  }
 
-// ---------- mode=json：解析 epg_data_cache.json ----------
-if (mode === 'json') {
-  let text = '';
+  // ---------- mode=json：解析 epg_data_cache.json ----------
+  if (mode === 'json') {
+    let text = '';
+    try {
+      text = fs.readFileSync(workerData.jsonFile, 'utf-8');
+    } catch (e) {
+      parentPort.postMessage({ ok: false, error: 'read: ' + String(e) });
+      return;
+    }
+    let root = null;
+    try {
+      root = JSON.parse(text);
+    } catch (e) {
+      parentPort.postMessage({ ok: false, error: 'parse: ' + String(e) });
+      return;
+    }
+    const epgs = root && root.epgs;
+    if (!Array.isArray(epgs)) {
+      parentPort.postMessage({ ok: true, nameToEpgId: [], normalizedNameToEpgId: [], count: 0 });
+      return;
+    }
+    const nameToEpgId = new Map();
+    const normalizedNameToEpgId = new Map();
+    for (const item of epgs) {
+      if (!item || !item.epgid || !item.name) continue;
+      const epgid = String(item.epgid).trim();
+      if (!epgid) continue;
+      const normEpgid = normalizeChannelName(epgid);
+      if (normEpgid && !normalizedNameToEpgId.has(normEpgid)) normalizedNameToEpgId.set(normEpgid, epgid);
+      for (const v of String(item.name).split(',')) {
+        const key = v.trim();
+        if (!key) continue;
+        nameToEpgId.set(key, epgid);
+        const nk = normalizeChannelName(key);
+        if (nk && !normalizedNameToEpgId.has(nk)) normalizedNameToEpgId.set(nk, epgid);
+      }
+    }
+    parentPort.postMessage({
+      ok: true,
+      nameToEpgId: Array.from(nameToEpgId.entries()),
+      normalizedNameToEpgId: Array.from(normalizedNameToEpgId.entries()),
+      count: nameToEpgId.size,
+    });
+    return;
+  }
+
+  // ---------- mode=xml：解析 XMLTV ----------
+  const nameToEpgId = new Map(workerData.nameToEpgIdArr);
+  const normalizedNameToEpgId = new Map(workerData.normalizedNameToEpgIdArr);
+  const requested = new Set(workerData.requestedArr);
+  const xmlFile = workerData.xmlFile;
+
+  const attrReCache = new Map();
+  function attrValue(attrs, name) {
+    let re = attrReCache.get(name);
+    if (!re) {
+      re = new RegExp('\\\\b' + name + '\\\\s*=\\\\s*"([^"]*)"|\\\\b' + name + '\\\\s*=\\\\s*\\'([^\\']*)\\'');
+      attrReCache.set(name, re);
+    }
+    const m = re.exec(attrs);
+    if (!m) return '';
+    return (m[1] || m[2] || '').trim();
+  }
+
+  function stripXmlText(s) {
+    let t = s.trim();
+    const cdata = /^<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>$/.exec(t);
+    if (cdata) t = cdata[1];
+    t = t.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+         .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+         .replace(/&amp;/g, '&');
+    return t.trim();
+  }
+
+  function parseXmltvTime(v) {
+    if (!v || v.length < 14) return null;
+    const main = v.substring(0, 14);
+    let zone = '+0800';
+    if (v.length >= 15) {
+      const z = v.substring(14).trim();
+      if (/^[+-]\\d{4}/.test(z)) zone = z.substring(0, 5);
+    }
+    const iso = main.slice(0,4) + '-' + main.slice(4,6) + '-' + main.slice(6,8) + 'T' +
+                main.slice(8,10) + ':' + main.slice(10,12) + ':' + main.slice(12,14) +
+                zone.slice(0,3) + ':' + zone.slice(3,5);
+    const d = new Date(iso);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  const requestedNorm = new Map();
+  for (const r of requested) {
+    const nr = normalizeChannelName(r);
+    if (nr && !requestedNorm.has(nr)) requestedNorm.set(nr, r);
+  }
+
+  let xml = '';
   try {
-    text = fs.readFileSync(workerData.jsonFile, 'utf-8');
+    xml = fs.readFileSync(xmlFile, 'utf-8');
   } catch (e) {
-    parentPort.postMessage({ ok: false, error: 'read: ' + String(e) });
+    parentPort.postMessage({ ok: false, error: 'read-xml: ' + String(e) });
     return;
   }
-  let root = null;
-  try {
-    root = JSON.parse(text);
-  } catch (e) {
-    parentPort.postMessage({ ok: false, error: 'parse: ' + String(e) });
-    return;
-  }
-  const epgs = root && root.epgs;
-  if (!Array.isArray(epgs)) {
-    parentPort.postMessage({ ok: true, nameToEpgId: [], normalizedNameToEpgId: [], count: 0 });
-    return;
-  }
-  const nameToEpgId = new Map();
-  const normalizedNameToEpgId = new Map();
-  for (const item of epgs) {
-    if (!item || !item.epgid || !item.name) continue;
-    const epgid = String(item.epgid).trim();
-    if (!epgid) continue;
-    const normEpgid = normalizeChannelName(epgid);
-    if (normEpgid && !normalizedNameToEpgId.has(normEpgid)) normalizedNameToEpgId.set(normEpgid, epgid);
-    for (const v of String(item.name).split(',')) {
-      const key = v.trim();
-      if (!key) continue;
-      nameToEpgId.set(key, epgid);
-      const nk = normalizeChannelName(key);
-      if (nk && !normalizedNameToEpgId.has(nk)) normalizedNameToEpgId.set(nk, epgid);
+
+  const newPrograms = new Map();
+  const idsByEpgId = new Map();
+  const iconByEpgId = new Map();
+  const wantedChannelIds = new Set();
+  const normalizedToXmlChannelId = new Map();
+  const normalizedToIconUrl = new Map();
+  const aliasToChannelIds = new Map();
+
+  let totalChannel = 0, matchByChannelId = 0, matchByExact = 0, matchByVariant = 0, matchByNorm = 0;
+
+  const noteAlias = (name, channelId) => {
+    if (!name || !channelId) return;
+    const key = name.trim();
+    if (!key) return;
+    const add = (k) => {
+      if (!k) return;
+      const arr = aliasToChannelIds.get(k) || [];
+      if (arr.indexOf(channelId) < 0) arr.push(channelId);
+      aliasToChannelIds.set(k, arr);
+    };
+    add(key);
+    const nk = normalizeChannelName(key);
+    if (nk) add(nk);
+  };
+
+  const channelRe = /<channel\\b([^>]*)>([\\s\\S]*?)<\\/channel>/g;
+  let m;
+  while ((m = channelRe.exec(xml)) !== null) {
+    totalChannel++;
+    const attrs = m[1], body = m[2];
+    const channelId = attrValue(attrs, 'id');
+    if (!channelId) continue;
+
+    const displayNames = [];
+    const dnRe = /<display-name\\b[^>]*>([\\s\\S]*?)<\\/display-name>/g;
+    let dn;
+    while ((dn = dnRe.exec(body)) !== null) {
+      const v = stripXmlText(dn[1]);
+      if (v) displayNames.push(v);
+    }
+
+    const iconMatch = /<icon\\b[^>]*?\\bsrc\\s*=\\s*"([^"]*)"/.exec(body) ||
+                      /<icon\\b[^>]*?\\bsrc\\s*=\\s*'([^']*)'/.exec(body);
+    const icon = iconMatch ? (iconMatch[1] || '').trim() : '';
+
+    let matched = null, how = '';
+    if (requested.has(channelId)) { matched = channelId; how = 'channelId'; }
+    if (!matched) for (const d of displayNames) {
+      const t = d.trim();
+      if (requested.has(t)) { matched = t; how = 'exact'; break; }
+    }
+    if (!matched) for (const d of displayNames) {
+      const t = d.trim();
+      const id = nameToEpgId.get(t);
+      if (id && requested.has(id)) { matched = id; how = 'variant'; break; }
+    }
+    if (!matched) for (const d of displayNames) {
+      const nd = normalizeChannelName(d);
+      if (!nd) continue;
+      const r = requestedNorm.get(nd);
+      if (r) { matched = r; how = 'norm'; break; }
+    }
+    if (!matched) for (const d of displayNames) {
+      const nd = normalizeChannelName(d);
+      if (!nd) continue;
+      const id = normalizedNameToEpgId.get(nd);
+      if (id && requested.has(id)) { matched = id; how = 'norm-variant'; break; }
+    }
+
+    if (matched) {
+      if (how === 'channelId') matchByChannelId++;
+      else if (how === 'exact') matchByExact++;
+      else if (how === 'variant') matchByVariant++;
+      else if (how === 'norm') matchByNorm++;
+
+      const arr = idsByEpgId.get(matched) || [];
+      if (arr.indexOf(channelId) < 0) arr.push(channelId);
+      idsByEpgId.set(matched, arr);
+      wantedChannelIds.add(channelId);
+      if (icon && !iconByEpgId.has(matched)) iconByEpgId.set(matched, icon);
+
+      const mNorm = normalizeChannelName(matched);
+      if (mNorm && !normalizedToXmlChannelId.has(mNorm)) {
+        normalizedToXmlChannelId.set(mNorm, channelId);
+        if (icon) normalizedToIconUrl.set(mNorm, icon);
+      }
+
+      for (const d of displayNames) noteAlias(d, channelId);
+      noteAlias(matched, channelId);
+      noteAlias(channelId, channelId);
+    } else {
+      noteAlias(channelId, channelId);
     }
   }
+
+  let totalProg = 0, usedProg = 0;
+  const progRe = /<programme\\b([^>]*)>([\\s\\S]*?)<\\/programme>/g;
+  while ((m = progRe.exec(xml)) !== null) {
+    totalProg++;
+    const attrs = m[1], body = m[2];
+    const channel = attrValue(attrs, 'channel');
+    if (!channel || !wantedChannelIds.has(channel)) continue;
+    const start = attrValue(attrs, 'start');
+    const stop = attrValue(attrs, 'stop');
+    if (!start || !stop) continue;
+    const s = parseXmltvTime(start);
+    const e = parseXmltvTime(stop);
+    if (!s || !e || e.getTime() <= s.getTime()) continue;
+
+    const titleMatch = /<title\\b[^>]*>([\\s\\S]*?)<\\/title>/.exec(body);
+    const descMatch = /<desc\\b[^>]*>([\\s\\S]*?)<\\/desc>/.exec(body);
+    const title = titleMatch ? stripXmlText(titleMatch[1]) : '';
+    const desc = descMatch ? stripXmlText(descMatch[1]) : '';
+
+    const arr = newPrograms.get(channel) || [];
+    arr.push({ title: title, description: desc, start: s, stop: e });
+    newPrograms.set(channel, arr);
+    usedProg++;
+  }
+
   parentPort.postMessage({
     ok: true,
-    nameToEpgId: Array.from(nameToEpgId.entries()),
-    normalizedNameToEpgId: Array.from(normalizedNameToEpgId.entries()),
-    count: nameToEpgId.size,
+    idsByEpgId: Array.from(idsByEpgId.entries()),
+    programsByChannelId: Array.from(newPrograms.entries()),
+    iconByEpgId: Array.from(iconByEpgId.entries()),
+    normalizedToXmlChannelId: Array.from(normalizedToXmlChannelId.entries()),
+    normalizedToIconUrl: Array.from(normalizedToIconUrl.entries()),
+    aliasToChannelIds: Array.from(aliasToChannelIds.entries()),
+    stats: { totalChannel, totalProg, usedProg, matchByChannelId, matchByExact, matchByVariant, matchByNorm },
   });
-  return;
-}
-
-// ---------- mode=xml：解析 XMLTV ----------
-const nameToEpgId = new Map(workerData.nameToEpgIdArr);
-const normalizedNameToEpgId = new Map(workerData.normalizedNameToEpgIdArr);
-const requested = new Set(workerData.requestedArr);
-const xmlFile = workerData.xmlFile;
-
-const attrReCache = new Map();
-function attrValue(attrs, name) {
-  let re = attrReCache.get(name);
-  if (!re) {
-    re = new RegExp('\\\\b' + name + '\\\\s*=\\\\s*"([^"]*)"|\\\\b' + name + '\\\\s*=\\\\s*\\'([^\\']*)\\'');
-    attrReCache.set(name, re);
-  }
-  const m = re.exec(attrs);
-  if (!m) return '';
-  return (m[1] || m[2] || '').trim();
-}
-
-function stripXmlText(s) {
-  let t = s.trim();
-  const cdata = /^<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>$/.exec(t);
-  if (cdata) t = cdata[1];
-  t = t.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-       .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
-       .replace(/&amp;/g, '&');
-  return t.trim();
-}
-
-function parseXmltvTime(v) {
-  if (!v || v.length < 14) return null;
-  const main = v.substring(0, 14);
-  let zone = '+0800';
-  if (v.length >= 15) {
-    const z = v.substring(14).trim();
-    if (/^[+-]\\d{4}/.test(z)) zone = z.substring(0, 5);
-  }
-  const iso = main.slice(0,4) + '-' + main.slice(4,6) + '-' + main.slice(6,8) + 'T' +
-              main.slice(8,10) + ':' + main.slice(10,12) + ':' + main.slice(12,14) +
-              zone.slice(0,3) + ':' + zone.slice(3,5);
-  const d = new Date(iso);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-const requestedNorm = new Map();
-for (const r of requested) {
-  const nr = normalizeChannelName(r);
-  if (nr && !requestedNorm.has(nr)) requestedNorm.set(nr, r);
-}
-
-let xml = '';
-try {
-  xml = fs.readFileSync(xmlFile, 'utf-8');
-} catch (e) {
-  parentPort.postMessage({ ok: false, error: 'read-xml: ' + String(e) });
-  return;
-}
-
-const newPrograms = new Map();
-const idsByEpgId = new Map();
-const iconByEpgId = new Map();
-const wantedChannelIds = new Set();
-const normalizedToXmlChannelId = new Map();
-const normalizedToIconUrl = new Map();
-const aliasToChannelIds = new Map();
-
-let totalChannel = 0, matchByChannelId = 0, matchByExact = 0, matchByVariant = 0, matchByNorm = 0;
-
-const noteAlias = (name, channelId) => {
-  if (!name || !channelId) return;
-  const key = name.trim();
-  if (!key) return;
-  const add = (k) => {
-    if (!k) return;
-    const arr = aliasToChannelIds.get(k) || [];
-    if (arr.indexOf(channelId) < 0) arr.push(channelId);
-    aliasToChannelIds.set(k, arr);
-  };
-  add(key);
-  const nk = normalizeChannelName(key);
-  if (nk) add(nk);
-};
-
-const channelRe = /<channel\\b([^>]*)>([\\s\\S]*?)<\\/channel>/g;
-let m;
-while ((m = channelRe.exec(xml)) !== null) {
-  totalChannel++;
-  const attrs = m[1], body = m[2];
-  const channelId = attrValue(attrs, 'id');
-  if (!channelId) continue;
-
-  const displayNames = [];
-  const dnRe = /<display-name\\b[^>]*>([\\s\\S]*?)<\\/display-name>/g;
-  let dn;
-  while ((dn = dnRe.exec(body)) !== null) {
-    const v = stripXmlText(dn[1]);
-    if (v) displayNames.push(v);
-  }
-
-  const iconMatch = /<icon\\b[^>]*?\\bsrc\\s*=\\s*"([^"]*)"/.exec(body) ||
-                    /<icon\\b[^>]*?\\bsrc\\s*=\\s*'([^']*)'/.exec(body);
-  const icon = iconMatch ? (iconMatch[1] || '').trim() : '';
-
-  let matched = null, how = '';
-  if (requested.has(channelId)) { matched = channelId; how = 'channelId'; }
-  if (!matched) for (const d of displayNames) {
-    const t = d.trim();
-    if (requested.has(t)) { matched = t; how = 'exact'; break; }
-  }
-  if (!matched) for (const d of displayNames) {
-    const t = d.trim();
-    const id = nameToEpgId.get(t);
-    if (id && requested.has(id)) { matched = id; how = 'variant'; break; }
-  }
-  if (!matched) for (const d of displayNames) {
-    const nd = normalizeChannelName(d);
-    if (!nd) continue;
-    const r = requestedNorm.get(nd);
-    if (r) { matched = r; how = 'norm'; break; }
-  }
-  if (!matched) for (const d of displayNames) {
-    const nd = normalizeChannelName(d);
-    if (!nd) continue;
-    const id = normalizedNameToEpgId.get(nd);
-    if (id && requested.has(id)) { matched = id; how = 'norm-variant'; break; }
-  }
-
-  if (matched) {
-    if (how === 'channelId') matchByChannelId++;
-    else if (how === 'exact') matchByExact++;
-    else if (how === 'variant') matchByVariant++;
-    else if (how === 'norm') matchByNorm++;
-
-    const arr = idsByEpgId.get(matched) || [];
-    if (arr.indexOf(channelId) < 0) arr.push(channelId);
-    idsByEpgId.set(matched, arr);
-    wantedChannelIds.add(channelId);
-    if (icon && !iconByEpgId.has(matched)) iconByEpgId.set(matched, icon);
-
-    const mNorm = normalizeChannelName(matched);
-    if (mNorm && !normalizedToXmlChannelId.has(mNorm)) {
-      normalizedToXmlChannelId.set(mNorm, channelId);
-      if (icon) normalizedToIconUrl.set(mNorm, icon);
-    }
-
-    for (const d of displayNames) noteAlias(d, channelId);
-    noteAlias(matched, channelId);
-    noteAlias(channelId, channelId);
-  } else {
-    noteAlias(channelId, channelId);
-  }
-}
-
-let totalProg = 0, usedProg = 0;
-const progRe = /<programme\\b([^>]*)>([\\s\\S]*?)<\\/programme>/g;
-while ((m = progRe.exec(xml)) !== null) {
-  totalProg++;
-  const attrs = m[1], body = m[2];
-  const channel = attrValue(attrs, 'channel');
-  if (!channel || !wantedChannelIds.has(channel)) continue;
-  const start = attrValue(attrs, 'start');
-  const stop = attrValue(attrs, 'stop');
-  if (!start || !stop) continue;
-  const s = parseXmltvTime(start);
-  const e = parseXmltvTime(stop);
-  if (!s || !e || e.getTime() <= s.getTime()) continue;
-
-  const titleMatch = /<title\\b[^>]*>([\\s\\S]*?)<\\/title>/.exec(body);
-  const descMatch = /<desc\\b[^>]*>([\\s\\S]*?)<\\/desc>/.exec(body);
-  const title = titleMatch ? stripXmlText(titleMatch[1]) : '';
-  const desc = descMatch ? stripXmlText(descMatch[1]) : '';
-
-  const arr = newPrograms.get(channel) || [];
-  arr.push({ title: title, description: desc, start: s, stop: e });
-  newPrograms.set(channel, arr);
-  usedProg++;
-}
-
-parentPort.postMessage({
-  ok: true,
-  idsByEpgId: Array.from(idsByEpgId.entries()),
-  programsByChannelId: Array.from(newPrograms.entries()),
-  iconByEpgId: Array.from(iconByEpgId.entries()),
-  normalizedToXmlChannelId: Array.from(normalizedToXmlChannelId.entries()),
-  normalizedToIconUrl: Array.from(normalizedToIconUrl.entries()),
-  aliasToChannelIds: Array.from(aliasToChannelIds.entries()),
-  stats: { totalChannel, totalProg, usedProg, matchByChannelId, matchByExact, matchByVariant, matchByNorm },
-});
+})();
 `;
 
 // worker 回传结构
@@ -591,7 +598,6 @@ export class EpgManager {
     this.refreshRunning = true;
     const t0 = Date.now();
     try {
-      // 未过期直接用本地
       const st = await stat(this.epgFile).catch(() => null);
       if (st && st.size > 1024) {
         const age = Date.now() - st.mtimeMs;
@@ -602,7 +608,6 @@ export class EpgManager {
         }
       }
 
-      // 远端 hash 比对
       const remoteHash = await this.fetchViaProxy(this.epgUrl + '.hash', 10000, false);
       const localHash = existsSync(this.hashFile)
         ? (await readFile(this.hashFile, 'utf-8')).trim() : '';

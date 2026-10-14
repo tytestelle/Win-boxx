@@ -1,23 +1,25 @@
 // src/main/live/EpgManager.ts
 // XMLTV EPG 管理器 —— 移植自 TVBox EpgManager.java（含别名表，支持多 key 反查）
 //
-// ★★ 2026-10-14（用户报「加载 50MB EPG XML 时未响应/崩溃」）★★
-//   旧实现：readFileSync 整个 50MB → 正则全量两遍 → 全程同步阻塞主进程。
-//   问题：① 内存峰值 ~200MB（字符串 + 中间 Map）；② 主进程 IPC 完全无响应 → "未响应"；
-//        ③ attrValue 每次 new RegExp，几十万次调用。
+// ★★ 2026-10-14（用户报「加载 50MB EPG XML 时未响应/崩溃」根本解决）★★
+//   前两版尝试：
+//     ① 主线程 readFileSync 整读 → 主进程卡死
+//     ② 主线程流式分块 + 每 2000 条让出 → 仍慢（字符串拼接/正则的回溯成本太高）
 //
-//   现改为：**流式分块读（4MB/chunk） + 每 2000 条 programme 让出主线程**。
-//   · 内存峰值降到 ~20MB（buffer 最大 ~8MB + 命中数据）
-//   · 主进程 IPC 保持响应（setImmediate 让事件循环跑一轮）
-//   · attrValue 走正则缓存
+//   现改为：**worker_threads（inline、eval 模式）跑解析**。
+//     · 主进程完全不做解析，只等 worker 的 postMessage 结果
+//     · 期间主进程 IPC 完全正常（窗口可拖动、按钮可点击、日志可写）
+//     · worker 里直接 readFileSync + 正则扫（在独立线程/独立内存里，不影响 UI）
+//     · 结果通过 structured clone 传回（Date 会被正确保留）
+//     · 用 inline worker（eval: true）→ 不需要新文件、不需要改构建脚本
 
 import {
   existsSync, mkdirSync, readFileSync, writeFileSync,
-  statSync, unlinkSync, renameSync, createReadStream,
+  statSync, unlinkSync, renameSync,
 } from 'node:fs';
-import { StringDecoder } from 'node:string_decoder';
 import { join } from 'node:path';
 import { gunzipSync } from 'node:zlib';
+import { Worker } from 'node:worker_threads';
 import { fileLogger } from '../util/logger';
 
 const TAG = 'EpgManager';
@@ -51,64 +53,243 @@ export interface EpgRefreshResult {
   error?: string;
 }
 
-// ===================== XML 工具 =====================
-/**
- * 属性提取：**正则缓存**。
- * ★ 2026-10-14：旧实现每次调用 `new RegExp(...)`，在几十万条 programme 上是灾难。
- *   这里按属性名缓存正则（属性名只有 id/channel/start/stop/src 等有限几个）。
- */
-const attrReCache = new Map<string, RegExp>();
-function attrValue(attrs: string, name: string): string {
+// =====================================================================
+// ★ Worker 代码（inline）
+//
+//   worker 里独立完成：
+//     1) readFileSync 读整个 XML（在 worker 自己的线程/内存里，不影响主进程）
+//     2) 正则扫 channel + programme
+//     3) postMessage 结果（只传命中的部分，量小）
+//
+//   纯函数（attrValue / stripXmlText / normalizeChannelName / parseXmltvTime）
+//   在 worker 里重定义一次 —— 它们极小，重复没维护成本。
+// =====================================================================
+const EPG_WORKER_CODE = `
+const { parentPort, workerData } = require('node:worker_threads');
+const fs = require('node:fs');
+
+const nameToEpgId = new Map(workerData.nameToEpgIdArr);
+const normalizedNameToEpgId = new Map(workerData.normalizedNameToEpgIdArr);
+const requested = new Set(workerData.requestedArr);
+const xmlFile = workerData.xmlFile;
+
+const attrReCache = new Map();
+function attrValue(attrs, name) {
   let re = attrReCache.get(name);
   if (!re) {
-    re = new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"|\\b${name}\\s*=\\s*'([^']*)'`);
+    re = new RegExp('\\\\b' + name + '\\\\s*=\\\\s*"([^"]*)"|\\\\b' + name + '\\\\s*=\\\\s*\\'([^\\']*)\\'');
     attrReCache.set(name, re);
   }
   const m = re.exec(attrs);
   if (!m) return '';
-  return (m[1] ?? m[2] ?? '').trim();
+  return (m[1] || m[2] || '').trim();
 }
 
-function stripXmlText(s: string): string {
+function stripXmlText(s) {
   let t = s.trim();
-  const cdataMatch = /^<!\[CDATA\[([\s\S]*?)\]\]>$/.exec(t);
-  if (cdataMatch) t = cdataMatch[1];
-  t = t
-    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
+  const cdata = /^<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>$/.exec(t);
+  if (cdata) t = cdata[1];
+  t = t.replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+       .replace(/&quot;/g, '"').replace(/&apos;/g, "'")
+       .replace(/&amp;/g, '&');
   return t.trim();
 }
 
-function normalizeChannelName(name: string): string {
+function normalizeChannelName(name) {
   if (!name) return '';
   let s = name.trim();
-  s = s.replace(/[（(][^）)]*[）)]/g, '');
-  s = s.replace(/超清|蓝光|高清|标清|原画|流畅|超高清|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
-  s = s.replace(/[\s\-_.·]+/g, '');
-  s = s.replace(/(频道|台)$/, '');
+  s = s.replace(/[\\uFF08(][^\\uFF09)]*[\\uFF09)]/g, '');
+  s = s.replace(/\\u8D85\\u6E05|\\u84DD\\u5149|\\u9AD8\\u6E05|\\u6807\\u6E05|\\u539F\\u753B|\\u6D41\\u7545|\\u8D85\\u9AD8\\u6E05|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
+  s = s.replace(/[\\s\\-_.\\u00B7]+/g, '');
+  s = s.replace(/(\\u9891\\u9053|\\u53F0)$/, '');
   return s.toUpperCase();
 }
 
-function localDayStartMs(input: Date | string | number): number | null {
-  const d = input instanceof Date ? input : new Date(input);
-  if (Number.isNaN(d.getTime())) return null;
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
+function parseXmltvTime(v) {
+  if (!v || v.length < 14) return null;
+  const main = v.substring(0, 14);
+  let zone = '+0800';
+  if (v.length >= 15) {
+    const z = v.substring(14).trim();
+    if (/^[+-]\\d{4}/.test(z)) zone = z.substring(0, 5);
+  }
+  const iso = main.slice(0,4) + '-' + main.slice(4,6) + '-' + main.slice(6,8) + 'T' +
+              main.slice(8,10) + ':' + main.slice(10,12) + ':' + main.slice(12,14) +
+              zone.slice(0,3) + ':' + zone.slice(3,5);
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? null : d;
 }
 
-function localNextDayStartMs(input: Date | string | number): number | null {
-  const d = input instanceof Date ? input : new Date(input);
-  if (Number.isNaN(d.getTime())) return null;
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0).getTime();
+// ---------- 请求集合归一化 ----------
+const requestedNorm = new Map();
+for (const r of requested) {
+  const nr = normalizeChannelName(r);
+  if (nr && !requestedNorm.has(nr)) requestedNorm.set(nr, r);
 }
 
-function localYmd(input: Date | string | number): string {
-  const d = input instanceof Date ? input : new Date(input);
-  if (Number.isNaN(d.getTime())) return '';
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+// ---------- 读取 XML ----------
+let xml = '';
+try {
+  xml = fs.readFileSync(xmlFile, 'utf-8');
+} catch (e) {
+  parentPort.postMessage({ ok: false, error: String(e) });
+  return;
+}
+
+// ---------- 扫 channel ----------
+const newPrograms = new Map();
+const idsByEpgId = new Map();
+const iconByEpgId = new Map();
+const wantedChannelIds = new Set();
+const normalizedToXmlChannelId = new Map();
+const normalizedToIconUrl = new Map();
+const aliasToChannelIds = new Map();
+
+let totalChannel = 0, matchByChannelId = 0, matchByExact = 0, matchByVariant = 0, matchByNorm = 0;
+
+const noteAlias = (name, channelId) => {
+  if (!name || !channelId) return;
+  const key = name.trim();
+  if (!key) return;
+  const add = (k) => {
+    if (!k) return;
+    const arr = aliasToChannelIds.get(k) || [];
+    if (arr.indexOf(channelId) < 0) arr.push(channelId);
+    aliasToChannelIds.set(k, arr);
+  };
+  add(key);
+  const nk = normalizeChannelName(key);
+  if (nk) add(nk);
+};
+
+const channelRe = /<channel\\b([^>]*)>([\\s\\S]*?)<\\/channel>/g;
+let m;
+while ((m = channelRe.exec(xml)) !== null) {
+  totalChannel++;
+  const attrs = m[1], body = m[2];
+  const channelId = attrValue(attrs, 'id');
+  if (!channelId) continue;
+
+  const displayNames = [];
+  const dnRe = /<display-name\\b[^>]*>([\\s\\S]*?)<\\/display-name>/g;
+  let dn;
+  while ((dn = dnRe.exec(body)) !== null) {
+    const v = stripXmlText(dn[1]);
+    if (v) displayNames.push(v);
+  }
+
+  const iconMatch = /<icon\\b[^>]*?\\bsrc\\s*=\\s*"([^"]*)"/.exec(body) ||
+                    /<icon\\b[^>]*?\\bsrc\\s*=\\s*'([^']*)'/.exec(body);
+  const icon = iconMatch ? (iconMatch[1] || '').trim() : '';
+
+  let matched = null, how = '';
+  if (requested.has(channelId)) { matched = channelId; how = 'channelId'; }
+  if (!matched) for (const d of displayNames) {
+    const t = d.trim();
+    if (requested.has(t)) { matched = t; how = 'exact'; break; }
+  }
+  if (!matched) for (const d of displayNames) {
+    const t = d.trim();
+    const id = nameToEpgId.get(t);
+    if (id && requested.has(id)) { matched = id; how = 'variant'; break; }
+  }
+  if (!matched) for (const d of displayNames) {
+    const nd = normalizeChannelName(d);
+    if (!nd) continue;
+    const r = requestedNorm.get(nd);
+    if (r) { matched = r; how = 'norm'; break; }
+  }
+  if (!matched) for (const d of displayNames) {
+    const nd = normalizeChannelName(d);
+    if (!nd) continue;
+    const id = normalizedNameToEpgId.get(nd);
+    if (id && requested.has(id)) { matched = id; how = 'norm-variant'; break; }
+  }
+
+  if (matched) {
+    if (how === 'channelId') matchByChannelId++;
+    else if (how === 'exact') matchByExact++;
+    else if (how === 'variant') matchByVariant++;
+    else if (how === 'norm') matchByNorm++;
+
+    const arr = idsByEpgId.get(matched) || [];
+    if (arr.indexOf(channelId) < 0) arr.push(channelId);
+    idsByEpgId.set(matched, arr);
+    wantedChannelIds.add(channelId);
+    if (icon && !iconByEpgId.has(matched)) iconByEpgId.set(matched, icon);
+
+    const mNorm = normalizeChannelName(matched);
+    if (mNorm && !normalizedToXmlChannelId.has(mNorm)) {
+      normalizedToXmlChannelId.set(mNorm, channelId);
+      if (icon) normalizedToIconUrl.set(mNorm, icon);
+    }
+
+    for (const d of displayNames) noteAlias(d, channelId);
+    noteAlias(matched, channelId);
+    noteAlias(channelId, channelId);
+  } else {
+    noteAlias(channelId, channelId);
+  }
+}
+
+// ---------- 扫 programme ----------
+let totalProg = 0, usedProg = 0;
+const progRe = /<programme\\b([^>]*)>([\\s\\S]*?)<\\/programme>/g;
+while ((m = progRe.exec(xml)) !== null) {
+  totalProg++;
+  const attrs = m[1], body = m[2];
+  const channel = attrValue(attrs, 'channel');
+  if (!channel || !wantedChannelIds.has(channel)) continue;
+  const start = attrValue(attrs, 'start');
+  const stop = attrValue(attrs, 'stop');
+  if (!start || !stop) continue;
+  const s = parseXmltvTime(start);
+  const e = parseXmltvTime(stop);
+  if (!s || !e || e.getTime() <= s.getTime()) continue;
+
+  const titleMatch = /<title\\b[^>]*>([\\s\\S]*?)<\\/title>/.exec(body);
+  const descMatch = /<desc\\b[^>]*>([\\s\\S]*?)<\\/desc>/.exec(body);
+  const title = titleMatch ? stripXmlText(titleMatch[1]) : '';
+  const desc = descMatch ? stripXmlText(descMatch[1]) : '';
+
+  const arr = newPrograms.get(channel) || [];
+  arr.push({ title: title, description: desc, start: s, stop: e });
+  newPrograms.set(channel, arr);
+  usedProg++;
+}
+
+// ---------- 回传（Map → 数组，便于 structured clone） ----------
+parentPort.postMessage({
+  ok: true,
+  idsByEpgId: Array.from(idsByEpgId.entries()),
+  programsByChannelId: Array.from(newPrograms.entries()),
+  iconByEpgId: Array.from(iconByEpgId.entries()),
+  normalizedToXmlChannelId: Array.from(normalizedToXmlChannelId.entries()),
+  normalizedToIconUrl: Array.from(normalizedToIconUrl.entries()),
+  aliasToChannelIds: Array.from(aliasToChannelIds.entries()),
+  stats: { totalChannel, totalProg, usedProg, matchByChannelId, matchByExact, matchByVariant, matchByNorm },
+});
+`;
+
+// worker 回传结果的结构
+interface EpgWorkerResult {
+  ok: boolean;
+  error?: string;
+  idsByEpgId: Array<[string, string[]]>;
+  programsByChannelId: Array<[string, EpgProgram[]]>;
+  iconByEpgId: Array<[string, string]>;
+  normalizedToXmlChannelId: Array<[string, string]>;
+  normalizedToIconUrl: Array<[string, string]>;
+  aliasToChannelIds: Array<[string, string[]]>;
+  stats: {
+    totalChannel: number;
+    totalProg: number;
+    usedProg: number;
+    matchByChannelId: number;
+    matchByExact: number;
+    matchByVariant: number;
+    matchByNorm: number;
+  };
 }
 
 export class EpgManager {
@@ -122,7 +303,6 @@ export class EpgManager {
   private readonly loadedEpgIds = new Set<string>();
   private readonly normalizedToXmlChannelId = new Map<string, string>();
   private readonly normalizedToIconUrl = new Map<string, string>();
-
   private readonly aliasToChannelIds = new Map<string, string[]>();
 
   private activeProxy: string | null = null;
@@ -132,6 +312,8 @@ export class EpgManager {
   private epgUrl: string;
   private refreshRunning = false;
   private epgDataRefreshRunning = false;
+  /** ★ worker 解析锁：同一时间只跑一个 worker（避免重复解析大文件） */
+  private parseRunning: Promise<void> | null = null;
 
   private readonly epgDir: string;
   private readonly epgFile: string;
@@ -369,9 +551,14 @@ export class EpgManager {
       if (epgid) requested.add(epgid);
     }
     if (requested.size === 0) return;
-    if (!this.parsed || !this.isSubset(requested, this.loadedEpgIds)) {
-      await this.parseXmlForEpgIds(this.epgFile, requested);
+    // 已有缓存覆盖 → 直接返回
+    if (this.parsed && this.isSubset(requested, this.loadedEpgIds)) return;
+    // 若已有 worker 在跑 → 等它完成再看
+    if (this.parseRunning) {
+      await this.parseRunning;
+      if (this.parsed && this.isSubset(requested, this.loadedEpgIds)) return;
     }
+    await this.parseXmlForEpgIds(this.epgFile, requested);
   }
 
   private isSubset(a: Set<string>, b: Set<string>): boolean {
@@ -396,252 +583,118 @@ export class EpgManager {
     return this.lookupEpgId(channelName);
   }
 
-  private noteAlias(name: string, channelId: string): void {
-    if (!name || !channelId) return;
-    const key = name.trim();
-    if (!key) return;
-    const add = (k: string) => {
-      if (!k) return;
-      const arr = this.aliasToChannelIds.get(k) ?? [];
-      if (!arr.includes(channelId)) arr.push(channelId);
-      this.aliasToChannelIds.set(k, arr);
-    };
-    add(key);
-    const nk = normalizeChannelName(key);
-    if (nk) add(nk);
-  }
+  // =====================================================================
+  // ★★ Worker 线程解析（主进程完全不阻塞）★★
+  // =====================================================================
+  private parseXmlForEpgIds(file: string, requested: Set<string>): Promise<void> {
+    // 若已有 worker 在跑 → 复用
+    if (this.parseRunning) return this.parseRunning;
 
-  // =====================================================================
-  // ★★ 2026-10-14 流式解析（核心优化）★★
-  //
-  //   旧实现：readFileSync 整个文件 → 两遍全局正则 → 全程同步阻塞主进程。
-  //   新实现：
-  //     · createReadStream 分块（4MB）读，不一次性把 50MB 读成字符串
-  //     · 每处理 2000 条 programme 让出主线程一次（setImmediate）→ IPC 保持响应
-  //     · 切掉已处理的 buffer，只保留未闭合的尾巴（几十 KB 到几百 KB）
-  //     · 内存峰值从 ~200MB 降到 ~20MB
-  // =====================================================================
-  private async parseXmlForEpgIds(file: string, requested: Set<string>): Promise<void> {
     const t0 = Date.now();
     let sizeBytes = 0;
     try { sizeBytes = statSync(file).size; } catch { /* ignore */ }
     fileLogger.i(
-      `${TAG} 开始流式解析 XML ${(sizeBytes / 1024 / 1024).toFixed(1)}MB（请求 ${requested.size} 个频道）`,
+      `${TAG} 启动 worker 解析 ${(sizeBytes / 1024 / 1024).toFixed(1)}MB（请求 ${requested.size} 个频道）…`,
     );
 
-    const requestedNorm = new Map<string, string>();
-    for (const r of requested) {
-      const nr = normalizeChannelName(r);
-      if (nr && !requestedNorm.has(nr)) requestedNorm.set(nr, r);
-    }
-
-    const newPrograms = new Map<string, EpgProgram[]>();
-    const idsByEpgId = new Map<string, string[]>();
-    const iconByEpgId = new Map<string, string>();
-    const wantedChannelIds = new Set<string>();
-    let totalChannel = 0;
-    let matchByChannelId = 0, matchByExact = 0, matchByVariant = 0, matchByNorm = 0;
-    let totalProg = 0, usedProg = 0;
-    let processedSinceYield = 0;
-    const YIELD_EVERY = 2000;
-
-    // ---------- channel 段处理 ----------
-    const handleChannel = (attrs: string, body: string): void => {
-      totalChannel++;
-      const channelId = attrValue(attrs, 'id');
-      if (!channelId) return;
-
-      const displayNames: string[] = [];
-      const dnRe = /<display-name\b[^>]*>([\s\S]*?)<\/display-name>/g;
-      let dn: RegExpExecArray | null;
-      while ((dn = dnRe.exec(body)) !== null) {
-        const v = stripXmlText(dn[1]);
-        if (v) displayNames.push(v);
-      }
-
-      const iconMatch =
-        /<icon\b[^>]*?\bsrc\s*=\s*"([^"]*)"/.exec(body) ||
-        /<icon\b[^>]*?\bsrc\s*=\s*'([^']*)'/.exec(body);
-      const icon = iconMatch ? (iconMatch[1] || '').trim() : '';
-
-      let matched: string | null = null;
-      let how = '';
-
-      if (requested.has(channelId)) { matched = channelId; how = 'channelId'; }
-      if (!matched) for (const d of displayNames) {
-        const t = d.trim();
-        if (requested.has(t)) { matched = t; how = 'exact'; break; }
-      }
-      if (!matched) for (const d of displayNames) {
-        const t = d.trim();
-        const id = this.nameToEpgId.get(t);
-        if (id && requested.has(id)) { matched = id; how = 'variant'; break; }
-      }
-      if (!matched) for (const d of displayNames) {
-        const nd = normalizeChannelName(d);
-        if (!nd) continue;
-        const r = requestedNorm.get(nd);
-        if (r) { matched = r; how = 'norm'; break; }
-      }
-      if (!matched) for (const d of displayNames) {
-        const nd = normalizeChannelName(d);
-        if (!nd) continue;
-        const id = this.normalizedNameToEpgId.get(nd);
-        if (id && requested.has(id)) { matched = id; how = 'norm-variant'; break; }
-      }
-
-      if (matched) {
-        if (how === 'channelId') matchByChannelId++;
-        else if (how === 'exact') matchByExact++;
-        else if (how === 'variant') matchByVariant++;
-        else if (how === 'norm') matchByNorm++;
-
-        const arr = idsByEpgId.get(matched) ?? [];
-        if (!arr.includes(channelId)) arr.push(channelId);
-        idsByEpgId.set(matched, arr);
-        wantedChannelIds.add(channelId);
-        if (icon && !iconByEpgId.has(matched)) iconByEpgId.set(matched, icon);
-
-        const mNorm = normalizeChannelName(matched);
-        if (mNorm && !this.normalizedToXmlChannelId.has(mNorm)) {
-          this.normalizedToXmlChannelId.set(mNorm, channelId);
-          if (icon) this.normalizedToIconUrl.set(mNorm, icon);
-        }
-
-        for (const d of displayNames) this.noteAlias(d, channelId);
-        this.noteAlias(matched, channelId);
-        this.noteAlias(channelId, channelId);
-      } else {
-        this.noteAlias(channelId, channelId);
-      }
+    const workerData = {
+      xmlFile: file,
+      requestedArr: [...requested],
+      nameToEpgIdArr: [...this.nameToEpgId.entries()],
+      normalizedNameToEpgIdArr: [...this.normalizedNameToEpgId.entries()],
     };
 
-    // ---------- programme 段处理 ----------
-    const handleProgramme = (attrs: string, body: string): void => {
-      totalProg++;
-      const channel = attrValue(attrs, 'channel');
-      if (!channel || !wantedChannelIds.has(channel)) return;
-      const start = attrValue(attrs, 'start');
-      const stop = attrValue(attrs, 'stop');
-      if (!start || !stop) return;
-      const s = this.parseXmltvTime(start);
-      const e = this.parseXmltvTime(stop);
-      if (!s || !e || e.getTime() <= s.getTime()) return;
-
-      const titleMatch = /<title\b[^>]*>([\s\S]*?)<\/title>/.exec(body);
-      const descMatch = /<desc\b[^>]*>([\s\S]*?)<\/desc>/.exec(body);
-      const title = titleMatch ? stripXmlText(titleMatch[1]) : '';
-      const desc = descMatch ? stripXmlText(descMatch[1]) : '';
-
-      const arr = newPrograms.get(channel) ?? [];
-      arr.push({ title, description: desc, start: s, stop: e });
-      newPrograms.set(channel, arr);
-      usedProg++;
-    };
-
-    // ---------- 分块读取 ----------
-    try {
-      const CHUNK = 4 * 1024 * 1024; // 4MB
-      const decoder = new StringDecoder('utf-8');
-      const stream = createReadStream(file, { highWaterMark: CHUNK });
-
-      let buffer = '';
-      const channelRe = /<channel\b([^>]*)>([\s\S]*?)<\/channel>/g;
-      const progRe = /<programme\b([^>]*)>([\s\S]*?)<\/programme>/g;
-
-      const consume = async (final: boolean): Promise<void> => {
-        let maxConsumed = 0;
-        let m: RegExpExecArray | null;
-
-        // channel
-        channelRe.lastIndex = 0;
-        while ((m = channelRe.exec(buffer)) !== null) {
-          handleChannel(m[1], m[2]);
-          if (channelRe.lastIndex > maxConsumed) maxConsumed = channelRe.lastIndex;
+    const p = (async (): Promise<void> => {
+      try {
+        const result = await runEpgWorker(workerData);
+        if (!result.ok) {
+          fileLogger.w(`${TAG} worker 解析失败: ${result.error || 'unknown'}`);
+          return;
         }
-
-        // programme（每 N 条让出一次主线程，让 IPC 有机会响应）
-        progRe.lastIndex = 0;
-        while ((m = progRe.exec(buffer)) !== null) {
-          handleProgramme(m[1], m[2]);
-          if (progRe.lastIndex > maxConsumed) maxConsumed = progRe.lastIndex;
-
-          if (++processedSinceYield >= YIELD_EVERY) {
-            processedSinceYield = 0;
-            // ★ 关键：让事件循环跑一轮 → IPC handler 有机会响应
-            await new Promise<void>((r) => setImmediate(r));
-          }
-        }
-
-        if (final) {
-          buffer = '';
-        } else if (maxConsumed > 0) {
-          buffer = buffer.slice(maxConsumed);
-        } else {
-          // 兜底：整块都没有完整标签时（异常输入），最多保留 1MB，避免 buffer 无限增长
-          const KEEP = 1024 * 1024;
-          if (buffer.length > KEEP) buffer = buffer.slice(buffer.length - KEEP);
-        }
-      };
-
-      for await (const chunk of stream) {
-        buffer += decoder.write(chunk as Buffer);
-        // 只在 buffer 攒够一个块时才处理，避免频繁碎片
-        if (buffer.length >= CHUNK) {
-          await consume(false);
-        }
+        this.applyWorkerResult(result, requested);
+        const s = result.stats;
+        fileLogger.i(
+          `${TAG} 解析完成: 请求=${requested.size} 命中=${result.idsByEpgId.length} 累计=${this.loadedEpgIds.size} 别名=${this.aliasToChannelIds.size} ` +
+            `channel=${s.totalChannel}(channelId ${s.matchByChannelId}/精确 ${s.matchByExact}/变体 ${s.matchByVariant}/归一化 ${s.matchByNorm}) ` +
+            `programme=${s.totalProg}/命中 ${s.usedProg} 耗时=${Date.now() - t0}ms`,
+        );
+      } catch (e) {
+        fileLogger.w(`${TAG} worker 异常: ${String(e)}`);
+      } finally {
+        this.parseRunning = null;
       }
-      buffer += decoder.end();
-      await consume(true);
-    } catch (e) {
-      fileLogger.w(`${TAG} XML 解析失败: ${String(e)}`);
-      return;
-    }
+    })();
+    this.parseRunning = p;
+    return p;
+  }
 
-    fileLogger.i(
-      `${TAG} channel 扫描完成：共 ${totalChannel} 个 channel；channelId ${matchByChannelId} / 精确 ${matchByExact} / 变体 ${matchByVariant} / 归一化 ${matchByNorm}`,
-    );
-    fileLogger.i(
-      `${TAG} programme 扫描完成：共 ${totalProg} 条；命中 ${usedProg} 条（属于 ${newPrograms.size} 个 channel）`,
-    );
-
-    // ---------- 合并进实例 Map ----------
-    for (const [chId, list] of newPrograms) {
+  private applyWorkerResult(result: EpgWorkerResult, requested: Set<string>): void {
+    // 合并 programmes（按 channelId）
+    for (const [chId, list] of result.programsByChannelId) {
       const existing = this.programsByChannelId.get(chId);
-      if (existing) existing.push(...list);
-      else this.programsByChannelId.set(chId, list);
+      if (existing) {
+        const seen = new Set(existing.map((p) => `${p.start.getTime()}_${p.stop.getTime()}_${p.title}`));
+        for (const p of list) {
+          const k = `${p.start.getTime()}_${p.stop.getTime()}_${p.title}`;
+          if (!seen.has(k)) { seen.add(k); existing.push(p); }
+        }
+        existing.sort((a, b) => a.start.getTime() - b.start.getTime());
+      } else {
+        list.sort((a, b) => a.start.getTime() - b.start.getTime());
+        this.programsByChannelId.set(chId, list);
+      }
     }
-    for (const [epgid, ids] of idsByEpgId) {
+    // channelIds by epgId
+    for (const [epgid, ids] of result.idsByEpgId) {
       const existing = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
       for (const id of ids) if (!existing.includes(id)) existing.push(id);
       this.xmlChannelIdsByEpgId.set(epgid, existing);
     }
-    for (const [epgid] of idsByEpgId) {
+    // 归一化名字 → xml channelId
+    for (const [k, v] of result.normalizedToXmlChannelId) {
+      if (!this.normalizedToXmlChannelId.has(k)) this.normalizedToXmlChannelId.set(k, v);
+    }
+    // icon
+    for (const [epgid, url] of result.iconByEpgId) {
+      if (!this.iconUrlByEpgId.has(epgid)) this.iconUrlByEpgId.set(epgid, url);
+    }
+    for (const [k, v] of result.normalizedToIconUrl) {
+      if (!this.normalizedToIconUrl.has(k)) this.normalizedToIconUrl.set(k, v);
+    }
+    // aliases
+    for (const [name, ids] of result.aliasToChannelIds) {
+      const arr = this.aliasToChannelIds.get(name) ?? [];
+      for (const id of ids) if (!arr.includes(id)) arr.push(id);
+      this.aliasToChannelIds.set(name, arr);
+    }
+    // 重建 programsByEpgId（用于 multi 查询的 eid 分支）
+    for (const [epgid] of result.idsByEpgId) {
       const allIds = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
       const merged: EpgProgram[] = [];
+      const seen = new Set<string>();
       for (const id of allIds) {
         const list = this.programsByChannelId.get(id);
-        if (list) merged.push(...list);
+        if (!list) continue;
+        for (const p of list) {
+          const k = `${p.start.getTime()}_${p.stop.getTime()}_${p.title}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          merged.push(p);
+        }
       }
       merged.sort((a, b) => a.start.getTime() - b.start.getTime());
       this.programsByEpgId.set(epgid, merged);
     }
-    for (const [epgid, url] of iconByEpgId) {
-      if (!this.iconUrlByEpgId.has(epgid)) this.iconUrlByEpgId.set(epgid, url);
-    }
-    for (const epgid of idsByEpgId.keys()) this.loadedEpgIds.add(epgid);
+    for (const epgid of result.idsByEpgId.map(([e]) => e)) this.loadedEpgIds.add(epgid);
     this.parsed = this.programsByEpgId.size > 0 || this.xmlChannelIdsByEpgId.size > 0;
 
     const unmatched = new Set<string>();
-    for (const r of requested) if (!idsByEpgId.has(r)) unmatched.add(r);
+    for (const r of requested) if (!result.idsByEpgId.some(([e]) => e === r)) unmatched.add(r);
     if (unmatched.size > 0) {
       fileLogger.i(
         `${TAG} 未匹配上的 epgid（共 ${unmatched.size} 个，示例 20 个）: ${JSON.stringify([...unmatched].slice(0, 20))}`,
       );
     }
-    fileLogger.i(
-      `${TAG} 解析完成: 请求=${requested.size} 命中=${idsByEpgId.size} 累计=${this.loadedEpgIds.size} 别名=${this.aliasToChannelIds.size} 耗时=${Date.now() - t0}ms`,
-    );
   }
 
   // =====================================================================
@@ -676,13 +729,8 @@ export class EpgManager {
       }
     }
 
-    // 日志降噪：只在候选数为 0 时打一条（正常命中不打，避免直播页批量查询刷屏）
-    if (candidateChannelIds.size === 0 && candidateEpgids.size === 0) {
-      fileLogger.i(
-        `[EPG] multi 未命中任何候选 keys=${JSON.stringify(names)} 已解析=${this.programsByEpgId.size}/${this.programsByChannelId.size}`,
-      );
-      return [];
-    }
+    // 未命中任何候选（且没解析过）→ 静默返回空
+    if (candidateChannelIds.size === 0 && candidateEpgids.size === 0) return [];
 
     const merged: EpgProgram[] = [];
     const seen = new Set<string>();
@@ -726,8 +774,7 @@ export class EpgManager {
     });
 
     fileLogger.i(
-      `[EPG] 按日期查询 localYMD=${localYmd(date)} ` +
-        `全部=${all.length} 命中=${result.length}`,
+      `[EPG] 按日期查询 localYMD=${localYmd(date)} 全部=${all.length} 命中=${result.length}`,
     );
     return result;
   }
@@ -776,17 +823,72 @@ export class EpgManager {
   isParsed(): boolean {
     return this.parsed && this.programsByEpgId.size > 0;
   }
+}
 
-  private parseXmltvTime(v: string): Date | null {
-    if (!v || v.length < 14) return null;
-    const main = v.substring(0, 14);
-    let zone = '+0800';
-    if (v.length >= 15) {
-      const z = v.substring(14).trim();
-      if (/^[+-]\d{4}/.test(z)) zone = z.substring(0, 5);
-    }
-    const iso = `${main.slice(0, 4)}-${main.slice(4, 6)}-${main.slice(6, 8)}T${main.slice(8, 10)}:${main.slice(10, 12)}:${main.slice(12, 14)}${zone.slice(0, 3)}:${zone.slice(3, 5)}`;
-    const d = new Date(iso);
-    return Number.isNaN(d.getTime()) ? null : d;
-  }
+// =====================================================================
+// Worker 启动器（模块级纯函数）
+// =====================================================================
+function runEpgWorker(payload: {
+  xmlFile: string;
+  requestedArr: string[];
+  nameToEpgIdArr: Array<[string, string]>;
+  normalizedNameToEpgIdArr: Array<[string, string]>;
+}): Promise<EpgWorkerResult> {
+  return new Promise<EpgWorkerResult>((resolve, reject) => {
+    let settled = false;
+    const worker = new Worker(EPG_WORKER_CODE, {
+      eval: true,
+      workerData: payload,
+      /** worker 自身内存不占主进程（Node 默认 2GB heap，够 50MB 解析） */
+      resourceLimits: { maxOldGenerationSizeMb: 1024 },
+    });
+    const finish = (err: Error | null, result?: EpgWorkerResult): void => {
+      if (settled) return;
+      settled = true;
+      void worker.terminate().catch(() => undefined);
+      if (err) reject(err);
+      else resolve(result!);
+    };
+    worker.once('message', (msg: EpgWorkerResult) => finish(null, msg));
+    worker.once('error', (e) => finish(e instanceof Error ? e : new Error(String(e))));
+    worker.once('exit', (code) => {
+      if (!settled && code !== 0) finish(new Error(`EPG worker exited with code=${code}`));
+    });
+    /** 兜底超时：90 秒没结果就放弃（避免 worker 卡死导致永不返回） */
+    setTimeout(() => finish(new Error('EPG worker timeout (90s)')), 90_000).unref?.();
+  });
+}
+
+// =====================================================================
+// 主进程侧的纯函数（与 worker code 内的同名实现保持一致）
+// =====================================================================
+function normalizeChannelName(name: string): string {
+  if (!name) return '';
+  let s = name.trim();
+  s = s.replace(/[（(][^）)]*[）)]/g, '');
+  s = s.replace(/超清|蓝光|高清|标清|原画|流畅|超高清|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
+  s = s.replace(/[\s\-_.·]+/g, '');
+  s = s.replace(/(频道|台)$/, '');
+  return s.toUpperCase();
+}
+
+function localDayStartMs(input: Date | string | number): number | null {
+  const d = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0).getTime();
+}
+
+function localNextDayStartMs(input: Date | string | number): number | null {
+  const d = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(d.getTime())) return null;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0).getTime();
+}
+
+function localYmd(input: Date | string | number): string {
+  const d = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(d.getTime())) return '';
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }

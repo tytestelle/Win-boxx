@@ -435,27 +435,34 @@ export default function LivePage() {
 
   /**
    * ★ 2026-10-14（用户要求）：打开 EPG 独立窗口。
-   *   - 不再在直播页内开浮窗（会遮视频、拖不出去）
    *   - 主进程创建/复用一个无边框独立窗口，**默认置顶**，可拖动到屏幕任意位置
    *   - 单例：切换频道时通知已开窗口换参数（不重载、不丢位置）
-   *   - ★ 追加 `channels` 参数：当前分组的全部频道 → EPG 窗口内可下拉切换
+   *   - ★ 传 `groups`（整个直播源的**所有分组**）+ `currentGroup`：
+   *       EPG 窗口左侧渲染「分组 → 频道」列表，点击可切换到任意分组的任意频道。
    */
   async function openPrograms(channel: { name: string; 'tvg-id'?: string; 'tvg-name'?: string }) {
     const name = (channel.name || '').trim();
     if (!name) return;
-    const chList = (curGroup?.channels || [])
-      .map((c) => ({
-        name: String(c.name || '').trim(),
-        tvgId: String(c['tvg-id'] || '').trim(),
-        tvgName: String(c['tvg-name'] || '').trim(),
+    // ★ 传整个直播源的所有分组（不只是当前分组）
+    const groupList = groups
+      .map((g) => ({
+        group: String(g.group || '').trim(),
+        channels: g.channels
+          .map((c) => ({
+            name: String(c.name || '').trim(),
+            tvgId: String(c['tvg-id'] || '').trim(),
+            tvgName: String(c['tvg-name'] || '').trim(),
+          }))
+          .filter((c) => !!c.name),
       }))
-      .filter((c) => !!c.name);
+      .filter((g) => !!g.group && g.channels.length > 0);
     try {
       await ipcInvoke('epg:openWindow', {
         channelName: name,
         tvgId: (channel['tvg-id'] || '').trim(),
         tvgName: (channel['tvg-name'] || '').trim(),
-        channels: chList,
+        groups: groupList,
+        currentGroup: groupName,
       });
     } catch (e) {
       console.warn('[EPG] 打开节目单窗口失败', e);

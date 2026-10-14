@@ -37,7 +37,7 @@ jobs:
         run: |
           $jreDir = "resources/jvm/jre"
           if (Test-Path "$jreDir/bin/java.exe") {
-            Write-Host "✓ JRE 已存在"
+            Write-Host "JRE already exists"
             & "$jreDir/bin/java.exe" -version
             exit 0
           }
@@ -45,14 +45,14 @@ jobs:
           $url = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
           $zip = Join-Path $env:RUNNER_TEMP "jre.zip"
           $extract = Join-Path $env:RUNNER_TEMP "jre-extract"
-          Write-Host "⬇  下载 JRE：$url"
+          Write-Host "Downloading JRE: $url"
           $attempts = 0
           while ($attempts -lt 3) {
             $attempts++
             try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 600; break }
             catch {
-              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
-              if ($attempts -ge 3) { throw "JRE 下载失败" }
+              Write-Warning "Download failed (attempt $attempts): $($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "JRE download failed" }
               Start-Sleep -Seconds 5
             }
           }
@@ -60,12 +60,12 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $extract -Force
           $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
           Get-ChildItem -Path $inner.FullName -Force | Move-Item -Destination $jreDir -Force
-          if (-not (Test-Path "$jreDir/bin/java.exe")) { throw "JRE 准备失败" }
+          if (-not (Test-Path "$jreDir/bin/java.exe")) { throw "JRE setup failed" }
           & "$jreDir/bin/java.exe" -version
-          Write-Host "✓ JRE 就绪"
+          Write-Host "JRE ready"
 
       # ==================================================================
-      # 2. dex2jar（含 lib/ 里的 antlr、asm、d2j-*、dex-*、ST4 等）
+      # 2. dex2jar
       # ==================================================================
       - name: Prepare dex2jar
         shell: pwsh
@@ -73,47 +73,42 @@ jobs:
           $zip = Join-Path $env:RUNNER_TEMP "dex-tools.zip"
           $extract = Join-Path $env:RUNNER_TEMP "dex-tools"
           $url = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
-          Write-Host "⬇  下载 dex2jar：$url"
+          Write-Host "Downloading dex2jar: $url"
           $attempts = 0
           while ($attempts -lt 3) {
             $attempts++
             try { Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing -TimeoutSec 300; break }
             catch {
-              Write-Warning "下载失败（第 $attempts 次）：$($_.Exception.Message)"
-              if ($attempts -ge 3) { throw "dex2jar 下载失败" }
+              Write-Warning "Download failed (attempt $attempts): $($_.Exception.Message)"
+              if ($attempts -ge 3) { throw "dex2jar download failed" }
               Start-Sleep -Seconds 5
             }
           }
           if (Test-Path $extract) { Remove-Item -Recurse -Force $extract }
           Expand-Archive -Path $zip -DestinationPath $extract -Force
           $inner = Get-ChildItem $extract -Directory | Select-Object -First 1
-          if (-not $inner) { throw "解压后未找到目录" }
-          Write-Host "=== dex-tools 解压后内容 ==="
-          Get-ChildItem $inner.FullName | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }} | Format-Table -AutoSize
+          if (-not $inner) { throw "dex-tools extract failed" }
 
-          # tools/dex2jar/（完整结构）
           $dest1 = "resources/jvm/tools/dex2jar"
           Remove-Item -Recurse -Force $dest1 -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $dest1 | Out-Null
           Get-ChildItem $inner.FullName -Force | Copy-Item -Destination $dest1 -Recurse -Force
 
-          # d2j/（bat/sh 脚本）
           $dest2 = "resources/jvm/d2j"
           Remove-Item -Recurse -Force $dest2 -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $dest2 | Out-Null
           Get-ChildItem "$($inner.FullName)/*.bat" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest2 -Force
           Get-ChildItem "$($inner.FullName)/*.sh" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest2 -Force
 
-          # libs/（jar 平铺）
           $dest3 = "resources/jvm/libs"
           New-Item -ItemType Directory -Force -Path $dest3 | Out-Null
           Get-ChildItem "$($inner.FullName)/lib/*.jar" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest3 -Force
           Get-ChildItem "$($inner.FullName)/*.jar" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest3 -Force
 
-          Write-Host "✓ dex2jar 部署完成"
+          Write-Host "dex2jar ready"
 
       # ==================================================================
-      # 3. Maven 依赖（stubs-src 里 import 的第三方库 + 其它通用）
+      # 3. Maven deps
       # ==================================================================
       - name: Prepare Maven deps
         shell: pwsh
@@ -121,138 +116,107 @@ jobs:
           $libs = "resources/jvm/libs"
           New-Item -ItemType Directory -Force -Path $libs | Out-Null
           $maven = @(
-            @{ name = "gson-2.10.1.jar";           url = "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar" },
-            @{ name = "okhttp-3.14.9.jar";         url = "https://repo1.maven.org/maven2/com/squareup/okhttp3/okhttp/3.14.9/okhttp-3.14.9.jar" },
-            @{ name = "okio-1.17.5.jar";           url = "https://repo1.maven.org/maven2/com/squareup/okio/okio/1.17.5/okio-1.17.5.jar" },
-            @{ name = "jsoup-1.17.2.jar";          url = "https://repo1.maven.org/maven2/org/jsoup/jsoup/1.17.2/jsoup-1.17.2.jar" },
-            @{ name = "json-20180813.jar";         url = "https://repo1.maven.org/maven2/org/json/json/20180813/json-20180813.jar" },
-            @{ name = "bcprov-jdk18on-1.78.1.jar"; url = "https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar" },
-            @{ name = "slf4j-api-2.0.16.jar";      url = "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar" },
-            @{ name = "slf4j-simple-2.0.16.jar";   url = "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/2.0.16/slf4j-simple-2.0.16.jar" },
-            @{ name = "sqlite-jdbc-3.46.1.0.jar";  url = "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.46.1.0/sqlite-jdbc-3.46.1.0.jar" }
+            @{ n = "gson-2.10.1.jar";           u = "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar" },
+            @{ n = "okhttp-3.14.9.jar";         u = "https://repo1.maven.org/maven2/com/squareup/okhttp3/okhttp/3.14.9/okhttp-3.14.9.jar" },
+            @{ n = "okio-1.17.5.jar";           u = "https://repo1.maven.org/maven2/com/squareup/okio/okio/1.17.5/okio-1.17.5.jar" },
+            @{ n = "jsoup-1.17.2.jar";          u = "https://repo1.maven.org/maven2/org/jsoup/jsoup/1.17.2/jsoup-1.17.2.jar" },
+            @{ n = "json-20180813.jar";         u = "https://repo1.maven.org/maven2/org/json/json/20180813/json-20180813.jar" },
+            @{ n = "bcprov-jdk18on-1.78.1.jar"; u = "https://repo1.maven.org/maven2/org/bouncycastle/bcprov-jdk18on/1.78.1/bcprov-jdk18on-1.78.1.jar" },
+            @{ n = "slf4j-api-2.0.16.jar";      u = "https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.16/slf4j-api-2.0.16.jar" },
+            @{ n = "slf4j-simple-2.0.16.jar";   u = "https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/2.0.16/slf4j-simple-2.0.16.jar" },
+            @{ n = "sqlite-jdbc-3.46.1.0.jar";  u = "https://repo1.maven.org/maven2/org/xerial/sqlite-jdbc/3.46.1.0/sqlite-jdbc-3.46.1.0.jar" }
           )
           foreach ($m in $maven) {
-            $dest = Join-Path $libs $m.name
-            if (Test-Path $dest) { Write-Host "✓ 已存在 $($m.name)"; continue }
-            Write-Host "⬇  $($m.name)"
+            $dest = Join-Path $libs $m.n
+            if (Test-Path $dest) { Write-Host "exists: $($m.n)"; continue }
+            Write-Host "downloading: $($m.n)"
             $attempts = 0
             while ($attempts -lt 3) {
               $attempts++
-              try { Invoke-WebRequest -Uri $m.url -OutFile $dest -UseBasicParsing -TimeoutSec 120; break }
+              try { Invoke-WebRequest -Uri $m.u -OutFile $dest -UseBasicParsing -TimeoutSec 120; break }
               catch {
-                if ($attempts -ge 3) { throw "下载失败: $($m.name)" }
+                if ($attempts -ge 3) { throw "download failed: $($m.n)" }
                 Start-Sleep -Seconds 3
               }
             }
           }
 
       # ==================================================================
-      # 4. ★ 补全 stubs-src 缺失的 2 个类
-      #    （源码仓库里没有，但 stubs-src 里其它类引用了它们）
+      # 4. Patch stubs-src（用 bash heredoc，避免 YAML 缩进陷阱）
       # ==================================================================
       - name: Patch stubs-src missing classes
-        shell: pwsh
+        shell: bash
         run: |
-          $root = "resources/jvm/stubs-src"
+          set -euo pipefail
+          mkdir -p resources/jvm/stubs-src/android/content
+          mkdir -p resources/jvm/stubs-src/com/github/catvod/net
 
-          # ---- 4.1 补 android.content.SharedPreferences.Mem ----
-          $sp = "$root/android/content/SharedPreferences.java"
-          if (Test-Path $sp) {
-            Write-Host "`n=== 原 SharedPreferences.java ==="
-            Get-Content $sp -Raw | Write-Host
-            $content = Get-Content $sp -Raw
-            if ($content -notmatch '\bMem\b') {
-              Write-Host "→ 未找到 Mem 字段，补上"
-              $memLine = "    java.util.Map<String, String> Mem = new java.util.concurrent.ConcurrentHashMap<>();"
-              $content = $content -replace '(\binterface\s+SharedPreferences\s*\{)', "`$1`n$memLine"
-              Set-Content -Path $sp -Value $content -Encoding utf8 -NoNewline
-              Write-Host "→ 补丁后："
-              Get-Content $sp -Raw | Write-Host
-            } else {
-              Write-Host "✓ Mem 已存在，跳过"
-            }
-          } else {
-            Write-Host "→ SharedPreferences.java 不存在，创建"
-            New-Item -ItemType Directory -Force -Path "$root/android/content" | Out-Null
-            $spContent = @'
-package android.content;
-
-public interface SharedPreferences {
-    java.util.Map<String, String> Mem = new java.util.concurrent.ConcurrentHashMap<>();
-    String getString(String key, String defValue);
-    int getInt(String key, int defValue);
-    long getLong(String key, long defValue);
-    boolean getBoolean(String key, boolean defValue);
-    float getFloat(String key, float defValue);
-    Editor edit();
-    interface Editor {
-        Editor putString(String key, String value);
-        Editor putInt(String key, int value);
-        Editor putLong(String key, long value);
-        Editor putBoolean(String key, boolean value);
-        Editor putFloat(String key, float value);
-        boolean commit();
-        void apply();
-    }
-}
-'@
-            Set-Content -Path $sp -Value $spContent -Encoding utf8
+          # 4.1 SharedPreferences.java（含 Mem 字段）
+          cat > resources/jvm/stubs-src/android/content/SharedPreferences.java << 'JAVAEOF'
+          package android.content;
+          import java.util.Map;
+          import java.util.concurrent.ConcurrentHashMap;
+          public interface SharedPreferences {
+              Map<String, String> Mem = new ConcurrentHashMap<>();
+              String getString(String key, String defValue);
+              int getInt(String key, int defValue);
+              long getLong(String key, long defValue);
+              boolean getBoolean(String key, boolean defValue);
+              float getFloat(String key, float defValue);
+              Editor edit();
+              interface Editor {
+                  Editor putString(String key, String value);
+                  Editor putInt(String key, int value);
+                  Editor putLong(String key, long value);
+                  Editor putBoolean(String key, boolean value);
+                  Editor putFloat(String key, float value);
+                  boolean commit();
+                  void apply();
+              }
           }
+          JAVAEOF
 
-          # ---- 4.2 补 com.github.catvod.net.OkHttp ----
-          $okhttpDir = "$root/com/github/catvod/net"
-          New-Item -ItemType Directory -Force -Path $okhttpDir | Out-Null
-          Write-Host "`n→ 写 OkHttp.java"
-          $okhttp = @'
-package com.github.catvod.net;
+          # 4.2 OkHttp.java
+          cat > resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java << 'JAVAEOF'
+          package com.github.catvod.net;
+          import okhttp3.Dns;
+          import okhttp3.OkHttpClient;
+          import okhttp3.Request;
+          import okhttp3.Response;
+          import okhttp3.ResponseBody;
+          import java.util.Map;
+          import java.util.concurrent.TimeUnit;
+          public class OkHttp {
+              private static OkHttpClient client;
+              public static Dns dns() { return Dns.SYSTEM; }
+              public static OkHttpClient client() {
+                  if (client == null) {
+                      client = new OkHttpClient.Builder()
+                              .connectTimeout(30, TimeUnit.SECONDS)
+                              .readTimeout(30, TimeUnit.SECONDS)
+                              .writeTimeout(30, TimeUnit.SECONDS)
+                              .build();
+                  }
+                  return client;
+              }
+              public static String string(String url) throws Exception { return string(url, null); }
+              public static String string(String url, Map<String, String> headers) throws Exception {
+                  Request.Builder b = new Request.Builder().url(url);
+                  if (headers != null) {
+                      for (Map.Entry<String, String> e : headers.entrySet()) b.addHeader(e.getKey(), e.getValue());
+                  }
+                  try (Response resp = client().newCall(b.build()).execute()) {
+                      ResponseBody body = resp.body();
+                      return body == null ? "" : body.string();
+                  }
+              }
+          }
+          JAVAEOF
 
-import okhttp3.Dns;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
-
-import java.util.Map;
-import java.util.concurrent.TimeUnit;
-
-public class OkHttp {
-    private static OkHttpClient client;
-
-    public static Dns dns() {
-        return Dns.SYSTEM;
-    }
-
-    public static OkHttpClient client() {
-        if (client == null) {
-            client = new OkHttpClient.Builder()
-                    .connectTimeout(30, TimeUnit.SECONDS)
-                    .readTimeout(30, TimeUnit.SECONDS)
-                    .writeTimeout(30, TimeUnit.SECONDS)
-                    .build();
-        }
-        return client;
-    }
-
-    public static String string(String url) throws Exception {
-        return string(url, null);
-    }
-
-    public static String string(String url, Map<String, String> headers) throws Exception {
-        Request.Builder b = new Request.Builder().url(url);
-        if (headers != null) {
-            for (Map.Entry<String, String> e : headers.entrySet()) {
-                b.addHeader(e.getKey(), e.getValue());
-            }
-        }
-        try (Response resp = client().newCall(b.build()).execute()) {
-            ResponseBody body = resp.body();
-            return body == null ? "" : body.string();
-        }
-    }
-}
-'@
-          Set-Content -Path "$okhttpDir/OkHttp.java" -Value $okhttp -Encoding utf8
-          Write-Host "✓ stubs-src 补丁完成"
+          echo "=== SharedPreferences.java ==="
+          cat resources/jvm/stubs-src/android/content/SharedPreferences.java
+          echo "=== OkHttp.java ==="
+          cat resources/jvm/stubs-src/com/github/catvod/net/OkHttp.java
 
       # ==================================================================
       # 5. 编译 stubs.jar
@@ -263,43 +227,39 @@ public class OkHttp {
           $stubsSrc = "resources/jvm/stubs-src"
           $stubsDir = "resources/jvm/stubs"
           $classes  = Join-Path $stubsDir "classes"
-
           New-Item -ItemType Directory -Force -Path $stubsDir | Out-Null
           Remove-Item -Recurse -Force $classes -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $classes | Out-Null
 
-          # 下载 android-all（提供 android.* 基础类）
           $androidAll = Join-Path $stubsDir "android-all-base.jar"
           if (-not (Test-Path $androidAll)) {
-            Write-Host "⬇  下载 android-all（~130MB）…"
+            Write-Host "Downloading android-all (~130MB)..."
             $url = "https://repo1.maven.org/maven2/org/robolectric/android-all/14-robolectric-10818077/android-all-14-robolectric-10818077.jar"
             $attempts = 0
             while ($attempts -lt 3) {
               $attempts++
               try { Invoke-WebRequest -Uri $url -OutFile $androidAll -UseBasicParsing -TimeoutSec 900; break }
               catch {
-                if ($attempts -ge 3) { throw "android-all 下载失败" }
+                if ($attempts -ge 3) { throw "android-all download failed" }
                 Start-Sleep -Seconds 5
               }
             }
           }
 
-          # classpath = libs/*.jar + android-all
           $libs = Get-ChildItem "resources/jvm/libs" -Filter "*.jar" | ForEach-Object { $_.FullName }
           $cp = ($libs + $androidAll) -join ";"
 
           $files = Get-ChildItem -Path $stubsSrc -Recurse -Filter "*.java" | ForEach-Object { $_.FullName }
-          Write-Host "🔨 编译 $($files.Count) 个 .java 文件…"
+          Write-Host "Compiling $($files.Count) .java files..."
           javac -encoding UTF-8 -cp $cp -d $classes $files
-          if ($LASTEXITCODE -ne 0) { throw "javac 编译失败" }
+          if ($LASTEXITCODE -ne 0) { throw "javac failed" }
 
-          # 组装 stubs.jar
           $stubsJar = Join-Path $stubsDir "stubs.jar"
           Copy-Item $androidAll $stubsJar -Force
           Push-Location $classes
           & jar uf "../stubs.jar" .
           Pop-Location
-          Write-Host "✓ stubs.jar: $((Get-Item $stubsJar).Length) B"
+          Write-Host "stubs.jar: $((Get-Item $stubsJar).Length) B"
 
       # ==================================================================
       # 6. 校验
@@ -307,9 +267,7 @@ public class OkHttp {
       - name: Verify resources
         shell: pwsh
         run: |
-          Write-Host "=== resources/jvm 顶层 ==="
-          Get-ChildItem "resources/jvm" | Select-Object Name, @{n='Size';e={ if ($_.PSIsContainer) { '<dir>' } else { $_.Length } }} | Format-Table -AutoSize
-
+          Get-ChildItem "resources/jvm" | Select-Object Name | Format-Table -AutoSize
           $must = @(
             "resources/jvm/jre/bin/java.exe",
             "resources/jvm/tools/dex2jar",
@@ -322,16 +280,12 @@ public class OkHttp {
             "resources/jvm/stubs/stubs.jar"
           )
           foreach ($m in $must) {
-            if (-not (Test-Path $m)) { throw "❌ 缺失: $m" }
-            if (Test-Path $m -PathType Leaf) {
-              Write-Host "  ✓ $m ($((Get-Item $m).Length) B)"
-            } else {
-              Write-Host "  ✓ $m (dir)"
-            }
+            if (-not (Test-Path $m)) { throw "missing: $m" }
+            Write-Host "OK: $m"
           }
 
       # ==================================================================
-      # 7. 测试 & 构建（不跳过任何测试）
+      # 7. 测试 & 构建
       # ==================================================================
       - name: Run typecheck
         run: npm run typecheck

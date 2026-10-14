@@ -1,24 +1,27 @@
 // src/main/live/EpgManager.ts
 // XMLTV EPG 管理器 —— 移植自 TVBox EpgManager.java（含别名表，支持多 key 反查）
 //
-// ★★ 2026-10-14（用户报「加载 50MB EPG XML 时未响应/崩溃」根本解决）★★
-//   前两版尝试：
-//     ① 主线程 readFileSync 整读 → 主进程卡死
-//     ② 主线程流式分块 + 每 2000 条让出 → 仍慢（字符串拼接/正则的回溯成本太高）
+// ★★ 2026-10-14（用户报「50MB EPG XML 卡死 + 加载不出」根治版）★★
 //
-//   现改为：**worker_threads（inline、eval 模式）跑解析**。
-//     · 主进程完全不做解析，只等 worker 的 postMessage 结果
-//     · 期间主进程 IPC 完全正常（窗口可拖动、按钮可点击、日志可写）
-//     · worker 里直接 readFileSync + 正则扫（在独立线程/独立内存里，不影响 UI）
-//     · 结果通过 structured clone 传回（Date 会被正确保留）
-//     · 用 inline worker（eval: true）→ 不需要新文件、不需要改构建脚本
+//   前几版问题：
+//     · 主线程 readFileSync 整个 50MB → 卡
+//     · 主线程流式分块 + 让出 → 仍慢
+//     · 主线程 worker 解析 XML → 好一些，但 JSON 映射表（epg_data_cache.json）依然
+//       用 readFileSync + JSON.parse 在主线程做 → 大文件依然卡
+//
+//   本版**全异步 + 全 worker**：
+//     · XML 解析   → Worker（mode=xml）
+//     · JSON 解析  → Worker（mode=json）
+//     · gunzip     → 异步 gunzip（promisify）
+//     · 所有 fs    → node:fs/promises
+//     · 构造时不阻塞（JSON 加载异步启动，loadChannelGroup 里 await 一次 ready）
+//     · 每一步都打 [EpgManager] 日志，带耗时 → 卡在哪一步一目了然
 
-import {
-  existsSync, mkdirSync, readFileSync, writeFileSync,
-  statSync, unlinkSync, renameSync,
-} from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
+import { readFile, writeFile, stat, unlink, rename } from 'node:fs/promises';
 import { join } from 'node:path';
-import { gunzipSync } from 'node:zlib';
+import { gunzip } from 'node:zlib';
+import { promisify } from 'node:util';
 import { Worker } from 'node:worker_threads';
 import { fileLogger } from '../util/logger';
 
@@ -28,6 +31,8 @@ const EPG_FILE_NAME = 'epg.xml';
 const HASH_FILE_NAME = 'epg.hash';
 const EPG_DATA_FILE_NAME = 'epg_data_cache.json';
 const EPG_DATA_HASH_FILE = 'epg_data_cache.hash';
+
+const gunzipAsync = promisify(gunzip);
 
 const GITHUB_PROXIES = [
   'https://gh-proxy.org/',
@@ -54,20 +59,71 @@ export interface EpgRefreshResult {
 }
 
 // =====================================================================
-// ★ Worker 代码（inline）
-//
-//   worker 里独立完成：
-//     1) readFileSync 读整个 XML（在 worker 自己的线程/内存里，不影响主进程）
-//     2) 正则扫 channel + programme
-//     3) postMessage 结果（只传命中的部分，量小）
-//
-//   纯函数（attrValue / stripXmlText / normalizeChannelName / parseXmltvTime）
-//   在 worker 里重定义一次 —— 它们极小，重复没维护成本。
+// ★ Worker 代码（inline，支持 mode=xml / mode=json）
 // =====================================================================
 const EPG_WORKER_CODE = `
 const { parentPort, workerData } = require('node:worker_threads');
 const fs = require('node:fs');
 
+const mode = workerData.mode;
+
+function normalizeChannelName(name) {
+  if (!name) return '';
+  let s = name.trim();
+  s = s.replace(/[\\uFF08(][^\\uFF09)]*[\\uFF09)]/g, '');
+  s = s.replace(/\\u8D85\\u6E05|\\u84DD\\u5149|\\u9AD8\\u6E05|\\u6807\\u6E05|\\u539F\\u753B|\\u6D41\\u7545|\\u8D85\\u9AD8\\u6E05|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
+  s = s.replace(/[\\s\\-_.\\u00B7]+/g, '');
+  s = s.replace(/(\\u9891\\u9053|\\u53F0)$/, '');
+  return s.toUpperCase();
+}
+
+// ---------- mode=json：解析 epg_data_cache.json ----------
+if (mode === 'json') {
+  let text = '';
+  try {
+    text = fs.readFileSync(workerData.jsonFile, 'utf-8');
+  } catch (e) {
+    parentPort.postMessage({ ok: false, error: 'read: ' + String(e) });
+    return;
+  }
+  let root = null;
+  try {
+    root = JSON.parse(text);
+  } catch (e) {
+    parentPort.postMessage({ ok: false, error: 'parse: ' + String(e) });
+    return;
+  }
+  const epgs = root && root.epgs;
+  if (!Array.isArray(epgs)) {
+    parentPort.postMessage({ ok: true, nameToEpgId: [], normalizedNameToEpgId: [], count: 0 });
+    return;
+  }
+  const nameToEpgId = new Map();
+  const normalizedNameToEpgId = new Map();
+  for (const item of epgs) {
+    if (!item || !item.epgid || !item.name) continue;
+    const epgid = String(item.epgid).trim();
+    if (!epgid) continue;
+    const normEpgid = normalizeChannelName(epgid);
+    if (normEpgid && !normalizedNameToEpgId.has(normEpgid)) normalizedNameToEpgId.set(normEpgid, epgid);
+    for (const v of String(item.name).split(',')) {
+      const key = v.trim();
+      if (!key) continue;
+      nameToEpgId.set(key, epgid);
+      const nk = normalizeChannelName(key);
+      if (nk && !normalizedNameToEpgId.has(nk)) normalizedNameToEpgId.set(nk, epgid);
+    }
+  }
+  parentPort.postMessage({
+    ok: true,
+    nameToEpgId: Array.from(nameToEpgId.entries()),
+    normalizedNameToEpgId: Array.from(normalizedNameToEpgId.entries()),
+    count: nameToEpgId.size,
+  });
+  return;
+}
+
+// ---------- mode=xml：解析 XMLTV ----------
 const nameToEpgId = new Map(workerData.nameToEpgIdArr);
 const normalizedNameToEpgId = new Map(workerData.normalizedNameToEpgIdArr);
 const requested = new Set(workerData.requestedArr);
@@ -95,16 +151,6 @@ function stripXmlText(s) {
   return t.trim();
 }
 
-function normalizeChannelName(name) {
-  if (!name) return '';
-  let s = name.trim();
-  s = s.replace(/[\\uFF08(][^\\uFF09)]*[\\uFF09)]/g, '');
-  s = s.replace(/\\u8D85\\u6E05|\\u84DD\\u5149|\\u9AD8\\u6E05|\\u6807\\u6E05|\\u539F\\u753B|\\u6D41\\u7545|\\u8D85\\u9AD8\\u6E05|HD|UHD|SD|4K|8K|FHD|QHD/gi, '');
-  s = s.replace(/[\\s\\-_.\\u00B7]+/g, '');
-  s = s.replace(/(\\u9891\\u9053|\\u53F0)$/, '');
-  return s.toUpperCase();
-}
-
 function parseXmltvTime(v) {
   if (!v || v.length < 14) return null;
   const main = v.substring(0, 14);
@@ -120,23 +166,20 @@ function parseXmltvTime(v) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-// ---------- 请求集合归一化 ----------
 const requestedNorm = new Map();
 for (const r of requested) {
   const nr = normalizeChannelName(r);
   if (nr && !requestedNorm.has(nr)) requestedNorm.set(nr, r);
 }
 
-// ---------- 读取 XML ----------
 let xml = '';
 try {
   xml = fs.readFileSync(xmlFile, 'utf-8');
 } catch (e) {
-  parentPort.postMessage({ ok: false, error: String(e) });
+  parentPort.postMessage({ ok: false, error: 'read-xml: ' + String(e) });
   return;
 }
 
-// ---------- 扫 channel ----------
 const newPrograms = new Map();
 const idsByEpgId = new Map();
 const iconByEpgId = new Map();
@@ -232,7 +275,6 @@ while ((m = channelRe.exec(xml)) !== null) {
   }
 }
 
-// ---------- 扫 programme ----------
 let totalProg = 0, usedProg = 0;
 const progRe = /<programme\\b([^>]*)>([\\s\\S]*?)<\\/programme>/g;
 while ((m = progRe.exec(xml)) !== null) {
@@ -258,7 +300,6 @@ while ((m = progRe.exec(xml)) !== null) {
   usedProg++;
 }
 
-// ---------- 回传（Map → 数组，便于 structured clone） ----------
 parentPort.postMessage({
   ok: true,
   idsByEpgId: Array.from(idsByEpgId.entries()),
@@ -271,8 +312,8 @@ parentPort.postMessage({
 });
 `;
 
-// worker 回传结果的结构
-interface EpgWorkerResult {
+// worker 回传结构
+interface EpgXmlWorkerResult {
   ok: boolean;
   error?: string;
   idsByEpgId: Array<[string, string[]]>;
@@ -292,18 +333,85 @@ interface EpgWorkerResult {
   };
 }
 
-export class EpgManager {
-  private readonly nameToEpgId = new Map<string, string>();
-  private readonly normalizedNameToEpgId = new Map<string, string>();
+interface EpgJsonWorkerResult {
+  ok: boolean;
+  error?: string;
+  nameToEpgId: Array<[string, string]>;
+  normalizedNameToEpgId: Array<[string, string]>;
+  count: number;
+}
 
-  private readonly xmlChannelIdsByEpgId = new Map<string, string[]>();
-  private readonly programsByChannelId = new Map<string, EpgProgram[]>();
-  private readonly programsByEpgId = new Map<string, EpgProgram[]>();
-  private readonly iconUrlByEpgId = new Map<string, string>();
-  private readonly loadedEpgIds = new Set<string>();
-  private readonly normalizedToXmlChannelId = new Map<string, string>();
-  private readonly normalizedToIconUrl = new Map<string, string>();
-  private readonly aliasToChannelIds = new Map<string, string[]>();
+// =====================================================================
+// Worker 启动器（模块级）
+// =====================================================================
+function runJsonWorker(jsonFile: string): Promise<EpgJsonWorkerResult> {
+  return new Promise<EpgJsonWorkerResult>((resolve, reject) => {
+    let settled = false;
+    const worker = new Worker(EPG_WORKER_CODE, {
+      eval: true,
+      workerData: { mode: 'json', jsonFile },
+      resourceLimits: { maxOldGenerationSizeMb: 1024 },
+    });
+    const finish = (err: Error | null, result?: EpgJsonWorkerResult): void => {
+      if (settled) return;
+      settled = true;
+      void worker.terminate().catch(() => undefined);
+      if (err) reject(err);
+      else resolve(result!);
+    };
+    worker.once('message', (msg: EpgJsonWorkerResult) => finish(null, msg));
+    worker.once('error', (e) => finish(e instanceof Error ? e : new Error(String(e))));
+    worker.once('exit', (code) => {
+      if (!settled && code !== 0) finish(new Error(`EPG json worker exited code=${code}`));
+    });
+    setTimeout(() => finish(new Error('EPG json worker timeout (60s)')), 60_000).unref?.();
+  });
+}
+
+function runXmlWorker(payload: {
+  xmlFile: string;
+  requestedArr: string[];
+  nameToEpgIdArr: Array<[string, string]>;
+  normalizedNameToEpgIdArr: Array<[string, string]>;
+}): Promise<EpgXmlWorkerResult> {
+  return new Promise<EpgXmlWorkerResult>((resolve, reject) => {
+    let settled = false;
+    const worker = new Worker(EPG_WORKER_CODE, {
+      eval: true,
+      workerData: { mode: 'xml', ...payload },
+      resourceLimits: { maxOldGenerationSizeMb: 1024 },
+    });
+    const finish = (err: Error | null, result?: EpgXmlWorkerResult): void => {
+      if (settled) return;
+      settled = true;
+      void worker.terminate().catch(() => undefined);
+      if (err) reject(err);
+      else resolve(result!);
+    };
+    worker.once('message', (msg: EpgXmlWorkerResult) => finish(null, msg));
+    worker.once('error', (e) => finish(e instanceof Error ? e : new Error(String(e))));
+    worker.once('exit', (code) => {
+      if (!settled && code !== 0) finish(new Error(`EPG xml worker exited code=${code}`));
+    });
+    setTimeout(() => finish(new Error('EPG xml worker timeout (120s)')), 120_000).unref?.();
+  });
+}
+
+// =====================================================================
+// EpgManager 主体
+// =====================================================================
+export class EpgManager {
+  private nameToEpgId = new Map<string, string>();
+  private normalizedNameToEpgId = new Map<string, string>();
+
+  private xmlChannelIdsByEpgId = new Map<string, string[]>();
+  private programsByChannelId = new Map<string, EpgProgram[]>();
+  private programsByEpgId = new Map<string, EpgProgram[]>();
+  private iconUrlByEpgId = new Map<string, string>();
+  private loadedEpgIds = new Set<string>();
+  private normalizedToXmlChannelId = new Map<string, string>();
+  private normalizedToIconUrl = new Map<string, string>();
+  private aliasToChannelIds = new Map<string, string[]>();
 
   private activeProxy: string | null = null;
   private proxyProbing: Promise<string> | null = null;
@@ -312,8 +420,10 @@ export class EpgManager {
   private epgUrl: string;
   private refreshRunning = false;
   private epgDataRefreshRunning = false;
-  /** ★ worker 解析锁：同一时间只跑一个 worker（避免重复解析大文件） */
+  /** ★ worker 解析锁：同一时间只跑一个 XML worker */
   private parseRunning: Promise<void> | null = null;
+  /** ★ JSON 加载 ready（构造时异步启动；loadChannelGroup 会 await 一次） */
+  private epgDataReady: Promise<void>;
 
   private readonly epgDir: string;
   private readonly epgFile: string;
@@ -329,7 +439,10 @@ export class EpgManager {
     this.epgDataHashFile = join(userDataDir, EPG_DATA_HASH_FILE);
     if (!existsSync(this.epgDir)) mkdirSync(this.epgDir, { recursive: true });
     this.epgUrl = this.normalizeEpgUrl(epgUrl);
-    this.loadEpgDataMap(false);
+    // ★ 异步启动 JSON 加载（不阻塞构造）
+    this.epgDataReady = this.loadEpgDataMap(false).catch((e) => {
+      fileLogger.w(`${TAG} 构造期 JSON 加载异常: ${String(e)}`);
+    });
   }
 
   setEpgUrl(url: string): void {
@@ -403,42 +516,30 @@ export class EpgManager {
     }
   }
 
-  // ===================== epg_data.json 加载 =====================
-  loadEpgDataMap(resetXmlCache: boolean): void {
+  // ===================== epg_data.json 加载（worker 解析 JSON） =====================
+  async loadEpgDataMap(resetXmlCache: boolean): Promise<void> {
     this.nameToEpgId.clear();
     this.normalizedNameToEpgId.clear();
-    let source = '无';
+    const t0 = Date.now();
     try {
-      if (existsSync(this.epgDataFile) && statSync(this.epgDataFile).size > 0) {
-        source = '本地缓存';
-        const root = JSON.parse(readFileSync(this.epgDataFile, 'utf-8'));
-        const epgs = root?.epgs;
-        if (Array.isArray(epgs)) {
-          for (const item of epgs) {
-            if (!item?.epgid || !item?.name) continue;
-            const epgid = String(item.epgid).trim();
-            if (!epgid) continue;
-            const normEpgid = normalizeChannelName(epgid);
-            if (normEpgid && !this.normalizedNameToEpgId.has(normEpgid)) {
-              this.normalizedNameToEpgId.set(normEpgid, epgid);
-            }
-            for (const v of String(item.name).split(',')) {
-              const key = v.trim();
-              if (!key) continue;
-              this.nameToEpgId.set(key, epgid);
-              const nk = normalizeChannelName(key);
-              if (nk && !this.normalizedNameToEpgId.has(nk)) {
-                this.normalizedNameToEpgId.set(nk, epgid);
-              }
-            }
-          }
+      const s = await stat(this.epgDataFile).catch(() => null);
+      if (s && s.size > 0) {
+        fileLogger.i(`${TAG} 开始加载 epg_data.json（${(s.size / 1024 / 1024).toFixed(1)}MB，worker 解析）…`);
+        const r = await runJsonWorker(this.epgDataFile);
+        if (r.ok) {
+          this.nameToEpgId = new Map(r.nameToEpgId);
+          this.normalizedNameToEpgId = new Map(r.normalizedNameToEpgId);
+          fileLogger.i(
+            `${TAG} 加载 epg_data.json 完成：精确变体=${this.nameToEpgId.size}，归一化键=${this.normalizedNameToEpgId.size}，耗时=${Date.now() - t0}ms`,
+          );
+        } else {
+          fileLogger.w(`${TAG} epg_data.json 解析失败：${r.error || 'unknown'}（耗时 ${Date.now() - t0}ms）`);
         }
-        fileLogger.i(
-          `${TAG} 加载 epg_data.json[${source}]，精确变体=${this.nameToEpgId.size}，归一化键=${this.normalizedNameToEpgId.size}`,
-        );
+      } else {
+        fileLogger.i(`${TAG} epg_data.json 不存在或为空，跳过`);
       }
     } catch (e) {
-      fileLogger.w(`${TAG} 加载 epg_data.json 失败[${source}]: ${String(e)}`);
+      fileLogger.w(`${TAG} 加载 epg_data.json 异常: ${String(e)}`);
     }
     if (resetXmlCache) this.resetXmlCache();
   }
@@ -464,7 +565,7 @@ export class EpgManager {
       const dataRaw = 'https://raw.githubusercontent.com/tytestelle/sandiJMYG/main/epg_data/epg_data.json';
       const remoteHash = await this.fetchViaProxy(hashRaw, 15000, false);
       const localHash = existsSync(this.epgDataHashFile)
-        ? readFileSync(this.epgDataHashFile, 'utf-8').trim() : '';
+        ? (await readFile(this.epgDataHashFile, 'utf-8')).trim() : '';
       if (remoteHash && remoteHash === localHash && existsSync(this.epgDataFile)) return;
       const buf = await this.fetchViaProxy(dataRaw, 60000, true);
       if (!buf || buf.length === 0) return;
@@ -472,10 +573,10 @@ export class EpgManager {
         const parsed = JSON.parse(buf.toString('utf-8'));
         if (!parsed?.epgs) return;
       } catch { return; }
-      writeFileSync(this.epgDataFile, buf);
-      if (remoteHash) writeFileSync(this.epgDataHashFile, remoteHash, 'utf-8');
+      await writeFile(this.epgDataFile, buf);
+      if (remoteHash) await writeFile(this.epgDataHashFile, remoteHash, 'utf-8');
       fileLogger.i(`${TAG} epg_data.json 已更新（${buf.length}B）`);
-      this.loadEpgDataMap(true);
+      await this.loadEpgDataMap(true);
     } catch (e) {
       fileLogger.w(`${TAG} 刷新 epg_data.json 失败: ${String(e)}`);
     } finally {
@@ -483,27 +584,34 @@ export class EpgManager {
     }
   }
 
-  // ===================== XMLTV 下载 =====================
+  // ===================== XMLTV 下载（全异步） =====================
   async refreshEpg(): Promise<EpgRefreshResult> {
     if (!this.epgUrl) return { ok: false, error: 'EPG URL 未设置' };
     if (this.refreshRunning) return { ok: false, error: '正在刷新中' };
     this.refreshRunning = true;
+    const t0 = Date.now();
     try {
-      if (existsSync(this.epgFile) && statSync(this.epgFile).size > 1024) {
-        const age = Date.now() - statSync(this.epgFile).mtimeMs;
+      // 未过期直接用本地
+      const st = await stat(this.epgFile).catch(() => null);
+      if (st && st.size > 1024) {
+        const age = Date.now() - st.mtimeMs;
         if (age < 6 * 3600 * 1000) {
           fileLogger.i(`${TAG} EPG 本地文件未过期（${Math.round(age / 60000)} 分钟前）`);
           this.resetXmlCache();
           return { ok: true };
         }
       }
+
+      // 远端 hash 比对
       const remoteHash = await this.fetchViaProxy(this.epgUrl + '.hash', 10000, false);
       const localHash = existsSync(this.hashFile)
-        ? readFileSync(this.hashFile, 'utf-8').trim() : '';
+        ? (await readFile(this.hashFile, 'utf-8')).trim() : '';
       if (remoteHash && remoteHash === localHash && existsSync(this.epgFile)) {
+        fileLogger.i(`${TAG} 远端 hash 一致，使用本地 XML`);
         this.resetXmlCache();
         return { ok: true };
       }
+
       fileLogger.i(`${TAG} 开始下载 EPG ← ${this.epgUrl}`);
       const tmp = this.epgFile + '.tmp';
       const buf = await this.fetchViaProxy(this.epgUrl, 180000, true);
@@ -515,21 +623,35 @@ export class EpgManager {
         }
         return { ok: false, error: 'EPG 下载失败' };
       }
-      writeFileSync(tmp, buf);
-      const head = readFileSync(tmp).subarray(0, 2);
+
+      await writeFile(tmp, buf);
+      fileLogger.i(`${TAG} 下载完成 ${(buf.length / 1024 / 1024).toFixed(1)}MB（耗时 ${Date.now() - t0}ms），检查是否 gzip…`);
+
+      const fh = await readFile(tmp);
+      const head = fh.subarray(0, 2);
       if (head.length === 2 && head[0] === 0x1f && head[1] === 0x8b) {
-        writeFileSync(tmp, gunzipSync(readFileSync(tmp)));
+        const tg = Date.now();
+        fileLogger.i(`${TAG} 检测到 gzip，异步解压中…`);
+        const decompressed = await gunzipAsync(fh);
+        await writeFile(tmp, decompressed);
+        fileLogger.i(`${TAG} 解压完成 → ${(decompressed.length / 1024 / 1024).toFixed(1)}MB（耗时 ${Date.now() - tg}ms）`);
       }
-      if (existsSync(this.epgFile)) unlinkSync(this.epgFile);
-      try { renameSync(tmp, this.epgFile); } catch {
-        writeFileSync(this.epgFile, readFileSync(tmp));
-        unlinkSync(tmp);
+
+      if (existsSync(this.epgFile)) await unlink(this.epgFile);
+      try {
+        await rename(tmp, this.epgFile);
+      } catch {
+        await writeFile(this.epgFile, await readFile(tmp));
+        await unlink(tmp);
       }
-      if (remoteHash) writeFileSync(this.hashFile, remoteHash, 'utf-8');
+      if (remoteHash) await writeFile(this.hashFile, remoteHash, 'utf-8');
       this.resetXmlCache();
-      fileLogger.i(`${TAG} EPG 就绪 size=${statSync(this.epgFile).size}`);
+
+      const fs2 = await stat(this.epgFile).catch(() => null);
+      fileLogger.i(`${TAG} EPG 就绪 size=${fs2 ? (fs2.size / 1024 / 1024).toFixed(1) + 'MB' : '?'}（总耗时 ${Date.now() - t0}ms）`);
       return { ok: true };
     } catch (e) {
+      fileLogger.w(`${TAG} refreshEpg 异常：${String(e)}（耗时 ${Date.now() - t0}ms）`);
       if (existsSync(this.epgFile)) { this.resetXmlCache(); return { ok: true }; }
       return { ok: false, error: String(e) };
     } finally {
@@ -539,8 +661,11 @@ export class EpgManager {
 
   // ===================== 分组按需加载 =====================
   async loadChannelGroup(channelNames: string[]): Promise<void> {
+    // ★ 确保 JSON 数据表已就绪（构造时异步启动的）
+    await this.epgDataReady;
     if (!channelNames || channelNames.length === 0) return;
-    if (!existsSync(this.epgFile) || statSync(this.epgFile).size === 0) return;
+    const st = await stat(this.epgFile).catch(() => null);
+    if (!st || st.size === 0) return;
     const requested = new Set<string>();
     for (const name of channelNames) {
       if (!name) continue;
@@ -551,9 +676,7 @@ export class EpgManager {
       if (epgid) requested.add(epgid);
     }
     if (requested.size === 0) return;
-    // 已有缓存覆盖 → 直接返回
     if (this.parsed && this.isSubset(requested, this.loadedEpgIds)) return;
-    // 若已有 worker 在跑 → 等它完成再看
     if (this.parseRunning) {
       await this.parseRunning;
       if (this.parsed && this.isSubset(requested, this.loadedEpgIds)) return;
@@ -584,42 +707,36 @@ export class EpgManager {
   }
 
   // =====================================================================
-  // ★★ Worker 线程解析（主进程完全不阻塞）★★
+  // Worker 线程解析 XML
   // =====================================================================
   private parseXmlForEpgIds(file: string, requested: Set<string>): Promise<void> {
-    // 若已有 worker 在跑 → 复用
     if (this.parseRunning) return this.parseRunning;
 
     const t0 = Date.now();
-    let sizeBytes = 0;
-    try { sizeBytes = statSync(file).size; } catch { /* ignore */ }
-    fileLogger.i(
-      `${TAG} 启动 worker 解析 ${(sizeBytes / 1024 / 1024).toFixed(1)}MB（请求 ${requested.size} 个频道）…`,
-    );
-
     const workerData = {
       xmlFile: file,
       requestedArr: [...requested],
       nameToEpgIdArr: [...this.nameToEpgId.entries()],
       normalizedNameToEpgIdArr: [...this.normalizedNameToEpgId.entries()],
     };
+    fileLogger.i(`${TAG} 启动 XML worker（请求 ${requested.size} 个频道）…`);
 
     const p = (async (): Promise<void> => {
       try {
-        const result = await runEpgWorker(workerData);
+        const result = await runXmlWorker(workerData);
         if (!result.ok) {
-          fileLogger.w(`${TAG} worker 解析失败: ${result.error || 'unknown'}`);
+          fileLogger.w(`${TAG} XML worker 失败：${result.error || 'unknown'}`);
           return;
         }
         this.applyWorkerResult(result, requested);
         const s = result.stats;
         fileLogger.i(
-          `${TAG} 解析完成: 请求=${requested.size} 命中=${result.idsByEpgId.length} 累计=${this.loadedEpgIds.size} 别名=${this.aliasToChannelIds.size} ` +
+          `${TAG} XML 解析完成：请求=${requested.size} 命中=${result.idsByEpgId.length} 累计=${this.loadedEpgIds.size} 别名=${this.aliasToChannelIds.size} ` +
             `channel=${s.totalChannel}(channelId ${s.matchByChannelId}/精确 ${s.matchByExact}/变体 ${s.matchByVariant}/归一化 ${s.matchByNorm}) ` +
             `programme=${s.totalProg}/命中 ${s.usedProg} 耗时=${Date.now() - t0}ms`,
         );
       } catch (e) {
-        fileLogger.w(`${TAG} worker 异常: ${String(e)}`);
+        fileLogger.w(`${TAG} XML worker 异常：${String(e)}`);
       } finally {
         this.parseRunning = null;
       }
@@ -628,8 +745,7 @@ export class EpgManager {
     return p;
   }
 
-  private applyWorkerResult(result: EpgWorkerResult, requested: Set<string>): void {
-    // 合并 programmes（按 channelId）
+  private applyWorkerResult(result: EpgXmlWorkerResult, requested: Set<string>): void {
     for (const [chId, list] of result.programsByChannelId) {
       const existing = this.programsByChannelId.get(chId);
       if (existing) {
@@ -644,30 +760,25 @@ export class EpgManager {
         this.programsByChannelId.set(chId, list);
       }
     }
-    // channelIds by epgId
     for (const [epgid, ids] of result.idsByEpgId) {
       const existing = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
       for (const id of ids) if (!existing.includes(id)) existing.push(id);
       this.xmlChannelIdsByEpgId.set(epgid, existing);
     }
-    // 归一化名字 → xml channelId
     for (const [k, v] of result.normalizedToXmlChannelId) {
       if (!this.normalizedToXmlChannelId.has(k)) this.normalizedToXmlChannelId.set(k, v);
     }
-    // icon
     for (const [epgid, url] of result.iconByEpgId) {
       if (!this.iconUrlByEpgId.has(epgid)) this.iconUrlByEpgId.set(epgid, url);
     }
     for (const [k, v] of result.normalizedToIconUrl) {
       if (!this.normalizedToIconUrl.has(k)) this.normalizedToIconUrl.set(k, v);
     }
-    // aliases
     for (const [name, ids] of result.aliasToChannelIds) {
       const arr = this.aliasToChannelIds.get(name) ?? [];
       for (const id of ids) if (!arr.includes(id)) arr.push(id);
       this.aliasToChannelIds.set(name, arr);
     }
-    // 重建 programsByEpgId（用于 multi 查询的 eid 分支）
     for (const [epgid] of result.idsByEpgId) {
       const allIds = this.xmlChannelIdsByEpgId.get(epgid) ?? [];
       const merged: EpgProgram[] = [];
@@ -691,9 +802,7 @@ export class EpgManager {
     const unmatched = new Set<string>();
     for (const r of requested) if (!result.idsByEpgId.some(([e]) => e === r)) unmatched.add(r);
     if (unmatched.size > 0) {
-      fileLogger.i(
-        `${TAG} 未匹配上的 epgid（共 ${unmatched.size} 个，示例 20 个）: ${JSON.stringify([...unmatched].slice(0, 20))}`,
-      );
+      fileLogger.i(`${TAG} 未匹配上的 epgid（共 ${unmatched.size} 个，示例 20 个）: ${JSON.stringify([...unmatched].slice(0, 20))}`);
     }
   }
 
@@ -729,7 +838,6 @@ export class EpgManager {
       }
     }
 
-    // 未命中任何候选（且没解析过）→ 静默返回空
     if (candidateChannelIds.size === 0 && candidateEpgids.size === 0) return [];
 
     const merged: EpgProgram[] = [];
@@ -762,20 +870,15 @@ export class EpgManager {
     const names = Array.isArray(channelNames) ? channelNames : [channelNames];
     const all = this.getProgramsForChannelMulti(names);
     if (all.length === 0) return [];
-
     const dayStart = localDayStartMs(date);
     const dayEnd = localNextDayStartMs(date);
     if (dayStart === null || dayEnd === null) return all;
-
     const result = all.filter((p) => {
       const s = p.start.getTime();
       const e = p.stop.getTime();
       return e > dayStart && s < dayEnd;
     });
-
-    fileLogger.i(
-      `[EPG] 按日期查询 localYMD=${localYmd(date)} 全部=${all.length} 命中=${result.length}`,
-    );
+    fileLogger.i(`[EPG] 按日期查询 localYMD=${localYmd(date)} 全部=${all.length} 命中=${result.length}`);
     return result;
   }
 
@@ -826,41 +929,7 @@ export class EpgManager {
 }
 
 // =====================================================================
-// Worker 启动器（模块级纯函数）
-// =====================================================================
-function runEpgWorker(payload: {
-  xmlFile: string;
-  requestedArr: string[];
-  nameToEpgIdArr: Array<[string, string]>;
-  normalizedNameToEpgIdArr: Array<[string, string]>;
-}): Promise<EpgWorkerResult> {
-  return new Promise<EpgWorkerResult>((resolve, reject) => {
-    let settled = false;
-    const worker = new Worker(EPG_WORKER_CODE, {
-      eval: true,
-      workerData: payload,
-      /** worker 自身内存不占主进程（Node 默认 2GB heap，够 50MB 解析） */
-      resourceLimits: { maxOldGenerationSizeMb: 1024 },
-    });
-    const finish = (err: Error | null, result?: EpgWorkerResult): void => {
-      if (settled) return;
-      settled = true;
-      void worker.terminate().catch(() => undefined);
-      if (err) reject(err);
-      else resolve(result!);
-    };
-    worker.once('message', (msg: EpgWorkerResult) => finish(null, msg));
-    worker.once('error', (e) => finish(e instanceof Error ? e : new Error(String(e))));
-    worker.once('exit', (code) => {
-      if (!settled && code !== 0) finish(new Error(`EPG worker exited with code=${code}`));
-    });
-    /** 兜底超时：90 秒没结果就放弃（避免 worker 卡死导致永不返回） */
-    setTimeout(() => finish(new Error('EPG worker timeout (90s)')), 90_000).unref?.();
-  });
-}
-
-// =====================================================================
-// 主进程侧的纯函数（与 worker code 内的同名实现保持一致）
+// 主进程侧纯函数（与 worker 内保持一致）
 // =====================================================================
 function normalizeChannelName(name: string): string {
   if (!name) return '';

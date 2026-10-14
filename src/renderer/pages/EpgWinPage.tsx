@@ -1,10 +1,11 @@
 // src/renderer/pages/EpgWinPage.tsx
 // EPG 独立窗口的渲染层页面。
-//   · 路由：`#/epg-window?name=…&tvgId=…&tvgName=…`
-//   · 布局：左侧「分组 → 频道」列表 + 右侧节目单
-//   · 点击左侧频道 → 右侧刷新为该频道节目单（不影响主窗口正在播放的频道）
-//   · 标题栏 `-webkit-app-region: drag` → 整窗拖动；📌 切换置顶、× 关闭
-//   · 监听主进程 `epg:windowUpdate` / `epg:getChannels` → 从主窗口切频道/分组时同步
+//   · 布局：左侧「分组 → 频道」两级列表 + 右侧节目单
+//   · 点分组展开 / 折叠；点频道 → 右侧刷新该频道节目预告
+//   · 标题栏「↩ 当前」按钮 → 一键切回**主窗口当前播放的频道**
+//   · 搜索框：按频道名 / 分组名过滤左侧列表
+//   · `-webkit-app-region: drag` 拖动整窗；📌 切换置顶、× 关闭
+//   · 监听主进程 `epg:windowUpdate` / `epg:getChannels` → 主窗口切频道/分组时同步
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { client } from '../api/client';
 import { ipcInvoke } from '../api/ipc';
@@ -25,6 +26,13 @@ interface ChannelItem {
 interface GroupItem {
   group: string;
   channels: ChannelItem[];
+}
+
+interface InitialChannel {
+  name: string;
+  tvgId: string;
+  tvgName: string;
+  group: string;
 }
 
 function toDate(v: unknown): Date {
@@ -59,14 +67,17 @@ export default function EpgWinPage() {
   const [tvgId, setTvgId] = useState('');
   const [tvgName, setTvgName] = useState('');
   const [groups, setGroups] = useState<GroupItem[]>([]);
+  const [loadingGroups, setLoadingGroups] = useState(true);
   const [currentGroupName, setCurrentGroupName] = useState('');
-  const [loading, setLoading] = useState(false);
   const [list, setList] = useState<ProgramItem[]>([]);
+  const [loading, setLoading] = useState(false);
   const [date, setDate] = useState('');
   const [alwaysOnTop, setAlwaysOnTop] = useState(true);
   const [nowMs, setNowMs] = useState(Date.now());
   const [filter, setFilter] = useState('');
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  /** ★ 主窗口当前播放的频道（「↩ 当前」按钮用） */
+  const [initial, setInitial] = useState<InitialChannel | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -102,18 +113,30 @@ export default function EpgWinPage() {
     }
   };
 
-  const loadFromQuery = async (qs: string) => {
+  /** 从 hash query 解析参数（URL 里带 name/tvgId/tvgName）；同时更新 initial（= 主窗口正在播的频道） */
+  const loadFromQuery = async (qs: string, opts?: { updateInitial?: boolean }) => {
     const params = new URLSearchParams(qs);
     const name = (params.get('name') || '').trim();
     const id = (params.get('tvgId') || '').trim();
     const tn = (params.get('tvgName') || '').trim();
+    if (!name) return;
     setChannelName(name);
     setTvgId(id);
     setTvgName(tn);
+    // 每次主窗口切频道（更新 query）时，initial 也跟着更新
+    if (opts?.updateInitial !== false) {
+      // 找到该频道所在分组（用于「切回」时展开）
+      let group = '';
+      for (const g of groups) {
+        if (g.channels.some((c) => c.name === name)) { group = g.group; break; }
+      }
+      setInitial({ name, tvgId: id, tvgName: tn, group });
+      if (group) setExpanded((prev) => ({ ...prev, [group]: true }));
+    }
     await loadPrograms(name, id, tn);
   };
 
-  /** ★ 点击左侧频道切换（只影响本窗口显示的节目单） */
+  /** ★ 点击左侧频道切换（只影响本窗口显示，不影响主窗口播放） */
   const switchChannel = (name: string) => {
     for (const g of groups) {
       const hit = g.channels.find((c) => c.name === name);
@@ -122,36 +145,45 @@ export default function EpgWinPage() {
         setTvgId(hit.tvgId || '');
         setTvgName(hit.tvgName || '');
         setCurrentGroupName(g.group);
-        // 确保该分组展开
         setExpanded((prev) => ({ ...prev, [g.group]: true }));
         void loadPrograms(name, hit.tvgId || '', hit.tvgName || '');
         return;
       }
     }
-    // 兜底：直接按名字查
+    // 兜底：直接在 groups 里找不到（名字可能有微妙差异）→ 直接按名字查
     setChannelName(name);
     setTvgId('');
     setTvgName('');
     void loadPrograms(name, '', '');
   };
 
+  /** ★ 一键切回主窗口当前播放的频道 */
+  const backToLive = () => {
+    if (!initial) return;
+    switchChannel(initial.name);
+  };
+
   // 首次挂载
   useEffect(() => {
     const hash = window.location.hash || '';
     const qIndex = hash.indexOf('?');
-    void loadFromQuery(qIndex >= 0 ? hash.slice(qIndex + 1) : '');
-    void ipcInvoke('epg:windowReady').catch(() => undefined);
     void (async () => {
+      // 先拉分组/频道列表
       try {
         const data = await ipcInvoke<{ groups: GroupItem[]; currentGroup: string }>('epg:getChannels');
-        if (data && Array.isArray(data.groups)) {
+        if (data && Array.isArray(data.groups) && data.groups.length > 0) {
           setGroups(data.groups);
           setCurrentGroupName(data.currentGroup || '');
-          // 默认展开当前分组
           setExpanded({ [data.currentGroup || '']: true });
         }
-      } catch { /* ignore */ }
+      } catch (e) {
+        console.warn('[EPG Win] 拉取频道列表失败', e);
+      }
+      setLoadingGroups(false);
+      // 再加载初始频道节目单（会尝试从 groups 里找到分组）
+      void loadFromQuery(qIndex >= 0 ? hash.slice(qIndex + 1) : '', { updateInitial: true });
     })();
+    void ipcInvoke('epg:windowReady').catch(() => undefined);
     void (async () => {
       try {
         const on = await client.winIsAlwaysOnTop();
@@ -165,7 +197,7 @@ export default function EpgWinPage() {
   useEffect(() => {
     const w = window as any;
     const off1 = w?.winboxIpc?.on?.('epg:windowUpdate', (qs: unknown) => {
-      if (typeof qs === 'string') void loadFromQuery(qs);
+      if (typeof qs === 'string') void loadFromQuery(qs, { updateInitial: true });
     });
     const off2 = w?.winboxIpc?.on?.('epg:getChannels', (data: unknown) => {
       const d = data as { groups?: GroupItem[]; currentGroup?: string } | null;
@@ -175,6 +207,17 @@ export default function EpgWinPage() {
           setCurrentGroupName(d.currentGroup);
           setExpanded((prev) => ({ ...prev, [d.currentGroup as string]: true }));
         }
+        // 分组更新后，尝试补全 initial.group
+        setInitial((prev) => {
+          if (!prev) return prev;
+          if (prev.group) return prev;
+          for (const g of d.groups!) {
+            if (g.channels.some((c) => c.name === prev.name)) {
+              return { ...prev, group: g.group };
+            }
+          }
+          return prev;
+        });
       }
     });
     return () => {
@@ -219,13 +262,15 @@ export default function EpgWinPage() {
       .filter((g) => g.channels.length > 0);
   }, [groups, filter]);
 
+  const isInitial = !!(initial && channelName === initial.name);
+
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', height: '100vh',
       background: '#1a1d24', color: '#e6e6e6',
       fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
     }}>
-      {/* 标题栏 —— 拖动区 */}
+      {/* 标题栏 */}
       <div
         style={{
           display: 'flex', alignItems: 'center', justifyContent: 'space-between',
@@ -235,6 +280,7 @@ export default function EpgWinPage() {
           cursor: 'move',
           userSelect: 'none',
           flexShrink: 0,
+          gap: 8,
         }}
       >
         <div style={{ fontSize: 14, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }}>
@@ -250,8 +296,29 @@ export default function EpgWinPage() {
             display: 'flex', gap: 4, flexShrink: 0,
             // @ts-ignore
             WebkitAppRegion: 'no-drag',
+            alignItems: 'center',
           }}
         >
+          {/* ★「切回当前播放频道」按钮：只在当前显示的不是初始频道时可点 */}
+          {initial && (
+            <button
+              onClick={backToLive}
+              disabled={isInitial}
+              title={isInitial ? '已在显示当前播放频道' : `切回主窗口正在播放的频道：${initial.name}`}
+              style={{
+                background: isInitial ? 'transparent' : 'rgba(78,201,255,0.12)',
+                border: '1px solid ' + (isInitial ? '#333944' : '#4ec9ff'),
+                color: isInitial ? '#666' : '#4ec9ff',
+                cursor: isInitial ? 'not-allowed' : 'pointer',
+                borderRadius: 6,
+                padding: '3px 8px',
+                fontSize: 12,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              ↩ 当前
+            </button>
+          )}
           <button
             onClick={toggleTop}
             title={alwaysOnTop ? '取消置顶（可与视频并排看）' : '置顶（浮在视频上方）'}
@@ -278,7 +345,6 @@ export default function EpgWinPage() {
           width: 220, flexShrink: 0, display: 'flex', flexDirection: 'column',
           borderRight: '1px solid #2a2f3a', background: '#16191f',
         }}>
-          {/* 过滤框 */}
           <div style={{ padding: '8px 8px 6px', borderBottom: '1px solid #232833' }}>
             <input
               value={filter}
@@ -292,11 +358,14 @@ export default function EpgWinPage() {
               }}
             />
           </div>
-          {/* 列表 */}
           <div style={{ flex: 1, overflowY: 'auto', padding: '4px 0 8px' }}>
-            {filteredGroups.length === 0 ? (
+            {loadingGroups ? (
               <div style={{ padding: 16, textAlign: 'center', color: '#666', fontSize: 12 }}>
-                无频道
+                正在加载频道列表…
+              </div>
+            ) : filteredGroups.length === 0 ? (
+              <div style={{ padding: 16, textAlign: 'center', color: '#666', fontSize: 12 }}>
+                {groups.length === 0 ? '无频道（直播源为空？）' : '无匹配频道'}
               </div>
             ) : (
               filteredGroups.map((g) => {
@@ -321,11 +390,12 @@ export default function EpgWinPage() {
                     </button>
                     {open && g.channels.map((c) => {
                       const active = c.name === channelName;
+                      const isInit = !!(initial && initial.name === c.name);
                       return (
                         <button
                           key={c.name}
                           onClick={() => switchChannel(c.name)}
-                          title={c.name}
+                          title={isInit ? `${c.name}（主窗口正在播放）` : c.name}
                           style={{
                             width: '100%', textAlign: 'left',
                             background: active ? 'rgba(78,201,255,0.14)' : 'transparent',
@@ -336,9 +406,13 @@ export default function EpgWinPage() {
                             padding: '5px 10px 5px 24px',
                             fontSize: 12,
                             overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                            display: 'flex', alignItems: 'center', gap: 6,
                           }}
                         >
-                          {c.name}
+                          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.name}</span>
+                          {isInit && (
+                            <span style={{ fontSize: 10, color: '#4ec9ff', flexShrink: 0 }}>▶</span>
+                          )}
                         </button>
                       );
                     })}

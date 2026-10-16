@@ -769,7 +769,7 @@ export default function ConfigPage() {
   const TABS: { id: TabId; label: string }[] = [
     { id: 'sources', label: '订阅与源' },
     // ★ 2026-10-13（用户要求）：直播订阅源管理从直播页搬到配置页，独立 tab
-    { id: 'livesub', label: '直播订阅源' },
+  //  { id: 'livesub', label: '直播订阅源' },
     { id: 'health', label: '源健康与维护' },
     { id: 'profiles', label: '配置档案' },
     { id: 'account', label: '凭据' },

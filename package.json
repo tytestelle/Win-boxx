@@ -1,8 +1,8 @@
 {
-  "name": "win-box",
+  "name": "win-box-pro",
   "version": "1.21.2",
   "private": true,
-  "description": "Win-Box (CatVod 引擎) 的 Windows 桌面移植版 — 导入源规则与安卓版保持一致",
+  "description": "Win-Box-Pro (CatVod 引擎) 的 Windows 桌面移植版 — 导入源规则与安卓版保持一致",
   "type": "module",
   "main": "dist/main.cjs",
   "scripts": {
@@ -18,7 +18,7 @@
     "dist": "node scripts/build-release.mjs",
     "release:upload": "node scripts/upload-release.mjs"
   },
-  "author": "Win-Box",
+  "author": "Win-Box-Pro",
   "license": "MIT",
   "devDependencies": {
     "@types/crypto-js": "^4.2.2",
@@ -52,10 +52,10 @@
     "undici": "^7.29.1"
   },
   "build": {
-    "appId": "com.winbox.win",
-    "productName": "Win-Box",
+    "appId": "com.winbox.pro",
+    "productName": "Win-Box-Pro",
     "directories": {
-      "output": "release1.21.2"
+      "output": "release1.21.2-pro"
     },
     "files": [
       "dist/**",
